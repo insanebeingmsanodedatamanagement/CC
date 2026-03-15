@@ -39,7 +39,6 @@ from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter, TelegramNet
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
 
-
 # ==========================================
 # ⚡ CONFIGURATION  — all values from env vars
 # ==========================================
