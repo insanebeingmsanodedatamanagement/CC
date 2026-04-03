@@ -18,7 +18,17 @@ if sys.platform == 'win32':
     sys.stdout.reconfigure(encoding='utf-8')
     sys.stderr.reconfigure(encoding='utf-8')
 from zoneinfo import ZoneInfo
+from dotenv import load_dotenv
+import aiohttp
 from aiohttp import web as aiohttp_web
+
+# --- 🔧 NEW: UNIFIED BACKUP SYSTEM FINAL ARCHITECTURE ---
+try:
+    from backup_manager import BackupManager
+    bot_backup = BackupManager("bot1")
+except ImportError:
+    bot_backup = None
+    print("⚠️ backup_manager module not found — Automatic backups disabled")
 from aiogram import Bot, Dispatcher, types, F
 
 # ── Unified weekly backup system ──
@@ -28,7 +38,7 @@ except ImportError:
     print("⚠️ backup_schedulers module not found — weekly backups disabled")
     weekly_backup_scheduler = None
     monthly_export_scheduler = None
-from aiogram.filters import CommandStart, Command
+from aiogram.filters import CommandStart, Command, StateFilter
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, InlineKeyboardMarkup, InlineKeyboardButton, ChatMemberUpdated
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.base import StorageKey
@@ -38,14 +48,19 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter, TelegramNetworkError, TelegramUnauthorizedError
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
+# Load environment variables
+load_dotenv("bot1.env", override=True)
 
 # ==========================================
 # ⚡ CONFIGURATION  — all values from env vars
 # ==========================================
-BOT_TOKEN = os.getenv("BOT_8_TOKEN")
+BOT_TOKEN = os.getenv("BOT_1_TOKEN")
 OWNER_ID = int(os.getenv("OWNER_ID", 0))
 MONGO_URI = os.getenv("MONGO_URI")
 MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "MSANodeDB")  # MongoDB database name
+# Dedicated backup cluster — isolated from prod; backup writes go here only
+BACKUP_MONGO_URI     = os.getenv("BACKUP_MONGO_URI")
+BACKUP_MONGO_DB_NAME = os.getenv("BACKUP_MONGO_DB_NAME", "MSANodeBackups")
 CHANNEL_ID = int(os.getenv("CHANNEL_ID", 0))           # Vault channel numeric ID
 CHANNEL_LINK = os.getenv("CHANNEL_LINK")               # Telegram vault invite link
 YOUTUBE_LINK = os.getenv("YOUTUBE_LINK", "")
@@ -67,7 +82,7 @@ _WEBHOOK_URL = f"{_WEBHOOK_BASE_URL}{_WEBHOOK_PATH}" if _WEBHOOK_BASE_URL else "
 # ⚠️ STARTUP VALIDATION - Fail fast
 # ==========================================
 _REQUIRED_ENV = {
-    "BOT_8_TOKEN": BOT_TOKEN,
+    "BOT_1_TOKEN": BOT_TOKEN,
     "MONGO_URI": MONGO_URI,
     "OWNER_ID": os.getenv("OWNER_ID"),
     "CHANNEL_ID": os.getenv("CHANNEL_ID"),
@@ -140,6 +155,8 @@ _freeze_notice_tracker: dict[int, float] = {}  # throttle freeze notice spam per
 _SUPPORT_SECURITY_WINDOW_SECS = 24 * 3600
 _SUPPORT_SECURITY_MAX_WARNINGS = 3
 _SUPPORT_SECURITY_LOCK_SECS = 6 * 3600
+# NOTE: Lock is now stored in MongoDB (bot1_support_tickets, type='security_lock').
+# _support_security_tracker is kept as a fast in-process cache only.
 _support_security_tracker: dict[int, dict] = {}
 
 # Cooldown live-refresh hardening (prevents Telegram flood during heavy traffic)
@@ -175,7 +192,7 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
 # ==========================================
-# 🖥️ BOT 1(8) LIVE TERMINAL MIDDLEWARE
+# 🖥️ Bot 1 LIVE TERMINAL MIDDLEWARE
 # Logs every user interaction to MongoDB — visible in Bot 2 Terminal from Render
 # ==========================================
 from aiogram import BaseMiddleware
@@ -207,8 +224,47 @@ class Bot1TerminalMiddleware(BaseMiddleware):
             except Exception:
                 pass
         return await handler(event, data)
+
+class BanGateMiddleware(BaseMiddleware):
+    """
+    Global hard gate — runs BEFORE every message AND callback_query handler.
+    Permanently banned users: ALL interaction is silently dropped (no response).
+    Temporarily banned users: passed through — their per-handler support flow applies.
+    Bot owner is always exempted.
+    """
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, Dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
+        data: Dict[str, Any]
+    ) -> Any:
+        user = data.get("event_from_user")
+        if user and user.id and user.id != OWNER_ID:
+            try:
+                ban_doc = col_banned_users.find_one(
+                    {"user_id": user.id, "scope": {"$ne": "bot2"}}
+                )
+                if ban_doc:
+                    ban_type = ban_doc.get("ban_type", "permanent")
+                    # Temp ban: let through — per-handler logic handles it
+                    if ban_type == "temporary":
+                        pass
+                    else:
+                        # Permanent ban: hard drop — no response, no bypass
+                        # For callback_query, silently answer to dismiss Telegram spinner
+                        if hasattr(event, "answer") and callable(event.answer):
+                            try:
+                                await event.answer()
+                            except Exception:
+                                pass
+                        return  # Do NOT call handler under any circumstances
+            except Exception:
+                pass  # DB error: fail-open (never block legitimate users)
+        return await handler(event, data)
+
+from typing import Any
 # ==========================================
-health_stats = {
+health_stats: dict[str, Any] = {
     "errors_caught": 0,
     "auto_healed": 0,
     "owner_notified": 0,
@@ -223,6 +279,7 @@ health_stats = {
 # 📊 DATABASE CONNECTION  
 # ==========================================
 try:
+    import certifi
     client = pymongo.MongoClient(
         MONGO_URI,
         maxPoolSize=50,          # Up to 50 concurrent connections
@@ -234,6 +291,7 @@ try:
         retryWrites=True,
         retryReads=True,
         w="majority",            # Write concern – durable
+        tlsCAFile=certifi.where()
     )
     db = client[MONGO_DB_NAME]
     # Guard: refuse to start if pointed at the wrong database
@@ -241,20 +299,39 @@ try:
         logger.critical(f"❌ FATAL: MONGO_DB_NAME is '{db.name}' — must be 'MSANodeDB'. Fix your env vars and restart.")
         sys.exit(1)
     logger.info(f"✅ Database guard passed: writing to '{db.name}'")
-    # Single database — all bots (bot8, bot9, bot10) use MSANodeDB on Render
-    col_user_verification = db["user_verification"]
-    col_msa_ids = db["msa_ids"]  # Collection for MSA+ ID tracking
-    col_pdfs = db["bot3_pdfs"]          # Bot 9 PDFs (same MSANodeDB)
-    col_ig_content = db["bot3_ig_content"] # Bot 9 IG content (same MSANodeDB)
-    col_support_tickets = db["support_tickets"]  # Collection for support ticket tracking
-    col_banned_users = db["banned_users"]  # Collection for banned users (managed by Bot 2)
-    col_suspended_features = db["suspended_features"]  # Collection for suspended features (managed by Bot 2)
-    col_bot8_settings = db["bot8_settings"]  # Bot 1 global settings (Maintenance Mode)
-    col_live_logs = db["live_terminal_logs"]  # Shared live logs for Bot 2 terminal (Render-safe)
-    col_bot8_backups = db["bot8_backups"]         # Bot 1 auto-backups (12h, cloud-safe)
-    col_bot8_restore_data = db["bot8_restore_data"]  # Bot 1 latest restorable snapshot (always-replaced)
-    col_broadcasts = db["bot10_broadcasts"]        # Broadcasts sent via Bot 2 (read-only here)
+    # Single database — all bots (bot1, bot2, bot3) use MSANodeDB on Render
+    col_user_verification = db["bot1_user_verification"]
+    col_msa_ids = db["bot1_msa_ids"]  # Collection for MSA+ ID tracking
+    col_pdfs = db["bot3_pdfs"]          # Bot 3 PDFs (same MSANodeDB)
+    col_ig_content = db["bot3_ig_content"] # Bot 3 IG content (same MSANodeDB)
+    col_support_tickets = db["bot1_support_tickets"]  # Collection for support ticket tracking
+    col_banned_users = db["bot1_banned_users"]  # Collection for banned users (managed by Bot 2)
+    col_suspended_features = db["bot1_suspended_features"]  # Collection for suspended features (managed by Bot 2)
+    col_bot1_settings = db["bot1_settings"]  # Bot 1 global settings (Maintenance Mode)
+    col_live_logs = db["bot2_live_terminal_logs"]  # Shared live logs for Bot 2 terminal (Render-safe)
     logger.info("✅ MongoDB connected successfully")
+
+    # ── Dedicated BACKUP cluster (writes go here, never to MSANodeDB) ──
+    _bk_uri  = BACKUP_MONGO_URI or MONGO_URI
+    _bk_db   = BACKUP_MONGO_DB_NAME or "MSANodeBackups"
+    if not BACKUP_MONGO_URI:
+        logger.warning("⚠️ BACKUP_MONGO_URI not set — bot1 backup collections falling back to PROD cluster!")
+        backup_client_b1 = client
+    else:
+        import certifi
+        backup_client_b1 = pymongo.MongoClient(
+            _bk_uri,
+            maxPoolSize=10, minPoolSize=1,
+            serverSelectionTimeoutMS=8000,
+            connectTimeoutMS=10000, socketTimeoutMS=30000,
+            retryWrites=True, w="majority",
+            tlsCAFile=certifi.where()
+        )
+    backup_db_b1 = backup_client_b1[_bk_db]  # MSANodeBackups
+    logger.info(f"✅ Backup cluster connected: {_bk_db}")
+    col_bot1_backups = backup_db_b1["bot1_backups"]         # Bot 1 auto-backups → BACKUP cluster only
+    col_bot1_restore_data = backup_db_b1["bot1_restore_data"]  # Bot 1 restore snapshot → BACKUP cluster only
+    col_broadcasts = db["bot2_broadcasts"]        # Broadcasts sent via Bot 2 (read-only here)
     
     # ==========================================
     # 🔍 CREATE DATABASE INDEXES (Performance)
@@ -275,11 +352,11 @@ try:
         col_banned_users.create_index("ban_expires")  # TTL hint only
         col_support_tickets.create_index([("user_id", 1), ("status", 1)])
         col_support_tickets.create_index("created_at")
-        col_support_tickets.create_index([("resolved_at", 1)], sparse=True)  # plain index only — no TTL, tickets are permanent
-        db["bot10_user_tracking"].create_index("user_id", unique=True)
-        db["bot8_state_persistence"].create_index("key", unique=True)
-        col_bot8_backups.create_index([("backup_date", -1)])
-        col_bot8_backups.create_index([("backup_type", 1)])
+        # Note: resolved_at index intentionally omitted — tickets are permanent, no TTL needed
+        db["bot2_user_tracking"].create_index("user_id", unique=True)
+        db["bot1_state_persistence"].create_index("key", unique=True)
+        col_bot1_backups.create_index([("backup_date", -1)])
+        col_bot1_backups.create_index([("backup_type", 1)])
         col_broadcasts.create_index([("index", -1)])
         col_broadcasts.create_index("broadcast_id", unique=True)
         # ── Unique dedup index: prevents duplicate click-tracking rows even under concurrent load
@@ -292,12 +369,13 @@ try:
     except Exception as idx_error:
         logger.warning(f"⚠️ Index creation warning: {idx_error}")
 
-    # ── Drop any legacy TTL index on resolved_at (was 30-day auto-delete, now removed) ─
+    # ── Drop any legacy TTL index on resolved_at (all variants) ───────────────────────
     try:
-        try:
-            col_support_tickets.drop_index("resolved_at_1")
-        except Exception:
-            pass
+        for _idx_name in ("resolved_at_1", "resolved_at_ttl_180d", "resolved_at_ttl_30d"):
+            try:
+                col_support_tickets.drop_index(_idx_name)
+            except Exception:
+                pass  # Already gone — that's fine
         logger.info("✅ Ticket TTL cleared — tickets are permanent, no auto-deletion")
     except Exception as ttl_err:
         logger.warning(f"⚠️ Ticket TTL drop warning: {ttl_err}")
@@ -316,7 +394,7 @@ try:
 
     # ── Backup dedup index: one backup summary per bot/window key ───────────
     try:
-        col_bot8_backups.create_index(
+        col_bot1_backups.create_index(
             [("bot", 1), ("window_key", 1)],
             unique=True,
             sparse=True,
@@ -333,7 +411,7 @@ except Exception as e:
 # ==========================================
 # 🖥️ LIVE TERMINAL LOGGER (shared with Bot 2)
 # ==========================================
-_BOT8_LOG_MAX = 100  # Keep last 100 bot8 logs in MongoDB
+_BOT1_LOG_MAX = 100  # Keep last 100 bot1 logs in MongoDB
 
 def log_to_terminal(action_type: str, user_id: int, details: str = ""):
     """Write a log entry to the shared live_terminal_logs collection so Bot 2 can display it live."""
@@ -347,10 +425,10 @@ def log_to_terminal(action_type: str, user_id: int, details: str = ""):
             "user_id": user_id,
             "details": details,
         })
-        # Trim: keep newest _BOT8_LOG_MAX entries for bot1
+        # Trim: keep newest _BOT1_LOG_MAX entries for bot1
         count = col_live_logs.count_documents({"bot": "bot1"})
-        if count > _BOT8_LOG_MAX:
-            oldest = list(col_live_logs.find({"bot": "bot1"}, {"_id": 1}).sort("created_at", 1).limit(count - _BOT8_LOG_MAX))
+        if count > _BOT1_LOG_MAX:
+            oldest = list(col_live_logs.find({"bot": "bot1"}, {"_id": 1}).sort("created_at", 1).limit(count - _BOT1_LOG_MAX))
             if oldest:
                 col_live_logs.delete_many({"_id": {"$in": [d["_id"] for d in oldest]}})
     except Exception:
@@ -390,18 +468,63 @@ def _is_new_unique_click(user_id: int, item_id, click_type: str) -> bool:
         logger.warning(f"Dedup check failed ({click_type}): {e}; allowing increment")
         return True  # On any other error, fail-open (never block a user)
 
+def _store_initial_source(user_id: int, source: str) -> None:
+    """
+    Lightweight first-touch source recorder — writes ONLY to col_user_verification.
+    Does NOT write to bot2_user_tracking (that happens only at vault join).
+
+    Priority: Specific sources (IG, YT, YTCODE, IGCC) beat UNKNOWN.
+    Once a specific source is stored it is never overwritten.
+    """
+    _SPECIFIC = {"IG", "YT", "YTCODE", "IGCC"}
+    try:
+        existing = col_user_verification.find_one({"user_id": user_id}, {"initial_source": 1})
+        if existing is None:
+            # Brand-new user — create record with grace pass included
+            col_user_verification.update_one(
+                {"user_id": user_id},
+                {"$set": {
+                    "initial_source": source,
+                    "grace_allowed": True,   # All new users get one free pass
+                    "grace_consumed": False,
+                }},
+                upsert=True
+            )
+        else:
+            current = existing.get("initial_source", "UNKNOWN")
+            if current not in _SPECIFIC and source in _SPECIFIC:
+                # Upgrade UNKNOWN → specific (first real source wins)
+                col_user_verification.update_one(
+                    {"user_id": user_id},
+                    {"$set": {"initial_source": source}}
+                )
+            # else: specific already stored — never overwrite
+    except Exception as e:
+        logger.warning(f"_store_initial_source failed ({source}): {e}")
+
 def track_user_source(user_id: int, source: str, username: str, first_name: str, msa_id: str):
     """
-    Record traffic source PERMANENTLY on first start only.
-    - New user: inserts full record including source.
-    - Returning user without source: adds source field only.
-    - Returning user with source: only updates last_start and msa_id. Source is NEVER changed.
+    Record traffic source with FIRST-TOUCH PRIORITY lock.
+
+    Source Priority Tiers (HIGH → LOW):
+      Tier 1 (Specific / Permanent): IG | YT | YTCODE | IGCC
+      Tier 2 (Placeholder):          UNKNOWN
+
+    Rules:
+    - Brand new user → insert full record with whichever source comes first.
+    - User has UNKNOWN source → upgrade to any specific source freely.
+    - User has a specific source → NEVER overwrite, regardless of what comes next.
+    - Always update `last_start` and `msa_id` on every call.
     """
+    _SPECIFIC_SOURCES = {"IG", "YT", "YTCODE", "IGCC"}
+    new_source_is_specific = source in _SPECIFIC_SOURCES
+
     try:
-        col = db["bot10_user_tracking"]
-        existing = col.find_one({"user_id": user_id}, {"source": 1})
+        col = db["bot2_user_tracking"]
+        existing = col.find_one({"user_id": user_id}, {"source": 1, "first_start": 1})
+
         if existing is None:
-            # Brand new user — insert full record with source
+            # ── Brand new user: insert with whatever source arrives first ──
             col.insert_one({
                 "user_id": user_id,
                 "source": source,
@@ -411,25 +534,94 @@ def track_user_source(user_id: int, source: str, username: str, first_name: str,
                 "msa_id": msa_id,
                 "last_start": now_local(),
             })
-        elif "source" not in existing:
-            # Existing user but source was never recorded — set it now (once only)
-            col.update_one(
-                {"user_id": user_id},
-                {"$set": {
-                    "source": source,
-                    "first_start": now_local(),
-                    "last_start": now_local(),
-                    "msa_id": msa_id,
-                }}
-            )
         else:
-            # Returning user WITH source — only update last_start (msa_id never changes once assigned)
-            col.update_one(
-                {"user_id": user_id},
-                {"$set": {"last_start": now_local()}}
-            )
+            current_source = existing.get("source", "UNKNOWN")
+            current_is_specific = current_source in _SPECIFIC_SOURCES
+
+            if current_is_specific:
+                # ── Specific source already locked — only refresh last_start ──
+                col.update_one(
+                    {"user_id": user_id},
+                    {"$set": {"last_start": now_local(), "username": username, "first_name": first_name}}
+                )
+            elif new_source_is_specific:
+                # ── Upgrade UNKNOWN → specific source, lock it permanently ──
+                col.update_one(
+                    {"user_id": user_id},
+                    {"$set": {
+                        "source": source,
+                        "first_start": now_local(),  # Reset to first real interaction
+                        "last_start": now_local(),
+                        "username": username,
+                        "first_name": first_name,
+                        "msa_id": msa_id,
+                    }}
+                )
+                logger.info(f"📌 Source upgraded: user {user_id} UNKNOWN → {source}")
+            else:
+                # ── UNKNOWN stays UNKNOWN — just update mutable fields ──
+                col.update_one(
+                    {"user_id": user_id},
+                    {"$set": {"last_start": now_local(), "username": username, "first_name": first_name}}
+                )
     except Exception as e:
         logger.error(f"Warning: track_user_source failed: {e}")
+
+async def _sync_pre_vault_user(user_id: int, username: str, first_name: str) -> tuple:
+    """
+    One-time DB sync for users who joined the vault BEFORE ever starting bot1.
+
+    Called whenever is_in_vault=True is detected in cmd_start.
+    Idempotent — if vault_joined is already True in DB, skips silently.
+    Never sends any messages — only syncs database state.
+
+    Returns: (msa_id: str|None, newly_synced: bool)
+      newly_synced=True  → first time sync; caller should send the menu keyboard
+      newly_synced=False → already synced; no extra action needed
+
+    Actions (only when not already synced):
+      1. Sets vault_joined=True, verified=True, ever_verified=True
+      2. Allocates MSA+ ID (requires vault_joined=True, now satisfied)
+      3. Calls track_user_source → writes to bot2_user_tracking with first-touch source
+      4. Clears stale left/reminder fields
+    """
+    try:
+        rec = col_user_verification.find_one(
+            {"user_id": user_id}, {"vault_joined": 1, "initial_source": 1}
+        )
+        # Already synced — nothing to do
+        if rec and rec.get("vault_joined"):
+            return get_user_msa_id(user_id), False  # (msa_id, newly_synced=False)
+
+        # --- Sync vault status in DB ---
+        update_verification_status(
+            user_id,
+            vault_joined=True,
+            verified=True,
+            ever_verified=True,
+        )
+        # Clear any stale lifecycle fields
+        col_user_verification.update_one(
+            {"user_id": user_id},
+            {"$unset": {"vault_left_at": "", "reminder1_sent": "", "reminder2_sent": "", "reminder3_sent": ""}}
+        )
+
+        # --- Allocate MSA+ ID (vault_joined=True now satisfies the guard) ---
+        msa_id = allocate_msa_id(user_id, username, first_name)
+
+        # --- Write first-touch source to bot2_user_tracking ---
+        source = (rec or {}).get("initial_source", "UNKNOWN")
+        track_user_source(user_id, source, username, first_name, msa_id)
+
+        logger.info(
+            f"[PRE-VAULT SYNC] user={user_id} NEWLY SYNCED: source={source!r} msa_id={msa_id}"
+        )
+        return msa_id, True  # (msa_id, newly_synced=True)
+    except Exception as e:
+        logger.error(f"[PRE-VAULT SYNC] Failed for user {user_id}: {e}")
+        return None, False
+
+
 async def check_channel_membership(user_id: int) -> bool:
     """Check if user is a member of the vault channel"""
     try:
@@ -440,12 +632,13 @@ async def check_channel_membership(user_id: int) -> bool:
 
 class SearchCodeStates(StatesGroup):
     waiting_for_code = State()
+    waiting_for_first_code = State()
 
 class SupportStates(StatesGroup):
     waiting_for_issue = State()  # Waiting for user to describe their issue
 
 class GuideStates(StatesGroup):
-    viewing_bot8 = State()  # paginated Agent Guide
+    viewing_bot1 = State()  # paginated Agent Guide
 
 class RulesStates(StatesGroup):
     viewing_rules = State()  # paginated Rules
@@ -640,7 +833,7 @@ MIN_TICKET_LENGTH = 20  # Raised: 10 chars is too little to be a real support me
 # ---------------------------------------------------------------------------
 # PROFANITY DETECTION — multi-layer
 # ---------------------------------------------------------------------------
-def contains_profanity(text: str) -> tuple[bool, list]:
+def contains_profanity(text: str) -> tuple[bool, list[str]]:
     """
     Multi-layer profanity check:
     1. Direct match on original lowercase
@@ -740,7 +933,7 @@ def is_spam_or_gibberish(text: str) -> tuple[bool, str]:
     ]
     t_nospace = stripped.lower().replace(" ", "")
     for kp in keyboard_rows:
-        if len(kp) >= 6 and (kp in t_nospace or kp[::-1] in t_nospace):
+        if len(kp) >= 6 and (kp in t_nospace or "".join(reversed(kp)) in t_nospace):
             return (True, "Keyboard mashing detected")
 
     # --- 8. No vowels in a long stretch (pure consonant gibberish: "jksdfjkl") ---
@@ -814,32 +1007,69 @@ def _build_remaining_bar(remaining_seconds: int, total_seconds: int, width: int 
     filled = max(0, min(width, filled))
     return ("▰" * filled + "▱" * (width - filled), ratio * 100)
 
+def _support_lock_key(user_id: int) -> dict:
+    return {"type": "security_lock", "user_id": user_id}
+
+
 def _get_support_lock_remaining(user_id: int) -> int:
-    """Return active support lock remaining seconds, else 0."""
-    state = _support_security_tracker.get(user_id)
-    if not state:
-        return 0
-    lock_until = int(state.get("lock_until", 0))
+    """Return active support lock remaining seconds (0 = no lock).
+    Checks in-memory cache first, then MongoDB for persistence across restarts.
+    This means the lock survives: bot restarts, user leaving vault, rejoining.
+    """
     now_ts = int(time.time())
-    return max(0, lock_until - now_ts)
+
+    # Fast path: in-memory cache
+    cached = _support_security_tracker.get(user_id)
+    if cached and cached.get("lock_until", 0) > now_ts:
+        return max(0, int(cached["lock_until"]) - now_ts)
+
+    # DB fallback — authoritative source
+    try:
+        doc = col_support_tickets.find_one(_support_lock_key(user_id))
+        if doc:
+            lock_until = int(doc.get("lock_until", 0))
+            warnings   = int(doc.get("warnings", 0))
+            window_start = int(doc.get("window_start", 0))
+            # Sync back into in-memory cache
+            _support_security_tracker[user_id] = {
+                "lock_until":   lock_until,
+                "warnings":     warnings,
+                "window_start": window_start,
+            }
+            return max(0, lock_until - now_ts)
+    except Exception:
+        pass
+
+    return 0
+
 
 def _register_support_violation(user_id: int) -> tuple[int, int, bool]:
     """Register a support abuse violation.
+    Persists lock state to MongoDB so it survives bot restarts and vault leave/rejoin.
     Returns: (warning_count, lock_remaining_seconds, lock_triggered_now)
     """
     now_ts = int(time.time())
-    state = _support_security_tracker.get(user_id, {
-        "window_start": now_ts,
-        "warnings": 0,
-        "lock_until": 0,
-    })
 
-    # Reset rolling window
-    if now_ts - int(state.get("window_start", now_ts)) > _SUPPORT_SECURITY_WINDOW_SECS:
+    # Load from DB first (authoritative)
+    state: dict = {"window_start": now_ts, "warnings": 0, "lock_until": 0}
+    try:
+        doc = col_support_tickets.find_one(_support_lock_key(user_id))
+        if doc:
+            state = {
+                "window_start": int(doc.get("window_start", now_ts)),
+                "warnings":     int(doc.get("warnings", 0)),
+                "lock_until":   int(doc.get("lock_until", 0)),
+            }
+    except Exception:
+        # DB unavailable — fall back to in-memory cache
+        state = _support_security_tracker.get(user_id, state)
+
+    # Reset rolling window if it has expired
+    if now_ts - state.get("window_start", now_ts) > _SUPPORT_SECURITY_WINDOW_SECS:
         state["window_start"] = now_ts
         state["warnings"] = 0
 
-    # If already locked, keep lock state stable
+    # If already locked, return stable lock state
     active_lock = max(0, int(state.get("lock_until", 0)) - now_ts)
     if active_lock > 0:
         _support_security_tracker[user_id] = state
@@ -855,6 +1085,24 @@ def _register_support_violation(user_id: int) -> tuple[int, int, bool]:
         state["warnings"] = 0
         lock_triggered = True
 
+    # Persist to MongoDB — this is what survives restarts and vault exits
+    try:
+        col_support_tickets.update_one(
+            _support_lock_key(user_id),
+            {"$set": {
+                "type":         "security_lock",
+                "user_id":      user_id,
+                "window_start": state["window_start"],
+                "warnings":     state["warnings"],
+                "lock_until":   state["lock_until"],
+                "updated_at":   now_ts,
+            }},
+            upsert=True,
+        )
+    except Exception:
+        pass  # If DB write fails, in-memory state still works for this session
+
+    # Sync in-memory cache
     _support_security_tracker[user_id] = state
     lock_remaining = max(0, int(state.get("lock_until", 0)) - now_ts)
     return (warnings, lock_remaining, lock_triggered)
@@ -1025,7 +1273,7 @@ def validate_ticket_content(text: str, user_name: str = "User") -> tuple[bool, s
     has_profanity, found_terms = contains_profanity(text)
     if has_profanity:
         # Censor found terms to not expose the full list in messages
-        display = ", ".join([f"`{'*' * len(w)}`" for w in found_terms[:3]])
+        display = ", ".join([f"`{'*' * len(found_terms[i])}`" for i in range(min(3, len(found_terms)))])
         return (False,
             f"🚫 **INAPPROPRIATE CONTENT DETECTED**\n\n"
             f"{user_name}, your message was blocked by our content filter.\n\n"
@@ -1047,10 +1295,16 @@ def validate_ticket_content(text: str, user_name: str = "User") -> tuple[bool, s
 
     return (True, "")
 
-def get_user_verification_status(user_id: int) -> dict:
-    """Get user verification status from database"""
+def get_user_verification_status(user_id: int, tg_user=None) -> dict:
+    """Get user verification status from database.
+    If tg_user (Telegram user object) is provided, updates premium/language fields on every call.
+    """
     user_data = col_user_verification.find_one({"user_id": user_id})
     if not user_data:
+        # Capture Telegram-provided analytics fields (zero extra API calls needed)
+        is_premium = bool(getattr(tg_user, "is_premium", False)) if tg_user else False
+        language_code = getattr(tg_user, "language_code", None) if tg_user else None
+
         # Create new record for new user
         user_data = {
             "user_id": user_id,
@@ -1059,9 +1313,30 @@ def get_user_verification_status(user_id: int) -> dict:
             "ever_verified": False,  # Track if user was EVER verified (for old user detection)
             "verification_msg_id": None,  # Store verification message ID for deletion
             "rejoin_msg_id": None,  # Store rejoin message ID for deletion when user rejoins
-            "first_start": now_local()
+            "first_start": now_local(),
+            # Telegram analytics (captured once on first start, free data)
+            "is_premium": is_premium,       # Telegram Premium subscriber flag
+            "language_code": language_code,  # e.g. "en", "hi", "ar"
+            # Grace-pass fields: One free content delivery before vault join is mandatory
+            "grace_allowed": True,  # All new users get one free pass
+            "grace_consumed": False,  # Set to true after first successful delivery
+            "grace_consumed_at": None,  # Timestamp when grace was consumed
+            "grace_consumed_via": None,  # How grace was consumed: "IG", "YT", "IGCC", "YTCODE", "UNKNOWN_SEARCH"
+            # Abandonment lifecycle fields: Track 30/60/90-day notifications
+            "vault_left_at": None,  # When user left vault (trigger for 30/60/90-day countdown)
+            "reminder1_sent": False,  # First reminder sent at day 30
+            "reminder2_sent": False,  # Second reminder sent at day 60
+            "reminder3_sent": False  # Third reminder sent at day 90 (before auto-delete)
         }
         col_user_verification.insert_one(user_data)
+    elif tg_user:
+        # Returning user — silently update language/premium in case they changed
+        is_premium = bool(getattr(tg_user, "is_premium", False))
+        language_code = getattr(tg_user, "language_code", None)
+        col_user_verification.update_one(
+            {"user_id": user_id},
+            {"$set": {"is_premium": is_premium, "language_code": language_code, "last_seen": now_local()}}
+        )
     return user_data
 
 def update_verification_status(user_id: int, **kwargs):
@@ -1072,10 +1347,40 @@ def update_verification_status(user_id: int, **kwargs):
         upsert=True  # Create if doesn't exist, update if exists
     )
 
+
+async def send_psychological_vault_lock_message(user_id: int):
+    try:
+        from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+        from aiogram.enums import ParseMode
+        import asyncio
+        await asyncio.sleep(1.5)
+        msg = (
+            f"⚡ **YOUR FIRST BLUEPRINT WAS JUST DELIVERED.**\n\n"
+            f"That was a preview. What the full system holds is on another level entirely.\n\n"
+            f"Join the Vault now — it's 100% free — and unlock everything:\n\n"
+            f"📂 **All Blueprints**: Every premium PDF delivered instantly.\n"
+            f"🤖 **Elite AI Tools**: Private automation scripts the public never sees.\n"
+            f"💎 **Insider Strategies**: Reserved strictly for Vault members.\n"
+            f"🔓 **Full Agent Menu**: Dashboard, search, and live updates unlocked.\n\n"
+            f"This is the one action that separates access from opportunity.\n"
+            f"Join free. Stay informed. Scale faster.\n\n"
+            f"*The Vault is open. Your next move decides everything.*"
+        )
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💎 JOIN MSA VAULT (Free)", url=CHANNEL_LINK)],
+            [InlineKeyboardButton(text="📸 INSTAGRAM", url=INSTAGRAM_LINK),
+             InlineKeyboardButton(text="▶️ YOUTUBE", url=YOUTUBE_LINK)]
+        ])
+        await bot.send_message(user_id, msg, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+    except Exception as e:
+        logger.error(f"Failed to send psycho lock msg: {e}")
+
 # ==========================================
 # 🛑 MAINTENANCE MODE CHECK
+
+
 # ==========================================
-_maintenance_cache: dict = {"value": None, "set_at": 0.0, "settings": None}
+_maintenance_cache: dict = {"value": None, "set_at": 0.0, "bot3_settings": None}
 _MAINTENANCE_CACHE_TTL = 30  # seconds
 
 async def check_maintenance_mode(message: types.Message) -> bool:
@@ -1094,13 +1399,13 @@ async def check_maintenance_mode(message: types.Message) -> bool:
         if _maintenance_cache["value"] is not None and (now_ts - _maintenance_cache["set_at"]) < _MAINTENANCE_CACHE_TTL:
             if not _maintenance_cache["value"]:
                 return False
-            settings = _maintenance_cache["settings"]
+            settings = _maintenance_cache["bot3_settings"]
         else:
             # 3. Refresh from DB
-            settings = col_bot8_settings.find_one({"setting": "maintenance_mode"})
+            settings = col_bot1_settings.find_one({"setting": "maintenance_mode"})
             _maintenance_cache["value"] = bool(settings and settings.get("value", False))
             _maintenance_cache["set_at"] = now_ts
-            _maintenance_cache["settings"] = settings
+            _maintenance_cache["bot3_settings"] = settings
             if not _maintenance_cache["value"]:
                 return False
 
@@ -1436,417 +1741,415 @@ async def _check_freeze(message: types.Message) -> bool:
 # ==========================================
 # 📦 CONTENT PACKS (20 Items Each)
 # ==========================================
-CONTENT_PACKS = {
+CONTENT_PACKS: dict[str, list] = {
     "IGCCC_CODES": [
-        "👁️ **THE GLIMPSE:** You just saw a glimpse. The full picture is bigger. Grab out soon more content and free things. Check out YT MSA CODE.",
-        "⚡ **CHARGE:** That content was a spark. The fire is elsewhere. Check out more kind or check out YT MSA CODE.",
-        "🧩 **MISSING PIECE:** You have one piece. The puzzle is unsolved. Grab out soon more content and free things. Check out YT MSA CODE.",
-        "🌊 **DEEP DIVE:** Don't stay on the surface. Dive deeper. Check out more kind or check out YT MSA CODE.",
-        "🗝️ **UNLOCK:** The door is ajar. Push it open. Grab out more content and free things. Check out YT MSA CODE.",
-        "🚀 **BOOST:** That was just fuel. The engine is waiting. Check out more kind or check out YT MSA CODE.",
-        "💎 **HIDDEN GEMS:** The best content is not public. It is hidden. Grab out soon more content and free things. Check out YT MSA CODE.",
-        "📡 **SIGNAL:** You received the signal. Now trace the source. Check out more kind or check out YT MSA CODE.",
-        "🧠 **INTEL:** That was data. We have wisdom. Grab out soon more content and free things. Check out YT MSA CODE.",
-        "🔒 **ACCESS:** You are at the gate. The key is inside. Check out more kind or check out YT MSA CODE.",
-        "🌐 **NETWORK:** One post is a dot. The network is a line. Connect. Grab out soon more content and free things. Check out YT MSA CODE.",
-        "💼 **ASSET:** You viewed an asset. Now own the vault. Check out more kind or check out YT MSA CODE.",
-        "🧬 **DNA:** That was a sample. The organism is alive. Grab out soon more content and free things. Check out YT MSA CODE.",
-        "🔌 **PLUG IN:** You are running on battery. Plug into the grid. Check out more kind or check out YT MSA CODE.",
-        "🐺 **THE PACK:** You saw the lone wolf. Meet the pack. Grab out soon more content and free things. Check out YT MSA CODE.",
-        "🦅 **ALTITUDE:** You are on the ground. Fly higher. Check out more kind or check out YT MSA CODE.",
-        "⚔️ **WEAPON:** That was a shield. Get the sword. Grab out soon more content and free things. Check out YT MSA CODE.",
-        "🛡️ **DEFENSE:** You are exposed. Get armor. Check out more kind or check out YT MSA CODE.",
-        "🩸 **BLOOD:** It is in the veins. The heart is beating. Grab out soon more content and free things. Check out YT MSA CODE.",
-        "🌪️ **STORM:** That was a breeze. The storm is coming. Grab out soon more content and free things. Check out YT MSA CODE."
+        "👁️ **THE GLIMPSE:** You just saw a piece of it. The full picture is much bigger. More free content is waiting — grab your YT MSA CODE and get all of it.",
+        "⚡ **CHARGED:** That post was the spark. The real fire is on YouTube. Watch the video, get the MSA CODE, and access everything we promised.",
+        "🧩 **ONE PIECE:** You have one part of the puzzle. The rest is on YouTube. Get the MSA CODE and complete what you started.",
+        "🌊 **GO DEEPER:** You just touched the surface. The real value is inside. Watch the YouTube video, get the MSA CODE, and dive in.",
+        "🗝️ **THE KEY:** The door is right in front of you. The key is the MSA CODE on YouTube. Watch the video and step inside.",
+        "🚀 **READY TO LAUNCH:** You have the fuel. Now start the engine. Get the MSA CODE from YouTube and unlock what's next.",
+        "💎 **HIDDEN VALUE:** The best content is not out in the open. It's reserved for members. Watch the video, get the MSA CODE, and claim your spot.",
+        "📡 **FIND THE SOURCE:** You caught the signal. Now follow it to the source. The MSA CODE is in the YouTube video. Go get it.",
+        "🧠 **MORE THAN DATA:** That post gave you information. YouTube gives you the full strategy. Get the MSA CODE and level up for free.",
+        "🔒 **AT THE GATE:** You are standing at the entrance. The MSA CODE from YouTube is your pass. Watch the video and walk in.",
+        "🌐 **JOIN THE NETWORK:** One post connects you to the community. The MSA CODE connects you to everything. It's free — get it on YouTube.",
+        "💼 **OWN THE VAULT:** You saw the preview. Now own the full asset. The MSA CODE is your key — find it in the YouTube video.",
+        "🧬 **THE REAL THING:** That was just a sample. Come see the full version. Watch YouTube, grab the MSA CODE, and access the rest for free.",
+        "🔌 **POWER UP:** You are running on the free clips. The full power is on YouTube. Get the MSA CODE and plug into the main grid.",
+        "🐺 **THE PACK IS INSIDE:** You saw the teaser. The community is on the other side. Get the MSA CODE on YouTube and join us.",
+        "🦅 **FLY HIGHER:** You are at ground level right now. There is much more above. Watch the YouTube video and get the MSA CODE to rise up.",
+        "⚔️ **BETTER TOOLS WAIT:** What you saw is just the start. The real strategy is inside. Get the MSA CODE from YouTube and come prepared.",
+        "🛡️ **GET PROTECTED:** Free content keeps you exposed. The full system protects you. Watch the video, get the MSA CODE, and get covered.",
+        "🩸 **DEEPLY COMMITTED:** You clicked, you watched, you stayed. That matters. Now go all in — get the MSA CODE from YouTube and lock in your access.",
+        "🌪️ **MORE IS COMING:** That was just the beginning. The best content is still ahead. Get your MSA CODE on YouTube and be ready when it drops."
     ],
     "PDF_TITLES": [
-        "📫 **DELIVERED:** The Asset is in your inbox, {name}. It is a clear, step-by-step blueprint. Open it and execute.",
-        "🗺️ **THE MAP:** You have the map, {name}. It is easy to read. Follow the path. The destination is clear.",
-        "✅ **CONFIRMED:** The Transfer is complete, {name}. The PDF is a simplified guide. No fluff. Just action.",
-        "📘 **THE BLUEPRINT:** This is not a complex theory, {name}. It is a practical blueprint. Build exactly what you see.",
-        "⚡ **QUICK START:** The file is designed for speed, {name}. Read it in 10 minutes. Execute it today. Fast results.",
-        "🗝️ **MASTER KEY:** You hold the key, {name}. It fits the lock perfectly. Turn it. Open the door.",
-        "🧠 **CLARITY:** Confusion is the enemy, {name}. This PDF is the weapon. It cuts through the noise. Get clarity.",
-        "🏗️ **FOUNDATION:** Everything starts here, {name}. The PDF lays the foundation. It is solid. Build on it.",
-        "🛡️ **ARMOR:** The world is chaotic, {name}. This document is your armor. Put it on. You are protected.",
-        "🧭 **COMPASS:** You were lost, {name}. Now you have a compass. It points North. Follow the direction.",
-        "🩸 **THE PACT:** We have a deal, {name}. I give you the strategy. You give me the work. The contract is in the file.",
-        "🔋 **POWER SOURCE:** This is not just text, {name}. It is a battery. Plug in. Charge your systems.",
-        "🕶️ **VISION:** You were blind to the opportunity, {name}. Now you see. The PDF gives you 20/20 vision.",
-        "🧬 **THE CODE:** Success has a code, {name}. You just downloaded it. It is readable. Decrypt your future.",
-        "🎓 **THE LESSON:** School taught you to memorize, {name}. This PDF teaches you to think. Learn the real lesson.",
-        "💼 **PROFESSIONAL:** This is high-level intel, {name}. Treat it with respect. Execute like a professional.",
-        "🚦 **GREEN LIGHT:** You have the green light, {name}. The instructions are simple. Go. Do not stop.",
-        "🧩 **SOLVED:** The puzzle is solved, {name}. The PDF shows you the picture. Put the pieces together.",
-        "💎 **THE GEM:** You dug for it, {name}. Now polish it. The value is in your hands. Don't drop it.",
-        "🚀 **LAUNCH:** The checklist is complete, {name}. The systems are go. Launch the mission."
+        "📫 **DELIVERED:** Your resource is here, {name}. This is a clear, step-by-step guide. Open it, follow the steps, and take action.",
+        "🗺️ **YOUR ROADMAP:** You have the full plan, {name}. It is straightforward. Follow it from start to finish and reach your goal.",
+        "✅ **ALL YOURS:** Your download is ready, {name}. No filler, no fluff — just practical steps you can use today.",
+        "📘 **THE BLUEPRINT:** This is not theory, {name}. It is a real plan built for real results. Read it and start building.",
+        "⚡ **FAST TRACK:** This guide was made for speed, {name}. You can read it in under 10 minutes and put it to work the same day.",
+        "🗝️ **THE ANSWER:** You have been looking for this, {name}. Everything you need is inside. Open it and see for yourself.",
+        "🧠 **CLEAR DIRECTION:** Too much information creates confusion, {name}. This PDF cuts out the noise and gives you one clear path forward.",
+        "🏗️ **SOLID START:** Every strong result starts with a strong foundation, {name}. This PDF gives you exactly that. Build from here.",
+        "🛡️ **STAY AHEAD:** Others are guessing and losing time, {name}. This guide keeps you informed and moving in the right direction.",
+        "🧭 **YOUR GUIDE:** Not sure where to start? This PDF answers that, {name}. It points you in the right direction from page one.",
+        "🩸 **YOUR COMMITMENT:** You took the first step, {name}. This PDF is your next move. Do the work and get the result you want.",
+        "🔋 **READY TO USE:** This is not just a document, {name}. It is a working system. Put it into action and watch things move.",
+        "🕶️ **SEE THE FULL PICTURE:** You already saw the opportunity, {name}. This PDF shows you how to act on it the right way.",
+        "🧬 **THE FORMULA:** There is a repeatable formula behind every good result, {name}. You just received it. Now apply it.",
+        "🎓 **REAL KNOWLEDGE:** Formal education teaches you to memorize, {name}. This guide teaches you to build. Read and apply.",
+        "💼 **PROFESSIONAL LEVEL:** This is the kind of resource that serious people use, {name}. Treat it that way and get serious results.",
+        "🚦 **YOUR GREEN LIGHT:** Everything is set, {name}. The guide is simple and direct. There is nothing stopping you now. Start.",
+        "🧩 **THE COMPLETE PICTURE:** The information you needed is all in one place, {name}. Read it and see how everything connects.",
+        "💎 **REAL VALUE:** You earned this, {name}. Do not let it sit unopened. The value is there — but only if you use it.",
+        "🚀 **TIME TO MOVE:** You have the plan, {name}. Everything is ready. The only thing left is to take action. Go."
     ],
     "PDF_BUTTONS": [
-        "📂 OPEN BLUEPRINT", "🔓 UNLOCK ASSET", "👁️ SEE TRUTH", "🎒 GRAB BAG",
-        "📦 UNBOX PACKAGE", "🗝️ USE KEY", "👓 VIEW EVIDENCE",
-        "🤝 SECURE DEAL", "✊ SEIZE CHANCE", "📄 READ FILE", "🧱 BREAK WALL",
-        "🔦 REVEAL INTEL", "💵 CLAIM BOUNTY", "📥 GET DOWNLOAD", "💼 OPEN BRIEFCASE",
-        "🔐 DECRYPT FILE", "🔭 SCOUT TARGET", "🎣 HOOK PRIZE", "💿 SAVE ASSET",
-        "🗄️ ACCESS ARCHIVE", "🚪 ENTER ROOM", "🔬 INSPECT DATA", "🕯️ SEE LIGHT",
-        "⚒️ FORGE KEY", "🗡️ EQUIP WEAPON", "🩸 TAKE OATH",
-        "💠 CLAIM GEM"
+        "📂 OPEN YOUR GUIDE", "🔓 ACCESS THE GUIDE", "🎒 GET YOUR FILE",
+        "📦 DOWNLOAD NOW", "🗝️ OPEN THE GUIDE", "👓 VIEW THE GUIDE",
+        "🤝 GET YOUR GUIDE", "✊ TAKE GUIDE NOW",
+        "🔦 SEE INSIDE GUIDE", "💵 CLAIM THE GUIDE", "📥 DOWNLOAD FREE GUIDE", "💼 OPEN THE FILE", 
+        "🔐 UNLOCK THE GUIDE", "🎣 GRAB YOUR GUIDE", "💿 SAVE YOUR GUIDE",
+        "🗄️ ACCESS THE GUIDE", "🚪 OPEN AND READ", "🔬 VIEW GUIDE NOW", "🕯️ FOLLOW THE GUIDE",
+        "🗡️ USE THIS NOW", "🩸 COMMIT DOWNLOAD",
+        "💠 CLAIM YOUR GUIDE"
     ],
     "PDF_FOOTERS": [
-        "⚠️ Authorized for {name} only", "🔒 Status: CLASSIFIED | User: {name}", "⏱️ Time: NOW | Mission: GO",
-        "🕶️ Mode: GHOST | Trace: NONE", "🩸 Pact: SEALED | {name}", "🧾 Receipt: VALID | Item: BLUEPRINT",
-        "🛡️ Protection: ACTIVE | {name}", "🧬 DNA Match: {name} | CONFIRMED", "🔋 Battery: FULL | {name}: READY",
-        "🧊 Temperature: COLD | Fear: ZERO", "🐺 Pack: ONE | Leader: {name}", "🦅 Altitude: HIGH | View: CLEAR",
-        "🗝️ Access: GRANTED | Level: MAX", "🚫 Leaks: ZERO | Trust: 100%", "🧠 Firmware: UPDATED | {name}",
-        "🏹 Target: LOCKED | Shot: YOURS", "⚖️ Judge: YOU | Verdict: WIN", "🌪️ Storm: WEATHERED | Path: CLEAR",
-        "🧱 Wall: BROKEN | Path: OPEN", "🔦 Light: ON | Shadow: GONE", "💊 Matrix: EXIT | Reality: ENTER",
-        "💉 Dose: TRUTH | Patient: {name}", "🧩 Puzzle: SOLVED | Reward: CLAIMED", "🏆 Rank: ELITE | Player: {name}",
-        "🎫 Ticket: PUNCHED | Ride: START", "🎬 Scene: ONE | Action: {name}", "🎤 Mic: ON | Stage: YOURS",
-        "🥊 Corner: BLUE | Fighter: {name}", "🚦 Light: GREEN | Pedal: DOWN", "🏁 Flag: WAVED | Winner: {name}"
+        "⚠️ This guide was sent directly to you, {name}.", "🔒 Your access is confirmed, {name}. Use it wisely.", "⏱️ The right time to start is right now.",
+        "🕶️ No noise. No guessing. Just the plan.", "🩸 You committed. Here is what you asked for, {name}.", "🧾 Delivery confirmed. Your guide is ready to read.",
+        "🛡️ You are covered, {name}. The guide has everything you need.", "🧬 This was built for people like you, {name}.", "🔋 Energy is full. Now put it to work, {name}.",
+        "🧊 Stay calm and focused. The answers are inside.", "🐺 You made the move, {name}. Finish what you started.", "🦅 High performers act fast. The guide is open — move.",
+        "🗝️ Full access granted, {name}. Everything is inside.", "🚫 No shortcuts here. Just real steps that work.", "🧠 Sharp minds read first and act second. Your turn, {name}.",
+        "🏹 The target is clear. The guide shows you how to hit it.", "⚖️ You decided to show up. Now decide to follow through, {name}.", "🌪️ Everything you need is here. Clear path ahead.",
+        "🧱 The wall is gone. The guide shows you what is on the other side.", "🔦 You are in the right place, {name}. Keep reading.", "💊 Real solutions. No hype. Just results.",
+        "💉 The truth is inside, {name}. Read every page.", "🧩 It all comes together in this guide, {name}.", "🏆 This is the level you wanted to reach. Start here, {name}.",
+        "🎫 Your spot is confirmed. Make it count, {name}.", "🎬 Your first move starts with this guide, {name}.", "🎤 You have the floor, {name}. Use this to make your move.",
+        "🥊 You showed up ready, {name}. Now read and execute.", "🚦 Everything is green. Start reading and keep going.", "🏁 You are already ahead of most people, {name}. Finish the job."
     ],
     "AFFILIATE_TITLES": [
-        "🤖 **THE WORKFLOW:** I used to pay a VA $1,500/month to run my Twitter. Now I pay this AI tool $29/month to do it better. That is a $17,000/year raise. Click to give yourself a raise.",
-        "💸 **ROI ALERT:** This isn't an expense, it's an investment. If you buy a $40 tool and it makes you one $50 sale, everything after that is infinite ROI. Do not be cheap with your future.",
-        "🚀 **SPEED:** Speed is the only advantage you have against big corporations. They have meetings; you have this AI. While they talk, you build. Get the tool and start building.",
-        "💰 **ASSET BUILDING:** Stop looking for 'gigs' and start building 'assets'. An automated social media channel is an asset that pays you while you sleep. This is the engine for that asset.",
-        "🧬 **CLONE YOURSELF:** You are limited by 24 hours in a day. This AI is not. It clones your tone, your ideas, and your output. It’s the only ethical way to clone yourself. Start cloning.",
-        "📈 **COMPOUND RESULTS:** Content compounds. One video does nothing. 100 videos change your life. This tool ensures you actually post the 100 videos without burning out. Start compounding.",
-        "🏦 **THE MATH:** A $20 tool that saves you 20 hours is paying you $100/hour to use it (assuming your time is worth $100). If you don't buy it, you are losing money. Do the math.",
-        "💎 **HIDDEN GEM:** Most 'AI tools' are just ChatGPT wrappers. This one is different. It’s a full-stack automation suite that actually executes tasks. I only share the real ones. Get it.",
-        "🧾 **EXPENSE IT:** If you have a business, this is a write-off. If you don't have a business, this is how you start one. It costs less than a lunch. Stop overthinking.",
-        "🏗️ **FOUNDATION:** You wouldn't build a house without a foundation. Don't try to build a content empire without an automation foundation. This software is the concrete.",
-        "🧠 **PSYCHOLOGY:** Humans are wired to trust consistency. If you post every day, you win trust. But humans are inconsistent. This AI solves the human flaw. Be consistent.",
-        "⚡ **FRICTION:** The reason you haven't started is 'friction'. Creating is hard. This tool removes the friction. One click, one piece of content. Remove the barrier.",
-        "🕵️ **SECRET ADVANTAGE:** The top 1% of creators aren't working 100x harder than you. They just have better levers. This tool is a lever. Pull it.",
-        "📝 **WRITING HACK:** I hate writing emails. So I stopped. I trained this AI to write exactly like me, and now it sends 1000 emails a week. My open rates went UP. Try it.",
-        "🎨 **NO SKILL NEEDED:** You don't need to be a designer, a writer, or a coder. You just need to be smart enough to use this tool. It bridges the skill gap. Cross the bridge.",
-        "🧹 **AUTOMATE THE BORING:** Life is too short to do boring work. Data entry, scheduling, formatting... let the robot do it. You focus on the strategy. Reclaim your life.",
-        "🚿 **PASSIVE INCOME:** Everyone says they want passive income, but they do manual work. That is active income. To get passive results, you need active robots. Here is your robot.",
-        "⚙️ **SYSTEM:** You fall to the level of your systems. If your system is 'I'll do it when I feel like it', you will fail. If your system is this AI, you will succeed. Upgrade your system.",
-        "📅 **CONSISTENCY:** Motivation gets you started. Habit keeps you going. Automation keeps you going even when you quit. This is your insurance policy against quitting.",
-        "📂 **DIGITAL REAL ESTATE:** Every piece of content you post is a digital brick. This tool lays bricks 24/7. Build your mansion while you sleep.",
-        "😨 **THE WARNING:** I've seen it happen. People wait too long, the algorithm changes, and the opportunity is gone. This tool is working *right now*. Don't wait for it to break.",
-        "🦖 **DINOSAUR:** In 5 years, running a manual business will be like riding a horse to work. Cute, but slow. Don't be a dinosaur. Get the car (AI).",
-        "📉 **INFLATION:** The cost of living is going up. Your income needs to go up faster. Manual work can't keep up. Scalable AI income is the only hedge. Protect yourself.",
-        "🚫 **DON'T GET LEFT BEHIND:** Your competitors are reading this right now. Half of them will click. Half won't. The half that click will beat you. Which half are you in?",
-        "⚠️ **PRICE HIKE:** Software companies always raise prices once they get popular. Lock in your legacy pricing now before they 2x the monthly cost. Secure the bag.",
-        "🛑 **STOP SCROLLING:** You have been scrolling for 20 minutes. That gave you $0. If you spent that 20 minutes setting up this tool, you'd be building an asset. Switch modes.",
-        "⏳ **TIME IS MONEY:** Every hour you spend doing manual work is an hour you just sold for $0. Stop giving away your inventory. Automate the work.",
-        "🌪️ **THE WAVE:** AI is a tidal wave. You can surf it or you can drown. This tool is your surfboard. Get on the board.",
-        "👋 **FIRE YOUR BOSS:** The only way to fire your boss is to replace your salary. You can't do that with a side hustle that takes 10 hours a day. You need automation. Start here.",
-        "🤜 **PUNCH BACK:** The economy is punching you in the face. Punch back. Build a revenue stream that isn't dependent on a paycheck. This is your weapon.",
-        "🧪 **TESTED BY ME:** I don't recommend junk. I personally use this for my main channel. If it breaks, I lose money. It hasn't broken. That's my endorsement.",
-        "📊 **RESULTS:** I showed this to a student last week. He set it up in 20 minutes. Today he sent me a screenshot of his first commission. It works fast. Try it.",
-        "👨🔬 **THE LAB:** I spend $1,000s testing tools so you don't have to. I filtered out the trash. This is the one that survived. It's the best in class.",
-        "🔬 **VETTED:** I don't share garbage. I vet everything. This passed every test. Trust my process, {name}."
+        "🤖 **THE WORKFLOW:** I previously paid $1,500/month for a VA. Now this $29/month AI does the exact same tasks better. That’s a $17,000/year raise. Click to secure yours.",
+        "💸 **ROI ALERT:** This is an investment, not an expense. If a $40 tool brings in one $50 sale, the rest is pure profit. Don’t cut corners on your growth.",
+        "🚀 **SPEED:** Corporate competitors have meetings; you have this AI. While they talk, you build. Get the tool and execute faster.",
+        "💰 **ASSET BUILDING:** Stop trading time for gigs. Start building automated assets that pay you 24/7. This is the engine behind those assets.",
+        "🧬 **CLONE YOURSELF:** Your time is limited. This AI clones your voice, ideas, and output at scale. It’s the smartest way to duplicate your effort.",
+        "📈 **COMPOUND RESULTS:** One post does nothing; consistent output changes your life. This tool guarantees you hit your volume without burning out. Start compounding.",
+        "🏦 **THE MATH:** If a $20 tool saves you 20 hours, it’s paying you to use it. Ignoring automation is literally costing you money. Run the numbers.",
+        "💎 **HIDDEN GEM:** Most tools just wrap ChatGPT. This is a full-stack automation system that executes real tasks. I only share what works. This works.",
+        "🧾 **EXPENSE IT:** If you own a business, write this off. If you don’t, this is how you build one. It costs less than dinner. Take the step.",
+        "🏗️ **FOUNDATION:** You wouldn't skip the foundation on a house. Don't skip the automation foundation on your business. This software is the concrete.",
+        "🧠 **PSYCHOLOGY:** Consistency builds trust. But humans are inconsistent by nature. This AI solves that flaw. Automate your consistency.",
+        "⚡ **FRICTION:** Creating from scratch causes friction. This tool removes the friction entirely. One click, one result. Clear the barrier.",
+        "🕵️ **SECRET ADVANTAGE:** Top creators don't work 100x harder; they use better leverage. This system is leverage. Pull the lever.",
+        "📝 **WRITING HACK:** I stopped writing emails manually. I trained this AI on my voice, and now it sends emails natively. My open rates increased. Try it out.",
+        "🎨 **NO SKILL NEEDED:** You don't need technical skills or design experience. You just need to be smart enough to apply the tool. It bridges the gap.",
+        "🧹 **AUTOMATE THE BORING:** Life is too short for data entry and manual formatting. Let the software handle operations while you focus on strategy.",
+        "🚿 **PASSIVE INCOME:** 'Passive income' requires active systems. Doing manual work is active income. Build an active system with this system today.",
+        "⚙️ **SYSTEM:** You rise to the level of your systems. A system of 'doing it later' fails. A system of automation wins. Upgrade yours.",
+        "📅 **CONSISTENCY:** Motivation gets you started, but automated habits keep you going. This tool runs even when you take the day off. Secure your consistency.",
+        "📂 **DIGITAL REAL ESTATE:** Every post is a digital asset. This tool builds your real estate portfolio 24/7. Build while you sleep.",
+        "😨 **THE WARNING:** People wait until the opportunity is crowded. This tool gives you an edge *right now*. Act before the window closes.",
+        "🦖 **DINOSAUR:** Running a fully manual business in 5 years will be obsolete. Adapt with AI now, or get left behind. Make the shift.",
+        "📉 **INFLATION:** Costs are rising. Manual hourly work can't scale fast enough to beat inflation. You need scalable systems to protect your margin.",
+        "🚫 **DON'T GET LEFT BEHIND:** Half the people reading this will take action; half won't. The action-takers will win the market. Decide which side you are on.",
+        "⚠️ **PRICE HIKE:** Good software raises prices as it grows. Lock in your legacy rate right now before the monthly cost doubles. Secure the price.",
+        "🛑 **STOP SCROLLING:** You just spent 20 minutes consuming for $0. Spend the next 20 minutes setting up this tool to build an asset instead. Switch gears.",
+        "⏳ **TIME IS MONEY:** Any manual task you do is time you just priced at zero. Stop giving away your margin. Automate the routine.",
+        "🌪️ **THE WAVE:** AI is a tidal wave. You either ride it or get swept away. This system is your board. Get on.",
+        "👋 **FIRE YOUR BOSS:** You can't replace a full-time salary with another full-time grind. You need leverage. Leverage starts here.",
+        "🤜 **PUNCH BACK:** Build a revenue stream that isn't tied to your hourly wage. This system gives you the leverage to punch back at the economy.",
+        "🧪 **TESTED BY ME:** I don't push junk. I rely on this tool daily. If it breaks, I lose revenue. It hasn't broken. That is the highest endorsement.",
+        "📊 **RESULTS:** Someone set this up in 20 minutes last week and generated their first automated result today. It works fast. Test it yourself.",
+        "👨🔬 **THE LAB:** I spend thousands validating software so you don't have to guess. This is the top performer in its class. Skip the testing phase.",
+        "🔬 **VETTED:** Everything I share is fully vetted. This tool passed every standard. Trust the process and implement it, {name}."
     ],
     "AFFILIATE_FOOTERS": [
-        "Click now or regret later, {name}.",
-        "Every second you wait is revenue lost, {name}.",
-        "This is the sign you were looking for, {name}.",
-        "Don't let fear decide your future, {name}.",
-        "You'll either click this or watch someone else win with it, {name}.",
-        "The best time was yesterday. The second best time is now, {name}.",
-        "Hesitation is expensive, {name}.",
-        "Winners click. Losers scroll.",
-        "This is your edge, {name}. Use it.",
-        "Success leaves clues. This is one of them.",
-        "You already know you need this, {name}.",
-        "Investment, not expense. Get it {name}.",
-        "While you think, others act. Don't be late {name}.",
-        "Your competition just clicked. Now it's your turn {name}.",
-        "Courage is clicking even when you're scared, {name}.",
-        "This tool pays for itself on day one {name}.",
-        "Stop planning. Start building.",
-        "The opportunity is here. The decision is yours, {name}.",
-        "You can afford this. You can't afford to skip it.",
-        "One click. Infinite upside. Zero excuses."
+        "Take action now, {name}. Hesitation pays zero.",
+        "Every day without systems is a day of lost leverage, {name}.",
+        "This is the exact resource you've been looking for, {name}.",
+        "Execute based on facts, not fear, {name}.",
+        "You can deploy this, or watch someone else win with it, {name}.",
+        "The timeline is moving. Claim your spot now, {name}.",
+        "Delaying a good decision is a bad decision, {name}.",
+        "Results require action. Make the move.",
+        "This is your unfair advantage, {name}. Apply it.",
+        "Success follows proven systems. This is the system.",
+        "The value is obvious, {name}. The next step is yours.",
+        "Treat this as a core investment, {name}. It pays off.",
+        "Your competitors are scaling. Catch up, {name}.",
+        "The market rewards speed. Move fast, {name}.",
+        "Commitment drives results. Lock it in, {name}.",
+        "The ROI starts the moment you implement this, {name}.",
+        "Stop analyzing. Start executing.",
+        "The window is open. Walk through, {name}.",
+        "You need this infrastructure. Bring it online.",
+        "Zero excuses left. Click to start."
     ],
     "AFFILIATE_TITLES_EXTRA": [
-        "✅ **VERIFIED:** Beware of fake AI tools. There are scams out there. This link is the verified official site for the tool I use. Stay safe. Use this link.",
-        "📜 **MY STACK:** People ask me 'What is your tech stack?'. This is the foundation of it. Without this, my business collapses. That is how important it is.",
-        "👨🏫 **LESSON:** The wealthy buy time. The poor sell time. For $29, you are buying 100 hours of time. That is the best trade you will ever make.",
-        "🏆 **WINNER:** Winners make decisions quickly. Losers overthink until the opportunity is gone. Be a winner. Make the decision. Click the link.",
-        "🥇 **TOP TIER:** There are free tools and there are paid tools. Free tools cost you time. Paid tools make you money. Upgrade to the top tier.",
-        "🤝 **TRUST ME:** If you trust my content, trust my recommendation. I would not risk my reputation for a few dollars. This tool is legitimate power.",
-        "🗣️ **FINAL WORD:** You can keep doing it the hard way, and I will respect the hustle. But if you want the smart way, the wealthy way... click the button."
+        "✅ **VERIFIED:** Avoid knock-off tools and scams. This is the verified, official suite I actually use. Secure your access through this link.",
+        "📜 **MY STACK:** If you want to know my tech stack, this is the core. Without this infrastructure, the system stops. It is mandatory.",
+        "👨🏫 **LESSON:** You can either buy time or sell it. A $29 software buys you 100 hours of leverage. That is the highest-return trade available.",
+        "🏆 **WINNER:** Decisiveness separates operators from observers. Lock in the tool and become an operator. Make the decision.",
+        "🥇 **TOP TIER:** Free tools cost you manual labor. Premium tools save you labor. Upgrade to the tier that creates leverage.",
+        "🤝 **TRUST ME:** My reputation relies on sharing what actually works. I stake my performance on this software. It is legitimate.",
+        "🗣️ **FINAL WORD:** You can continue grinding manually, but there is a smarter way. If you are ready to scale efficiently, click the button."
     ],
     "AFFILIATE_BUTTONS": [
-        "💸 CLAIM YOUR EDGE",
-        "🚀 ACTIVATE NOW",
-        "🛠️ GRAB THE TOOL",
-        "⚡ GET INSTANT ACCESS",
-        "🤖 UNLOCK AUTOMATION",
-        "📈 START EARNING TODAY",
-        "🏗️ BUILD YOUR EMPIRE",
-        "💎 SECURE THE GEM",
-        "🧱 LAY YOUR FOUNDATION",
-        "⏳ STOP WASTING TIME",
-        "🔥 IGNITE YOUR GROWTH",
-        "💰 CLAIM FREE TRIAL",
-        "🎯 HIT YOUR TARGET",
-        "🔓 UNLOCK FULL POWER",
-        "⚙️ AUTOMATE EVERYTHING",
-        "🏆 JOIN THE WINNERS",
-        "🎁 REDEEM YOUR BONUS",
-        "💪 GAIN THE ADVANTAGE",
-        "🌟 ACCESS PREMIUM NOW",
-        "✅ YES, I WANT THIS"
+        "🚀 ACTIVATE ACCOUNT NOW",
+        "⚡ START YOUR ENGINE",
+        "🏗️ BEGIN INSTALLATION",
+        "🔧 CONFIGURE THE SYSTEM",
+        "🔌 PLUG INTO THE TOOL",
+        "💻 START THE BUILD",
+        "✅ COMPLETE SETUP",
+        "🎯 EXECUTE SETUP",
+                
+        "🔓 UNLOCK AND INSTALL",
+        "🔌 CONNECT YOUR TOOL",
+        "⚙️ DEPLOY FULL SYSTEM",
+        "🛠️ ASSEMBLE YOUR STACK",
+        "🚀 INITIATE STARTUP",
+        "⚡ QUICK INSTALLATION",
+        "🏗️ SET UP FOUNDATION",
+        "🔧 BEGIN INTEGRATION",
+        "✅ I AM READY TO SETUP"
     ],
     "YT_VIDEO_TITLES": [
-        "👁️ **THE SOURCE:** You have seen the clips on Instagram, {name}. Now go to the source. The Main Channel has the full picture. Explore it.",
-        "📡 **MAIN FREQUENCY:** Instagram is for updates, {name}. YouTube is for the broadcast. Tune into the main frequency on the Channel.",
-        "🧠 **THE ARCHIVE:** You are only seeing the surface on Instagram, {name}. The YouTube Channel is the archive. Go deep.",
-        "🏗️ **HEADQUARTERS:** Instagram is the outpost, {name}. YouTube is Headquarters. Report to HQ for the full briefing.",
-        "🌊 **DEEP DIVE:** Instagram is the shallow end, {name}. YouTube is the deep ocean. Dive into the Main Channel.",
-        "📚 **THE LIBRARY:** You read the headlines on Insta, {name}. Read the book on YouTube. The Channel holds the knowledge.",
-        "⚡ **FULL POWER:** Instagram is 10% power, {name}. YouTube is 100%. Switch to the Main Channel for full voltage.",
-        "🔥 **UNCENSORED:** We are limited on Instagram, {name}. We are unleashed on YouTube. Watch the uncensored strategies on the Channel.",
-        "🔐 **THE VAULT:** The gems are on Instagram, {name}. The gold bars are on YouTube. Enter the vault on the Main Channel.",
-        "🧬 **ORIGIN STORY:** You know the brand from Instagram, {name}. Learn the philosophy on YouTube. Watch the Main Channel.",
-        "🕸️ **THE NETWORK:** Instagram is the web, {name}. YouTube is the spider. Come to the center of the network.",
-        "🎓 **HIGHER LEARNING:** Instagram is recess, {name}. YouTube is class. School is in session on the Main Channel.",
-        "🛫 **LAUNCHPAD:** You are taxiing on Instagram, {name}. Take off on YouTube. The Main Channel is the runway.",
-        "🔭 **BIGGER PICTURE:** Expand your view, {name}. Instagram is a keyhole. YouTube is the door. Open it.",
-        "🗺️ **EXPEDITION:** The journey starts on Insta, {name}. The expedition happens on YouTube. Join the trek on the Channel.",
-        "🥊 **HEAVYWEIGHT:** Instagram is sparring, {name}. YouTube is the title fight. Step into the ring on the Main Channel.",
-        "🎹 **FULL SYMPHONY:** You heard the notes on Insta, {name}. Hear the symphony on YouTube. Listen to the Main Channel.",
-        "🍳 **THE KITCHEN:** You saw the meal on Instagram, {name}. See how it's cooked on YouTube. Enter the kitchen.",
-        "🏎️ **FULL THROTTLE:** You are cruising on Insta, {name}. Race on YouTube. Hit the gas on the Main Channel.",
-        "🌎 **THE UNIVERSE:** You are in orbit on Instagram, {name}. Land on the planet on YouTube. Explore the ecosystem."
+        "👁️ **THE SOURCE:** You saw the short clips on Instagram, {name}. The full strategy is on the Main Channel. Go explore it.",
+        "📡 **MAIN FREQUENCY:** Instagram is for the highlights, {name}. YouTube is the full broadcast. Tune into the Main Channel.",
+        "🧠 **THE ARCHIVE:** You are only scratching the surface on Instagram, {name}. The YouTube Channel holds the full archive. Go deep.",
+        "🏗️ **HEADQUARTERS:** Instagram is the outpost, {name}. YouTube is Headquarters. Report there for the full briefing.",
+        "🌊 **DEEP DIVE:** Instagram is the shallow end, {name}. YouTube is where the real depth is. Dive into the Main Channel.",
+        "📚 **THE LIBRARY:** You read the headlines on Instagram, {name}. Now read the book on YouTube. The Channel holds the blueprint.",
+        "⚡ **FULL POWER:** Instagram is a preview, {name}. YouTube is the full system. Switch to the Main Channel for everything.",
+        "🔥 **UNCENSORED:** The short-form content is limited, {name}. The full, uncensored strategies are on the YouTube Channel. Watch now.",
+        "🔐 **THE VAULT:** The quick tips are on Instagram, {name}. The real assets are in the YouTube vault. Enter the Main Channel.",
+        "🧬 **ORIGIN STORY:** You know the brand from the feed, {name}. Learn the philosophy behind it on YouTube. Watch the Main Channel.",
+        "🕸️ **THE NETWORK:** Instagram is the starting point, {name}. YouTube is the center. Come to the core of the network.",
+        "🎓 **HIGHER LEARNING:** Instagram is for attention, {name}. YouTube is for education. Class is in session on the Main Channel.",
+        "🛫 **LAUNCHPAD:** You are preparing on Instagram, {name}. Take off on YouTube. The Main Channel is the runway.",
+        "🔭 **BIGGER PICTURE:** Expand your perspective, {name}. Instagram is a keyhole. YouTube is the open door. Walk through.",
+        "🗺️ **EXPEDITION:** The introduction is on Insta, {name}. The actual journey happens on YouTube. Join the Channel.",
+        "🥊 **HEAVYWEIGHT:** Instagram is practice, {name}. YouTube is the main event. Step into the arena on the Main Channel.",
+        "🎹 **FULL SYMPHONY:** You heard the notes on Instagram, {name}. Hear the full composition on YouTube. Listen to the Main Channel.",
+        "🍳 **THE KITCHEN:** You saw the result on Instagram, {name}. See how we built it on YouTube. Watch the process.",
+        "🏎️ **FULL THROTTLE:** You are cruising on Insta, {name}. It's time to accelerate on YouTube. Hit the gas on the Main Channel.",
+        "🌎 **THE UNIVERSE:** You are orbiting on Instagram, {name}. Land and explore the full ecosystem on YouTube."
     ],
     "YT_CODES_BUTTONS": [
-        "📺 EXPLORE CHANNEL",
-        "📺 VISIT MAIN HUB",
-        "📺 ACCESS ARCHIVE",
+        "📺 ACCESS THE CHANNEL",
+        "📺 VISIT THE HUB",
+        "📺 OPEN THE ARCHIVE",
         "📺 ENTER THE VAULT",
-        "📺 JOIN THE NETWORK",
-        "📺 SEE FULL PICTURE",
-        "📺 GO TO SOURCE",
-        "📺 UNLOCK CHANNEL",
-        "📺 VIEW ALL INTEL",
-        "📺 OPEN MAIN FEED"
+        "📺 JOIN THE PLATFORM",
+        "📺 VIEW FULL STRATEGY",
+        "📺 GO TO THE STRATEGY",
+        "📺 UNLOCK THE CHANNEL",
+        "📺 WATCH THE INTEL",
+        "📺 OPEN MAIN CHANNEL"
     ],
     "IG_VIDEO_TITLES": [
-        "➕ **GET MORE:** You liked the video, {name}? There is so much more on Instagram. Get the full experience.",
-        "🤝 **CONNECT:** You watched the content, {name}. Now connect with the man behind it. I am on Instagram.",
-        "🏠 **THE HOUSE:** YouTube is the front yard, {name}. Instagram is the living room. Come inside the house.",
-        "🔥 **THE ENERGY:** YouTube is information, {name}. Instagram is energy. Come feel the vibe.",
-        "🧬 **FULL CIRCLE:** You have the lesson, {name}. Now get the lifestyle. Use Instagram to complete the circle.",
-        "🫂 **THE FAMILY:** YouTube is for everyone, {name}. Instagram is for the family. Join the brotherhood.",
-        "📸 **UNFILTERED:** YouTube is polished, {name}. Instagram is raw. See the real me.",
-        "🧠 **INSIDE MY HEAD:** I share my daily thoughts on Instagram, {name}. Get inside my head. Learn how I think.",
-        "❤️ **PASSION:** You see the work on YouTube, {name}. Feel the passion on Instagram. It hits different.",
-        "🆙 **LEVEL UP:** You want more? I give more on Instagram, {name}. Level up your access.",
-        "🎁 **BONUS:** The video was just the start, {name}. The bonus content is waiting on Instagram. Go get it.",
-        "🗣️ **CONVERSATION:** YouTube is a speech, {name}. Instagram is a conversation. Let's talk.",
-        "👀 **CLOSER LOOK:** Get a closer look at the operation, {name}. Instagram zooms in. See the details.",
-        "🛡️ **MY CIRCLE:** See who I hang with on Instagram, {name}. You are the average of your circle. Check mine.",
-        "💎 **MORE GEMS:** I drop daily gems on various topics, {name}. Don't miss the free game on Instagram.",
-        "🚀 **THE RIDE:** Come along for the ride, {name}. I document the journey on Instagram. Be a passenger.",
-        "🚪 **BACKSTAGE:** You saw the show on YouTube, {name}. Come backstage on Instagram. Meet the team.",
-        "🔌 **PLUG IN:** YouTube is the device, {name}. Instagram is the outlet. Plug in for power.",
-        "🌊 **IMMERSE:** Don't just watch, {name}. Immerse yourself. Instagram surrounds you with the mindset.",
-        "🔑 **ACCESS GRANTED:** I am giving you access to my daily life, {name}. Accept the invite on Instagram."
+        "➕ **GET MORE:** If you found value here, {name}, there is much more on Instagram. Experience the daily operations.",
+        "🤝 **CONNECT:** You consumed the content, {name}. Now connect directly. Follow the operation on Instagram.",
+        "🏠 **THE HOUSE:** YouTube provides the framework, {name}. Instagram shows the daily execution. Come inside.",
+        "🔥 **THE ENERGY:** YouTube is the strategy, {name}. Instagram is the execution and energy. Experience both.",
+        "🧬 **FULL CIRCLE:** You learned the lesson, {name}. Now see it applied in real time on Instagram. Complete the loop.",
+        "🫂 **THE COMMUNITY:** YouTube is public, {name}. Instagram is where the community operates closely. Join us.",
+        "📸 **UNFILTERED:** YouTube has high production, {name}. Instagram is raw and real-time. See the actual day-to-day.",
+        "🧠 **INSIDE MY HEAD:** Receive daily insights and raw thoughts on Instagram, {name}. Understand the mindset.",
+        "❤️ **PASSION:** The videos show the work, {name}. Instagram shows the relentless drive behind it. Follow along.",
+        "🆙 **LEVEL UP:** You want more frequent updates? I post the daily mechanics on Instagram, {name}. Level up.",
+        "🎁 **BONUS:** The YouTube video was the foundation, {name}. The daily updates and bonuses happen on Instagram.",
+        "🗣️ **CONVERSATION:** YouTube is a broadcast, {name}. Instagram is a dialogue. Join the conversation there.",
+        "👀 **CLOSER LOOK:** Want to see the behind-the-scenes, {name}? Instagram zooms in on the operations. Watch closely.",
+        "🛡️ **MY NETWORK:** See the environment I operate in on Instagram, {name}. Your network is your net worth.",
+        "💎 **MORE GEMS:** Daily tactical drops happen exclusively on Instagram, {name}. Don't miss the real-time value.",
+        "🚀 **THE RIDE:** Follow the actual journey as it happens, {name}. The documentation lives on Instagram.",
+        "🚪 **BACKSTAGE:** You saw the final product on YouTube, {name}. Come backstage on Instagram to see the build.",
+        "🔌 **PLUG IN:** YouTube is the long-form asset, {name}. Instagram is the daily pulse. Plug into the feed.",
+        "🌊 **IMMERSE:** Don't just watch passively, {name}. Immerse yourself in the daily reality. Follow the Instagram.",
+        "🔑 **ACCESS GRANTED:** Experience the unedited daily life of the operation, {name}. Accept the invite on Instagram."
     ],
     "IG_CODES_BUTTONS": [
         "📸 SEE THE REALITY",
-        "📸 JOIN THE NETWORK",
-        "📸 WATCH EXECUTION",
-        "📸 SEE DAILY OPS",
-        "📸 VERIFY RESULTS",
-        "📸 CHECK THE FIELD",
-        "📸 FOLLOW THE MAN",
-        "📸 VIEW LIFESTYLE",
-        "📸 ACCESS EVIDENCE",
-        "📸 ENTER THE LAB"
+        "📸 JOIN THE INSIDERS",
+        "📸 WATCH IT HAPPEN",
+        "📸 SEE DAILY PIPELINE",
+        "📸 VERIFY THE WORK",
+        "📸 CHECK THE PROCESS",
+        "📸 FOLLOW THE FOUNDER",
+        "📸 VIEW THE LIFESTYLE",
+        "📸 ACCESS REAL TIME",
+        "📸 ENTER THE DAILY LAB"
     ],
     "IG_VIDEO_FOOTERS": [
-        "Don't overthink it, {name}. Just click and see.",
-        "This is where the conversation happens.",
-        "The door is open, {name}. Step in.",
-        "Stop reading. Start following.",
-        "You'll regret not clicking, {name}.",
-        "The network is waiting for you.",
-        "One click separates you from the next level, {name}.",
-        "Follow now. Thank yourself later.",
-        "You're already here. Might as well commit.",
-        "This isn't spam, {name}. This is opportunity.",
-        "Everyone who follows, grows. Simple math.",
-        "The proof is in the feed, {name}.",
-        "You clicked on the Blueprint. Now click on this, {name}.",
-        "Instagram is where I live, {name}. Come visit.",
-        "Don't let your fear of commitment stop your growth.",
-        "You got this far, {name}. Finish the job.",
-        "The people who follow, succeed. Facts.",
-        "This is the missing piece, {name}.",
-        "Access denied until you follow.",
-        "If you're serious, you'll click. If not, you won't."
+        "Take the next step, {name}. See the daily action.",
+        "This is where the real-time execution happens.",
+        "The operation is fully transparent, {name}. Look inside.",
+        "Stop passively watching. Start engaging.",
+        "Missing this means missing the daily mechanics, {name}.",
+        "The daily network feed is waiting for you.",
+        "One click gives you the behind-the-scenes view, {name}.",
+        "Follow the reality. Apply the lessons.",
+        "You are already invested. Lock in the daily updates.",
+        "This is pure access, {name}. Take advantage of it.",
+        "Observing the daily process is how you learn.",
+        "The daily proof is published on the feed, {name}.",
+        "You have the blueprint. Now watch the execution, {name}.",
+        "Instagram is where the daily work is shown, {name}.",
+        "Stay close to the source to maintain your momentum.",
+        "You made it this far, {name}. Enter the daily circle.",
+        "Success requires daily immersion. This is your immersion.",
+        "This is the missing daily link you needed, {name}.",
+        "Stay plugged into the daily frequency.",
+        "If you are serious about scale, you will watch the daily execution."
     ],
     "MSACODE": [
-        "🔍 **THE SOURCE:** {name}, YouTube holds the **MSA CODES**. Instagram holds the **INTEL**. You need both to survive.",
-        "🗝️ **KEYS & MAPS:** The Keys (**MSA CODES**) are in the YouTube briefings, {name}. The Map is on Instagram. Don't get lost.",
-        "💎 **DOUBLE THREAT:** {name}, Watch YouTube for the **MSA CODES**. Follow Instagram for the **STRATEGY**. Master both.",
-        "📡 **SIGNAL:** YouTube transmits the **MSA CODES**, {name}. Instagram transmits the **CULTURE**. Tune into both frequencies.",
-        "🛑 **MISSING DATA:** {name}, If you only have the PDF, you have 10%. YouTube has the **MSA CODES** (40%). Instagram has the rest.",
-        "🐺 **HUNTING GROUNDS:** We drop **MSA CODES** in YouTube videos, {name}. We drop **STATUS** on Instagram. Hunt everywhere.",
-        "👁️ **ALWAYS WATCHING:** Did you miss the **MSA CODE** in the last video, {name}? YouTube has it. Instagram shows you how to use it.",
-        "⚡ **POWER SUPPLY:** {name}, YouTube is the **GENERATOR** (MSA CODES). Instagram is the **BATTERY** (Energy). Plug into both.",
-        "🧠 **FULL ACCESS:** You want more **MSA CODES**, {name}? Go to YouTube. You want the network? Go to Instagram. Full access requires both.",
-        "📦 **THE DROP:** The Asset is here, {name}. The **MSA CODE** to open the next one is on YouTube. The **MISSION** is on Instagram.",
-        "🔐 **TWO KEYS:** Success requires two keys, {name}. One (**MSA CODE**) is hidden in our YouTube videos. The other is on our Instagram feed.",
-        "🌐 **THE SYSTEM:** The System distributes **MSA CODES** via YouTube and **ORDERS** via Instagram. Follow the System, {name}.",
-        "🧬 **DNA:** The DNA of success, {name}: **MSA CODES** (YouTube) + **NETWORK** (Instagram). Do not separate them.",
-        "🕵️ **CLUES:** {name}, We hid the last **MSA CODE** in a YouTube frame. We posted the clue on Instagram. Play the game.",
-        "🏆 **THE PRIZE:** The prize is locked, {name}. YouTube has the **MSA CODE**. Instagram shows you the path to the vault.",
-        "🔌 **DISCONNECTED:** Without YouTube, you miss the **MSA CODES**. Without Instagram, you miss the **SIGNAL**. Reconnect, {name}.",
-        "📢 **BRIEFING:** The Mission Briefing is on YouTube (grab the **MSA CODE**), {name}. The Debrief is on Instagram. Report in.",
-        "⏳ **COUNTDOWN:** The next **MSA CODE** drops on YouTube soon, {name}. Instagram will notify you. Be ready.",
-        "🤝 **THE DEAL:** You watch YouTube for **MSA CODES**, {name}. You follow Instagram for **POWER**. That is the deal.",
-        "🚪 **DUAL ENTRY:** One door opens with an **MSA CODE** (YouTube). The other opens with reputation (Instagram). Enter, {name}.",
-        "🔦 **SEARCH PARTY:** {name}, the search is on. **MSA CODES** are hidden on YouTube. **CLUES** are on Instagram.",
-        "💼 **THE BRIEFCASE:** The briefcase is locked, {name}. Combination is an **MSA CODE** (YouTube). Location is Instagram.",
-        "🚁 **EXTRACTION:** Extraction point set, {name}. Ticket is an **MSA CODE** (YouTube). Route is on Instagram.",
-        "📡 **FREQUENCY:** {name}, you are on the wrong frequency. Tune to YouTube for **MSA CODES**. Instagram for **ORDERS**.",
-        "🧱 **THE WALL:** Hit a wall, {name}? Break it with an **MSA CODE** from YouTube. Build a bridge on Instagram.",
-        "💊 **RED PILL:** The Red Pill is the **MSA CODE** (YouTube). The rabbit hole is Instagram. Wake up, {name}.",
-        "🕰️ **TIK TOK:** Time is running out, {name}. Grab the **MSA CODE** from YouTube before the clock stops. Updates on Instagram.",
-        "🗺️ **COMPASS:** You are lost, {name}. YouTube is your North (**MSA CODES**). Instagram is your map.",
-        "⚖️ **JUDGMENT:** You are being judged, {name}. Evidence: **MSA CODES** (YouTube). Verdict: Instagram.",
-        "🌪️ **CHAOS:** Control the chaos, {name}. Structure comes from **MSA CODES** (YouTube). Power comes from Instagram.",
-        "🔑 **MASTER KEY:** There is a master key, {name}. It's an **MSA CODE** on YouTube. The door is on Instagram.",
-        "👁️‍🗨️ **VISION:** Clear your vision, {name}. See the **MSA CODE** on YouTube. See the future on Instagram.",
-        "🩸 **BLOODLINE:** It's in the blood, {name}. **MSA CODES** (YouTube) are the DNA. The Network (Instagram) is the family.",
-        "🛡️ **SHIELD:** Shields up, {name}. Armor yourself with **MSA CODES** (YouTube). Stand your ground on Instagram.",
-        "⚔️ **SWORD:** Strike first, {name}. Weapon: **MSA CODE** (YouTube). Battleground: Instagram.",
-        "👑 **CROWN:** Heavy is the head, {name}. Earn the crown with **MSA CODES** (YouTube). Wear it on Instagram.",
-        "🦁 **ROAR:** Silence the lambs, {name}. Roar with an **MSA CODE** (YouTube). Lead the pride on Instagram.",
-        "🦅 **ALTITUDE:** Fly higher, {name}. Fuel: **MSA CODES** (YouTube). Airspace: Instagram.",
-        "🌑 **ECLIPSE:** Overshadow them, {name}. Light: **MSA CODE** (YouTube). Shadow: Instagram.",
-        "🚀 **IGNITION:** 3, 2, 1... Launch, {name}. Ignition code is an **MSA CODE** (YouTube). Orbit is Instagram."
+        "🔍 **THE SOURCE:** {name}, YouTube delivers the **MSA CODES**. Instagram provides the **STRATEGY**. You need both to execute.",
+        "🗝️ **KEYS & MAPS:** The Keys (**MSA CODES**) are in the YouTube briefings, {name}. The execution Map is on Instagram. Connect them.",
+        "💎 **DOUBLE THREAT:** {name}, track YouTube for the **MSA CODES** and follow Instagram for the **DAILY OPS**. Master the full system.",
+        "📡 **SIGNAL:** YouTube broadcasts the **MSA CODES**, {name}. Instagram broadcasts the **CULTURE**. Stay tuned to both.",
+        "🛑 **MISSING DATA:** {name}, the PDF is only part of the equation. YouTube holds the **MSA CODES**. Instagram holds the context.",
+        "🐺 **HUNTING GROUNDS:** We deploy **MSA CODES** in YouTube videos, {name}. We display the **RESULTS** on Instagram. Follow both.",
+        "👁️ **ALWAYS WATCHING:** Did you catch the **MSA CODE** in the last video, {name}? YouTube has the code. Instagram shows the application.",
+        "⚡ **POWER SUPPLY:** {name}, YouTube is the **ENGINE** (MSA CODES). Instagram is the **FUEL** (Execution). You require both.",
+        "🧠 **FULL ACCESS:** To access more **MSA CODES**, {name}, go to YouTube. To access the network, go to Instagram.",
+        "📦 **THE DROP:** The Asset is delivered, {name}. Find the next **MSA CODE** on YouTube. See the **DEPLOYMENT** on Instagram.",
+        "🔐 **TWO KEYS:** Full access requires two components, {name}. The **MSA CODE** is on YouTube. The daily insight is on Instagram.",
+        "🌐 **THE SYSTEM:** The System distributes **MSA CODES** via YouTube and **UPDATES** via Instagram. Stay in the loop, {name}.",
+        "🧬 **DNA:** The structure of this operation, {name}: **MSA CODES** unlock the doors, and Instagram shows you the room.",
+        "🕵️ **CLUES:** {name}, the latest **MSA CODE** is embedded in the YouTube video. The context is waiting on Instagram.",
+        "🏆 **THE PRIZE:** The next level is locked, {name}. YouTube provides the **MSA CODE**. Instagram provides the roadmap.",
+        "🔌 **DISCONNECTED:** Without YouTube, you miss the **MSA CODES**. Without Instagram, you miss the **MOMENTUM**. Reconnect now, {name}.",
+        "📢 **BRIEFING:** The core briefing is on YouTube (find the **MSA CODE**), {name}. The daily debrief is on Instagram.",
+        "⏳ **COUNTDOWN:** The next **MSA CODE** drops on YouTube soon, {name}. Watch Instagram for the notification. Be prepared.",
+        "🤝 **THE DEAL:** Watch YouTube for the **MSA CODES**, {name}. Follow Instagram for the **COMMUNITY**. That is the framework.",
+        "🚪 **DUAL ENTRY:** One door opens with an **MSA CODE** (YouTube). The daily room opens with presence (Instagram). Enter both, {name}.",
+        "🔦 **SEARCH PARTY:** {name}, the search is active. **MSA CODES** are on YouTube. Daily insights are on Instagram.",
+        "💼 **THE BRIEFCASE:** The asset is locked, {name}. The combination is the **MSA CODE** (YouTube). The location is Instagram.",
+        "🚁 **EXTRACTION:** The extraction point is set, {name}. Your ticket is the **MSA CODE** (YouTube). The route is on Instagram.",
+        "📡 **FREQUENCY:** {name}, ensure you are on the right frequencies. YouTube for **MSA CODES**. Instagram for **DAILY UPDATES**.",
+        "🧱 **THE WALL:** Hit a wall, {name}? Break through with an **MSA CODE** from YouTube. Build momentum on Instagram.",
+        "💊 **RED PILL:** The truth is the **MSA CODE** (YouTube). The reality is built on Instagram. Wake up and execute, {name}.",
+        "🕰️ **TIK TOK:** The clock is running, {name}. Secure the **MSA CODE** from YouTube before the window closes. Updates on Instagram.",
+        "🗺️ **COMPASS:** If you are stalled, {name}, YouTube is your direction (**MSA CODES**). Instagram is your terrain.",
+        "⚖️ **JUDGMENT:** Your progress is tracked, {name}. The proof: **MSA CODES** (YouTube). The result: Instagram.",
+        "🌪️ **CHAOS:** Bring order to the chaos, {name}. Structure comes from **MSA CODES** (YouTube). Execution comes from Instagram.",
+        "🔑 **MASTER KEY:** The master key exists, {name}. It's an **MSA CODE** on YouTube. The community is on Instagram.",
+        "👁️‍🗨️ **VISION:** Gain clarity, {name}. Locate the **MSA CODE** on YouTube. See the daily operation on Instagram.",
+        "🩸 **BLOODLINE:** It's in the system, {name}. **MSA CODES** (YouTube) secure access. The Network (Instagram) provides leverage.",
+        "🛡️ **SHIELD:** Protect your progress, {name}. Gain access with **MSA CODES** (YouTube). Maintain ground on Instagram.",
+        "⚔️ **SWORD:** Take the offensive, {name}. Your tool: **MSA CODE** (YouTube). Your arena: Instagram.",
+        "👑 **CROWN:** Build your authority, {name}. Secure it with **MSA CODES** (YouTube). Demonstrate it on Instagram.",
+        "🦁 **ROAR:** Make your move, {name}. Unlock the next phase with an **MSA CODE** (YouTube). Lead your market on Instagram.",
+        "🦅 **ALTITUDE:** Gain a new perspective, {name}. Lift off with **MSA CODES** (YouTube). Navigate the airspace via Instagram.",
+        "🌑 **ECLIPSE:** Outperform the rest, {name}. The spark is the **MSA CODE** (YouTube). The sustained energy is Instagram.",
+        "🚀 **IGNITION:** Prepare for launch, {name}. The ignition sequence is the **MSA CODE** (YouTube). The trajectory is on Instagram."
     ],
     "MSACODE_BUTTONS": [
-        ("📺 ACQUIRE TARGET", "📸 CONFIRM KILL"),
-        ("📺 ANALYZE SIGNAL", "📸 JOIN NETWORK"),
-        ("📺 WATCH BRIEFING", "📸 REPORT STATUS"),
-        ("📺 DECRYPT VIDEO", "📸 ACCESS COMMS"),
-        ("📺 UNLOCK SYSTEM", "📸 ENTER PROTOCOL"),
-        ("📺 VIEW EVIDENCE", "📸 VERIFY SOURCE"),
-        ("📺 OPEN CHANNEL", "📸 ESTABLISH LINK"),
-        ("📺 GRAB BLUPRINT", "📸 JOIN DYNASTY"),
-        ("📺 INITIATE PLAN", "📸 EXECUTE ORDER"),
-        ("📺 ACCESS ARCHIVE", "📸 CHECK RANK"),
-        ("📺 CLAIM ASSET", "📸 VERIFY ID"),
-        ("📺 START MISSION", "📸 JOIN SQUAD"),
-        ("📺 DECODE INTEL", "📸 READ DOSSIER"),
-        ("📺 OPEN VAULT", "📸 ENTER GATE"),
-        ("📺 GET STRATEGY", "📸 SEE TACTICS"),
-        ("📺 DOWNLOAD KEY", "📸 UPLOAD STATUS"),
-        ("📺 ACTIVATE", "📸 DEPLOY"),
-        ("📺 WATCH FOOTAGE", "📸 SEE PROOF"),
-        ("📺 ENTER MATRIX", "📸 JOIN REALITY"),
-        ("📺 UNLOCK GATE", "📸 ACCESS CITY"),
-        ("📺 RETRIEVE CODE", "📸 CONFIRM ENTRY"),
-        ("📺 SECURE ASSET", "📸 JOIN FACTION"),
-        ("📺 WATCH INTEL", "📸 READ REPORT"),
-        ("📺 GET PASSWORD", "📸 ENTER CONSOLE"),
-        ("📺 ACCESS MAIN", "📸 JOIN CHANNEL"),
-        ("📺 VIEW SOURCE", "📸 VERIFY OATH"),
-        ("📺 OPEN FILE", "📸 READ MEMO"),
-        ("📺 GET CLEARANCE", "📸 JOIN ELITE"),
-        ("📺 UNLOCK POWER", "📸 GAIN STATUS"),
-        ("📺 VIEW CODES", "📸 SEE NETWORK"),
-        ("📺 START DOWNLOAD", "📸 START UPLOAD"),
-        ("📺 GET BRIEFING", "📸 VERIFY RANK"),
-        ("📺 ACCESS TERMINAL", "📸 JOIN SERVER"),
-        ("📺 WATCH VIDEO", "📸 SEE EVIDENCE"),
-        ("📺 GRAB CODE", "📸 JOIN TEAM"),
-        ("📺 ENTER CODE", "📸 ENTER WORLD"),
-        ("📺 UNLOCK NOW", "📸 JOIN NOW"),
-        ("📺 ACCESS KEY", "📸 ACCESS HUB"),
-        ("📺 VIEW MAP", "📸 FIND PATH"),
-        ("📺 GET COORDINATES", "📸 JOIN LOCATION"),
-        ("📺 START ENGINE", "📸 JOIN CONVOY"),
-        ("📺 LOAD PROGRAM", "📸 RUN SYSTEM"),
-        ("📺 EXECUTE CODE", "📸 CONFIRM KILL"),
-        ("📺 ACCESS DATABASE", "📸 READ LOGS"),
-        ("📺 GET CREDENTIALS", "📸 VERIFY PASS"),
-        ("📺 OPEN PORTAL", "📸 ENTER REALM"),
-        ("📺 START SEQUENCE", "📸 JOIN OPS"),
-        ("📺 UNLOCK POWER", "📸 CLAIM THRONE"),
-        ("📺 ACCESS REWARD", "📸 RANK UP"),
-        ("📺 FINAL STEP", "📸 COMPLETE MISSION")
+        ("📺 FIND THE CODE", "📸 SEE THE RESULTS"),
+        ("📺 WATCH THE VIDEO", "📸 JOIN THE INSIDERS"),
+        ("📺 VIEW FULL BRIEFING", "📸 SEE DAILY UPDATES"),
+        ("📺 ACCESS THE INTEL", "📸 ENTER THE NETWORK"),
+        ("📺 OPEN THE SYSTEM", "📸 VERIFY YOUR ACCESS"),
+        ("📺 WATCH IT NOW", "📸 CHECK THE PROOF"),
+        ("📺 CLAIM THE ASSET", "📸 CONNECT WITH US"),
+        ("📺 GET THE BLUEPRINT", "📸 JOIN THE COMMUNITY"),
+        ("📺 LAUNCH THE PLAN", "📸 EXECUTE THE WORK"),
+        ("📺 UNLOCK THE ARCHIVE", "📸 CONFIRM YOUR SPOT"),
+        ("📺 SECURE YOUR ACCESS", "📸 VERIFY DEPLOYMENT"),
+        ("📺 START YOUR MISSION", "📸 JOIN THE SQUAD"),
+        ("📺 DECODE THE SYSTEM", "📸 REVIEW DAILY OPS"),
+        ("📺 OPEN THE VAULT", "📸 ACCESS THE FLOOR"),
+        ("📺 LEARN THE STRATEGY", "📸 SEE THE TACTICS"),
+        ("📺 DOWNLOAD THE KEY", "📸 UPLOAD PROGRESS"),
+        ("📺 ACTIVATE FULL PLAN", "📸 DEPLOY YOUR ASSET"),
+        ("📺 WATCH FULL FOOTAGE", "📸 EXAMINE THE PROOF"),
+        ("📺 ENTER THE SYSTEM", "📸 SEE THE REALITY"),
+        ("📺 UNLOCK THE GATE", "📸 ACCESS THE PIPELINE"),
+        ("📺 RETRIEVE THE PASS", "📸 CONFIRM YOUR ENTRY"),
+        ("📺 CLAIM THE REWARD", "📸 JOIN THE FACTION"),
+        ("📺 WATCH THE FULL SETUP", "📸 READ THE DAILY LOG"),
+        ("📺 GET THE MASTER KEY", "📸 ENTER THE WORKSPACE"),
+        ("📺 ACCESS MAIN SOURCE", "📸 JOIN THE CHANNEL"),
+        ("📺 VIEW PRIMARY FEED", "📸 VERIFY YOUR STATUS"),
+        ("📺 OPEN SECURE FILE", "📸 READ THE MEMO"),
+        ("📺 GET ELITE CLEARANCE", "📸 JOIN THE ELITE LIST"),
+        ("📺 UNLOCK YOUR ACCESS", "📸 GAIN INSIDER STATUS"),
+        ("📺 VIEW ALL CODES", "📸 SEE THE FULL NETWORK"),
+        ("📺 START FULL DOWNLOAD", "📸 INITIATE YOUR UPLOAD"),
+        ("📺 GET THE FULL SCOOP", "📸 VERIFY YOUR RANK"),
+        ("📺 ACCESS THE TERMINAL", "📸 JOIN THE SERVER"),
+        ("📺 WATCH THE FULL PLAY", "📸 SEE THE METRICS"),
+        ("📺 SECURE YOUR CODE", "📸 JOIN THE WINNING TEAM"),
+        ("📺 ENTER THE NEW CODE", "📸 ENTER THE REAL WORLD"),
+        ("📺 UNLOCK IT NOW", "📸 JOIN US NOW"),
+        ("📺 ACCESS THE MASTER KEY", "📸 ACCESS THE CENTRAL HUB"),
+        ("📺 VIEW THE ROADMAP", "📸 FIND THE CLEAR PATH"),
+        ("📺 GET THE COORDINATES", "📸 JOIN THE EXACT LOCATION"),
+        ("📺 START YOUR ENGINE", "📸 JOIN THE FAST TRACT"),
+        ("📺 LOAD THE PROGRAM", "📸 RUN THE ACTIVE SYSTEM"),
+        ("📺 EXECUTE THE CODE", "📸 CONFIRM THE CLEARANCE"),
+        ("📺 ACCESS SECURE DATA", "📸 READ THE ACTIVE LOGS"),
+        ("📺 GET YOUR CREDENTIALS", "📸 VERIFY YOUR PASSWORD"),
+        ("📺 OPEN THE MAIN DOOR", "📸 ENTER THE LIVE ROOM"),
+        ("📺 START THE SEQUENCE", "📸 JOIN THE OPERATIONS"),
+        ("📺 UNLOCK YOUR POWER", "📸 CLAIM YOUR POSITION"),
+        ("📺 ACCESS THE PAYOUT", "📸 RANK UP YOUR SYSTEM"),
+        ("📺 TAKE THE FINAL STEP", "📸 COMPLETE THE PROCESS")
     ],
     "MSACODE_FOOTERS": [
-        "🛡️ Clearance: VAULT | Status: VERIFIED",
-        "👁️ Surveillance: ACTIVE | Trace: SECURE",
-        "⚡ Connection: ENCRYPTED | Uplink: STABLE",
-        "🔒 Security Level: MAX | User: {name}",
-        "🕶️ Mode: GHOST | Access: GRANTED",
-        "🧬 Identity: CONFIRMED | Phase: ACTIVE",
-        "📡 Signal: STRONG | Protocol: OMEGA",
-        "🗝️ Keys: ALLOCATED | Session: SECURE",
-        "🩸 Oath: BOUND | Loyalty: VERIFIED",
+        "🛡️ Clearance: VERIFIED | Status: ACTIVE",
+        "👁️ System: ONLINE | User: {name}",
+        "⚡ Connection: SECURE | Uplink: STABLE",
+        "🔒 Access Level: FULL | User: {name}",
+        "🕶️ Deployment: ACTIVE | Access: GRANTED",
+        "🧬 Identity: CONFIRMED | Phase: EXECUTING",
+        "📡 Signal: STRONG | Priority: HIGH",
+        "🗝️ Asset: ALLOCATED | Session: SECURE",
+        "🩸 Agreement: BOUND | Verification: COMPLETE",
         "🏛️ Network: PRIVATE | Entry: AUTHORIZED",
-        " Zone: RESTRICTED | Pass: VALID",
-        "🧪 Lab: SECURE | Test: PASSED",
-        "🧹 Area: CLEAN | Threat: NULL",
-        "🧗 Altitude: HIGH | Air: THIN",
-        "⚓ Anchor: LIFTED | Sail: SET",
-        "🥊 Fight: WON | Belt: HELD",
-        "🏁 Race: OVER | Winner: {name}",
-        "🐺 Pack: ALPHA | Hunt: ON",
-        "🦅 View: EAGLE | Eyes: SHARP",
-        "🕯️ Flame: LIT | Shadow: CAST",
-        "🗡️ Blade: SHARP | Cut: DEEP",
-        "🏆 Trophy: WON | Shelf: FULL",
-        "👻 Mode: STEALTH | Noise: ZERO",
-        "🚫 Mercy: NONE | Win: ALL",
-        "🔋 Battery: 100% | Charge: HOLDING",
-        "🤖 Bot: ACTIVE | AI: ONLINE",
-        "💸 Asset: SECURE | Value: HIGH",
-        "🏗️ Build: COMPLETE | Foundation: SOLID",
-        "🧠 Mind: FOCUSED | Vision: CLEAR",
-        "🌪️ Force: GALE | Path: DESTRUCTIVE",
-        "🌊 Wave: RIDING | Surf: UP",
-        "🔥 Heat: MAX | Burn: CONTROLLED",
-        "❄️ Ice: COLD | Veins: FROZEN",
-        "☁️ Cloud: UPLINK | Sync: DONE",
-        "🌞 Dawn: BREAKING | Rise: NOW",
-        "🌚 Night: OPS | Cover: DARK",
-        "⭐ Star: RISING | Shine: BRIGHT",
-        "🌀 Vortex: OPEN | Pull: STRONG"
+        " Phase: ACTIVE | Code: VALID",
+        "🧪 Environment: SECURE | Test: PASSED",
+        "🧹 System: CLEAN | Status: OPTIMAL",
+        "🧗 Operations: SCALING | Trajectory: UP",
+        "⚓ Infrastructure: SOLID | Ready: YES",
+        "🥊 Market: COMPETITIVE | Position: SECURE",
+        "🏁 Plan: EXECUTING | Operator: {name}",
+        "🐺 Community: ACTIVE | Growth: ON",
+        "🦅 View: CLEAR | Focus: SHARP",
+        "🕯️ Progress: VISIBLE | Direction: SET",
+        "🗡️ Strategy: SHARP | Execution: PRECISE",
+        "🏆 Metrics: MET | Target: HIT",
+        "👻 Operations: BACKEND | Noise: MINIMAL",
+        "🚫 Distractions: ZERO | Focus: HIGH",
+        "🔋 Systems: 100% | Capacity: MAX",
+        "🤖 Automation: ACTIVE | Status: ONLINE",
+        "💸 Asset: SECURE | Integrity: HIGH",
+        "🏗️ Build: COMPLETE | Foundation: VERIFIED",
+        "🧠 Mindset: FOCUSED | Vision: CLEAR",
+        "🌪️ Momentum: BUILDING | Direction: FORWARD",
+        "🌊 Trend: RIDING | Trajectory: SCALING",
+        "🔥 Execution: RAPID | Progress: CONSTANT",
+        "❄️ Processes: COLD | Logic: SOUND",
+        "☁️ Infrastructure: SYNCED | Data: SECURE",
+        "🌞 Launch: IMMINENT | Status: GO",
+        "🌚 Coverage: COMPLETE | Operations: LIVE",
+        "⭐ Trajectory: RISING | Performance: PEAK",
+        "🌀 Engagement: HIGH | Pull: STRONG"
     ],
     "MSACODE_INVALID": [
-        "❌ **IMPOSSIBLE:** That MSA CODE does not exist, {name}. You are guessing. Stop guessing. Click below to get the real MSA CODE.",
-        "🚫 **ACCESS DENIED:** We checked, {name}. That MSA CODE is wrong. You skipped the briefing. Click below to watch the video.",
-        "⚠️ **WARNING:** Invalid input detected, {name}. Do not waste the system's time. Click below to retrieve the correct MSA CODE.",
-        "🛑 **STOP:** You are trying to take shortcuts, {name}. There are no shortcuts. Click below to get the real MSA CODE.",
-        "📉 **FAILURE:** You missed the MSA CODE, {name}. It was on the screen. Click below and go find it.",
-        "🔒 **LOCKED:** The door remains shut, {name}. You do not have the key. The key is in the video. Click below.",
-        "📵 **NO SIGNAL:** Your MSA CODE is noise, {name}. We need the signal. Click below to connect to the source.",
-        "🧩 **MISSING PIECE:** You are trying to solve the puzzle without the pieces, {name}. Click below to get the piece.",
-        "📉 **ERROR 404:** MSA CODE not found, {name}. Strategy: Click below. Watch. Return.",
-        "👀 **BLIND:** You are flying blind, {name}. The coordinates are in the briefing. Click below to see.",
-        "🧱 **WALL:** You hit a wall, {name}. Break it with the correct MSA CODE. Click below to find the hammer.",
-        "🕸️ **TRAP:** You fell into the trap of laziness, {name}. Climb out. Click below to do the work.",
-        "⚖️ **JUDGMENT:** The system judges your MSA CODE: INVALID. Appeal by clicking below, {name}.",
-        "⏳ **TIME WASTED:** You just wasted time guessing, {name}. Stop. Click below to get the answer.",
-        "🔌 **UNPLUGGED:** You are not connected, {name}. Click below to connect to the source.",
-        "🔦 **DARKNESS:** You are in the dark, {name}. Turn on the light. Click below to find the switch.",
-        "🗑️ **TRASH:** That MSA CODE is garbage data, {name}. Give us gold. Click below to find the gold.",
-        "🚩 **FLAGGED:** Your attempt has been flagged as incorrect, {name}. Correct your course. Click below.",
-        "📉 **DECLINED:** Your transaction was declined, {name}. Insufficient knowledge. Click below to deposit knowledge.",
-        "🚪 **WRONG DOOR:** That key doesn't fit, {name}. Click below to find the right key.",
-        "🔇 **SILENCE:** The system is silent, {name}. Your MSA CODE did not wake it up. Click below to find the voice.",
-        "👻 **GHOST:** You are chasing ghosts, {name}. That MSA CODE is dead. Click below to find the living MSA CODE.",
-        "🌪️ **MIRAGE:** That MSA CODE is a mirage, {name}. It looks real, but it's not. Click below to find the oasis.",
-        "🕸️ **VOID:** You entered the void, {name}. There is nothing here. Click below to find the substance.",
-        "⚡ **STATIC:** All we hear is static, {name}. Tune your frequency. Click below to find the signal.",
-        "🐛 **GLITCH:** You caused a glitch in the matrix, {name}. That MSA CODE is a bug. Click below to fix the MSA CODE.",
-        "🛑 **HALT:** Security protocol engaged, {name}. MSA CODE unrecognized. Click below to clear your status.",
-        "🧊 **FROZEN:** Your progress is frozen, {name}. That MSA CODE is ice. Click below to find the fire.",
-        "🎭 **MASK:** That MSA CODE is wearing a mask, {name}. Take it off. Click below to find the face.",
-        "🕰️ **ECHO:** You are just an echo, {name}. We need the source. Click below to become the source."
+        "❌ **INVALID:** That MSA CODE does not exist in the system, {name}. Stop guessing. Click below to retrieve the correct code.",
+        "🚫 **ACCESS DENIED:** We checked the database, {name}. That MSA CODE is incorrect. You missed the information. Click below to watch the video again.",
+        "⚠️ **WARNING:** Incorrect input detected, {name}. Do not guess the codes. Click below to retrieve the exact MSA CODE.",
+        "🛑 **HALT:** You cannot bypass the system, {name}. There are no shortcuts. Click below to secure the real MSA CODE.",
+        "📉 **FAILURE:** You missed the proper MSA CODE, {name}. It was displayed in the video. Click below and find the correct one.",
+        "🔒 **LOCKED OUT:** Your access remains restricted, {name}. You supplied the wrong key. The real key is in the video. Click below.",
+        "📵 **NO MATCH:** Your submitted MSA CODE is incorrect, {name}. We need accurate data. Click below to connect to the correct source.",
+        "🧩 **INCOMPLETE:** You are trying to proceed without the correct data, {name}. Click below to get the exact code.",
+        "📉 **ERROR 404:** MSA CODE not recognized, {name}. The correct strategy: Click below. Watch the video. Enter the exact code.",
+        "👀 **NO ENTRY:** You are guessing blindly, {name}. The exact code is in the briefing. Click below to see it.",
+        "🧱 **BLOCKED:** Your request was blocked, {name}. Enter the exact, correct MSA CODE to proceed. Click below to find it.",
+        "🕸️ **STUCK:** You entered an incorrect code, {name}. Correct your input. Click below to do the work.",
+        "⚖️ **VERDICT:** The system has ruled your MSA CODE: INVALID. Fix your input by clicking below, {name}.",
+        "⏳ **TIME WASTED:** Guessing codes wastes your time, {name}. Stop. Click below, get the exact code, and proceed.",
+        "🔌 **UNRECOGNIZED:** Your entry is not in our system, {name}. Click below to retrieve the recognized code.",
+        "🔦 **NOT FOUND:** The code you entered was not found, {name}. It is visible in the video. Click below to locate it.",
+        "🗑️ **REJECTED:** That MSA CODE data is incorrect, {name}. Only accurate codes are accepted. Click below to find it.",
+        "🚩 **FLAGGED:** Your attempt was flagged as invalid, {name}. Adjust your input. Click below to find the correct details.",
+        "📉 **DECLINED:** Your code submission was declined, {name}. Incorrect format or value. Click below to fetch the accurate code.",
+        "🚪 **WRONG ENTRY:** That code does not open this stage, {name}. Click below to find the matching code.",
+        "🔇 **NO RESPONSE:** The system rejected your input, {name}. Your MSA CODE is wrong. Click below to fetch the correct one.",
+        "👻 **NON-EXISTENT:** You entered a code that doesn't exist, {name}. Click below to find the active, real MSA CODE.",
+        "🌪️ **INCORRECT:** That MSA CODE is a mistake, {name}. It does not work. Click below to find the guaranteed code.",
+        "🕸️ **VOIDED:** Your request was voided due to bad input, {name}. There is nothing here for that code. Click below.",
+        "⚡ **MISMATCH:** The code you sent does not match our records, {name}. Fix your input. Click below to find the signal.",
+        "🐛 **ERROR:** You submitted an invalid format, {name}. That MSA CODE is incorrect. Click below to correct it.",
+        "🛑 **RESTRICTED:** Security protocol rejected your entry, {name}. MSA CODE unrecognized. Click below to resolve this.",
+        "🧊 **PAUSED:** Your progress is paused due to an incorrect code, {name}. Click below to locate the correct code.",
+        "🎭 **INVALID DATA:** The data provided is incorrect, {name}. Enter the verified code. Click below to find it.",
+        "🕰️ **NO MATCH:** Your code was not found in the manifest, {name}. We require exact inputs. Click below to secure the exact code."
     ]
 }
 
@@ -1873,7 +2176,17 @@ def get_next_msa_id() -> tuple[str, int]:
     raise RuntimeError("Could not generate a unique MSA ID after exhaustive attempts")
 
 def allocate_msa_id(user_id: int, username: str, first_name: str) -> str:
-    """Allocate MSA+ ID to a user (prevents duplicates)"""
+    """Allocate MSA+ ID to a user (prevents duplicates)
+    
+    CRITICAL: Can only allocate to users who have vault_joined=True.
+    This ensures MSA ID is never assigned before vault membership.
+    """
+    # Check if user is vault member - MUST be true to allocate
+    user_data = col_user_verification.find_one({"user_id": user_id})
+    if not user_data or not user_data.get("vault_joined", False):
+        logger.warning(f"Cannot allocate MSA ID to user {user_id}: must join vault first")
+        raise ValueError(f"User {user_id} must join vault before MSA ID allocation")
+    
     # Check if user already has an MSA+ ID
     existing = col_msa_ids.find_one({"user_id": user_id})
     if existing:
@@ -1927,6 +2240,88 @@ def get_verification_keyboard(user_id: int, user_data: dict, show_all: bool = Tr
 # 🔒 VAULT ACCESS CONTROL MIDDLEWARE
 # ==========================================
 
+# Per-user cooldown: track the last time we sent the rejoin message.
+# Key = user_id (int), Value = datetime of last send.
+# The rejoin/block message fires AT MOST once per 60 seconds per user.
+# All other non-member interactions in the cooldown window are silently dropped.
+_VAULT_REJOIN_COOLDOWN_SECS = 60
+_vault_rejoin_last_sent: dict[int, datetime] = {}
+
+async def _send_vault_rejoin_message(message_or_callback, user_id: int, user_name: str) -> bool:
+    """Send the vault-rejoin prompt ONLY when the 60s per-user cooldown has expired.
+    Returns True if the message was sent, False if suppressed (in cooldown — silent drop)."""
+    now = datetime.now(TZ)
+    last = _vault_rejoin_last_sent.get(user_id)
+    if last and (now - last).total_seconds() < _VAULT_REJOIN_COOLDOWN_SECS:
+        # Still in cooldown — silently block without sending anything
+        return False
+
+    # Cooldown cleared — record timestamp and show the rejoin prompt
+    _vault_rejoin_last_sent[user_id] = now
+    user_data = get_user_verification_status(user_id)
+    was_ever_verified = user_data.get('ever_verified', False)
+
+    if was_ever_verified:
+        # Old user who left the vault
+        await message_or_callback.answer(
+            f"🔒 **{user_name}, YOU LEFT THE VAULT**\n\n"
+            f"You had access. You gave it up.\n"
+            f"Now the system won't let you in.\n\n"
+            f"**You know the drill:**\n"
+            f"No vault = No features. No exceptions.\n\n"
+            f"💎 **Get back in. Restore your status.**",
+            reply_markup=get_verification_keyboard(user_id, user_data, show_all=False),
+            parse_mode=ParseMode.MARKDOWN
+        )
+    else:
+        # New user who never joined
+        await message_or_callback.answer(
+            f"🔒 **{user_name}, AGENT ACCESS PAUSED**\n\n"
+            f"You are currently missing out on the full **MSA Node Ecosystem**.\n\n"
+            f"By securing your connection, you instantly unlock:\n\n"
+            f"📂 **Unlimited Blueprints:** Seamless delivery of all future PDFs and guides.\n"
+            f"🤖 **Elite AI Tools:** Access to our private arsenal of automation scripts.\n"
+            f"💎 **The Inner Circle:** Strategies reserved strictly for the Vault.\n\n"
+            f"To unlock the entire system at zero cost, simply join the Vault below.\n\n"
+            f"*Don't stay on the outside. Secure your access now.*",
+            reply_markup=get_verification_keyboard(user_id, user_data, show_all=True),
+            parse_mode=ParseMode.MARKDOWN
+        )
+    return True
+
+async def _require_vault_check(message) -> bool:
+    """Vault gate for Message handlers.
+    Sends rejoin message (respecting 60s cooldown) and returns True if user is NOT in vault.
+    Returns False if user IS in vault (allow the handler to continue)."""
+    user_id = message.from_user.id
+    user_name = message.from_user.first_name or "User"
+    is_in_vault = await check_channel_membership(user_id)
+    if not is_in_vault:
+        await _send_vault_rejoin_message(message, user_id, user_name)
+        return True   # blocked
+    return False      # allowed
+
+async def require_vault_access(handler_func):
+    """Decorator to ensure user is in vault before accessing any feature"""
+    async def wrapper(message_or_callback):
+        # Get user ID
+        if hasattr(message_or_callback, 'from_user'):
+            user_id = message_or_callback.from_user.id
+            user_name = message_or_callback.from_user.first_name or "User"
+        else:
+            return
+
+        # Check vault membership; send rejoin at most once per cooldown
+        is_in_vault = await check_channel_membership(user_id)
+        if not is_in_vault:
+            await _send_vault_rejoin_message(message_or_callback, user_id, user_name)
+            return   # blocked
+
+        # User is in vault — allow access
+        await handler_func(message_or_callback)
+
+    return wrapper
+
 async def check_if_banned(user_id: int) -> dict | None:
     """Check if user is banned. Returns ban doc if banned, None otherwise. Auto-unbans expired temporary bans."""
     try:
@@ -1950,55 +2345,7 @@ async def check_if_banned(user_id: int) -> dict | None:
         logger.error(f"Ban check failed for user {user_id}: {e}")
         return None
 
-async def require_vault_access(handler_func):
-    """Decorator to ensure user is in vault before accessing any feature"""
-    async def wrapper(message_or_callback):
-        # Get user ID
-        if hasattr(message_or_callback, 'from_user'):
-            user_id = message_or_callback.from_user.id
-            user_name = message_or_callback.from_user.first_name or "User"
-        else:
-            return
-        
-        # Check if user is in vault (real-time check)
-        is_in_vault = await check_channel_membership(user_id)
-        
-        if not is_in_vault:
-            # User not in vault - block access and show rejoin message
-            user_data = get_user_verification_status(user_id)
-            was_ever_verified = user_data.get('ever_verified', False)
-            
-            if was_ever_verified:
-                # Old user who left
-                await message_or_callback.answer(
-                    f"🔒 **{user_name}, YOU LEFT THE VAULT**\n\n"
-                    f"You had access. You gave it up.\n"
-                    f"Now the system won't let you in.\n\n"
-                    f"**You know the drill:**\n"
-                    f"No vault = No features. No exceptions.\n\n"
-                    f"💎 **Get back in. Restore your status.**",
-                    reply_markup=get_verification_keyboard(user_id, user_data, show_all=False),
-                    parse_mode=ParseMode.MARKDOWN
-                )
-            else:
-                # New user who never joined
-                await message_or_callback.answer(
-                    f"🔒 **{user_name}, ACCESS LOCKED**\n\n"
-                    f"The **MSA NODE Vault** is not optional.\n"
-                    f"It's the gateway. It's the requirement.\n\n"
-                    f"You want the tools? Join the vault.\n"
-                    f"You want the content? Join the vault.\n"
-                    f"You want to compete? Join the vault.\n\n"
-                    f"✨ **Join now. Unlock everything.**",
-                    reply_markup=get_verification_keyboard(user_id, user_data, show_all=True),
-                    parse_mode=ParseMode.MARKDOWN
-                )
-            return
-        
-        # User is in vault - allow access
-        await handler_func(message_or_callback)
-    
-    return wrapper
+
 
 # ==========================================
 # 📋 MENU KEYBOARDS
@@ -2038,7 +2385,7 @@ def get_user_menu(user_id: int):
     suspend_doc = col_suspended_features.find_one({"user_id": user_id})
     
     if suspend_doc:
-        suspended = suspend_doc.get("suspended_features", [])
+        suspended = suspend_doc.get("bot1_suspended_features", [])
         
         # Build menu excluding suspended features
         keyboard = []
@@ -2174,28 +2521,30 @@ def generate_digits(length=8):
 
 async def ensure_pdf_codes(pdf):
     """Ensure PDF has all start codes - creates them if missing"""
-    updates = {}
-    if not pdf.get("ig_start_code"):
+    from typing import Any
+    pdf_doc: dict[str, Any] = dict(pdf)
+    updates: dict[str, Any] = {}
+    if not pdf_doc.get("ig_start_code"):
         updates["ig_start_code"] = generate_alphanumeric(8)
-    if not pdf.get("yt_start_code"):
+    if not pdf_doc.get("yt_start_code"):
         updates["yt_start_code"] = generate_digits(8)
-    if not pdf.get("aff_start_code"):
+    if not pdf_doc.get("aff_start_code"):
         updates["aff_start_code"] = generate_digits(8)
-    if not pdf.get("orig_start_code"):
+    if not pdf_doc.get("orig_start_code"):
         updates["orig_start_code"] = generate_digits(8)
     
     if updates:
-        col_pdfs.update_one({"_id": pdf["_id"]}, {"$set": updates})
-        return {**pdf, **updates}
-    return pdf
+        col_pdfs.update_one({"_id": pdf_doc["_id"]}, {"$set": updates})
+        return {**pdf_doc, **updates}
+    return pdf_doc
 
-async def ensure_ig_cc_code(content):
+async def ensure_ig_cc_code(content) -> dict:
     """Ensure IG content has start_code"""
     if not content.get("start_code"):
         code = generate_digits(8)
         col_ig_content.update_one({"_id": content["_id"]}, {"$set": {"start_code": code}})
-        return {**content, "start_code": code}
-    return content
+        return dict({**content, "start_code": code})
+    return dict(content)
 
 async def show_access_denied_animation(message: types.Message, user_id: int, payload: str = "", expected: str = ""):
     """Reusable ACCESS DENIED animation and message"""
@@ -2319,16 +2668,18 @@ async def cmd_start(message: types.Message, state: FSMContext):
         logger.info(f"🚫 Banned user {user_id} ({ban_type}) attempted to access bot")
         return
     
+    just_consumed_grace = False
     args = message.text.split()
     payload = args[1] if len(args) > 1 else None
     
     # Check for Dynamic Payload (Priority)
-    parse_result = parse_start_payload(payload)
+    parse_result = parse_start_payload(payload or "")
     
     if parse_result["status"] == "valid":
-        parsed_data = parse_result["data"]
-        input_code = parsed_data.get("code", "")
-        source = parsed_data['source'] # 'ig' or 'yt'
+        _raw_data = parse_result.get("data")
+        parsed_data: dict = _raw_data if isinstance(_raw_data, dict) else {}
+        input_code = str(parsed_data.get("code", ""))
+        source = str(parsed_data.get("source", "")) # 'ig' or 'yt'
         
         # 1. Fetch Content by CODE (not by index)
         # Determine which DB field to check based on source
@@ -2382,7 +2733,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
             # 🔒 STRICT FULL LINK VALIDATION
             # Reconstruct the expected payload and compare with input
             
-            # Sanitize PDF name (same logic as bot9.py)
+            # Sanitize PDF name (same logic as bot3.py)
             pdf_name = pdf_data.get("name", "")
             sanitized_name = re.sub(r'[^a-zA-Z0-9]', '_', pdf_name)
             sanitized_name = re.sub(r'_+', '_', sanitized_name).strip('_')
@@ -2393,7 +2744,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
             # STRICT COMPARISON: Must match EXACTLY
             if payload != expected_payload:
                 # 🚫 INVALID LINK (Tampered suffix/structure)
-                await show_access_denied_animation(message, user_id, payload, expected_payload)
+                await show_access_denied_animation(message, user_id, payload or "", expected_payload)
                 return
             
             # ✅ FULL VALIDATION PASSED
@@ -2403,85 +2754,128 @@ async def cmd_start(message: types.Message, state: FSMContext):
             first_name = message.from_user.first_name or "User"
             is_in_vault = await check_channel_membership(user_id)
             try:
-                msa_id = get_user_msa_id(user_id)
-                # MSA ID allocated ONLY when user is already a vault member — never before joining
-                if not msa_id and is_in_vault:
-                    msa_id = allocate_msa_id(user_id, username, first_name)
-                
+                # ── FIRST-TOUCH SOURCE: MUST run BEFORE sync so the sync reads
+                # the correct source (IG/YT) when writing to bot2_user_tracking.
+                # Stored permanently on first click — never overwritten.
                 if source == "ig":
-                    # Deduplicated IG start click — only count each user once per PDF
-                    if _is_new_unique_click(user_id, pdf_data["_id"], "ig_start"):
-                        col_pdfs.update_one(
-                            {"_id": pdf_data["_id"]},
-                            {
-                                "$inc": {"ig_start_clicks": 1, "clicks": 1},
-                                "$set": {"last_ig_click": now_local(), "last_clicked_at": now_local()}
-                            }
-                        )
-                    # Source locked permanently on first click — never overwritten
-                    track_user_source(user_id, "IG", username, first_name, msa_id or "")
+                    _store_initial_source(user_id, "IG")
                 elif source == "yt":
-                    # Deduplicated YT start click — only count each user once per PDF
-                    if _is_new_unique_click(user_id, pdf_data["_id"], "yt_start"):
-                        col_pdfs.update_one(
-                            {"_id": pdf_data["_id"]},
-                            {
-                                "$inc": {"yt_start_clicks": 1, "clicks": 1},
-                                "$set": {"last_yt_click": now_local(), "last_clicked_at": now_local()}
-                            }
-                        )
-                    # Source locked permanently on first click — never overwritten
-                    track_user_source(user_id, "YT", username, first_name, msa_id or "")
-                logger.info(f"📊 Analytics: User {user_id} clicked {source.upper()} link for PDF '{pdf_data.get('name')}'")
+                    _store_initial_source(user_id, "YT")
+
+                # ── PRE-VAULT SYNC (idempotent) — reads the source just stored above ──
+                # For pre-vault users: syncs vault_joined, allocates MSA ID, writes
+                # bot2_user_tracking with the correct first-touch source.
+                # For non-vault users: no-op.
+                _newly_synced = False
+                if is_in_vault:
+                    msa_id, _newly_synced = await _sync_pre_vault_user(user_id, username, first_name)
+
+                msa_id = msa_id if is_in_vault else get_user_msa_id(user_id)
+
+
+                # 📊 EXCLUSIVE VAULT-MEMBER ANALYTICS TRACKING
+                # Click counters only run for confirmed vault members (no bloat from non-members)
+                if is_in_vault:
+                    if source == "ig":
+                        # Deduplicated IG start click — only count each user once per PDF
+                        if _is_new_unique_click(user_id, pdf_data["_id"], "ig_start"):
+                            col_pdfs.update_one(
+                                {"_id": pdf_data["_id"]},
+                                {
+                                    "$inc": {"ig_start_clicks": 1, "clicks": 1},
+                                    "$set": {"last_ig_click": now_local(), "last_clicked_at": now_local()}
+                                }
+                            )
+                    elif source == "yt":
+                        # Deduplicated YT start click — only count each user once per PDF
+                        if _is_new_unique_click(user_id, pdf_data["_id"], "yt_start"):
+                            col_pdfs.update_one(
+                                {"_id": pdf_data["_id"]},
+                                {
+                                    "$inc": {"yt_start_clicks": 1, "clicks": 1},
+                                    "$set": {"last_yt_click": now_local(), "last_clicked_at": now_local()}
+                                }
+                            )
+                    logger.info(f"📊 Analytics: Vault user {user_id} clicked {source.upper()} link for PDF '{pdf_data.get('name')}'")
             except Exception as analytics_err:
                 logger.error(f"⚠️ Analytics tracking failed: {analytics_err}")
             
-            # ==========================================
-            # 🔒 VAULT ACCESS CHECK — Block non-members (already resolved above)
+            # 🔒 VAULT ACCESS CHECK — Allow grace-pass users
             # ==========================================
             if not is_in_vault:
-                # Save the pending payload so it can be delivered upon verification
-                col_user_verification.update_one({"user_id": user_id}, {"$set": {"pending_payload": payload}}, upsert=True)
-                
+                # Check if user has grace-pass available
                 user_data = get_user_verification_status(user_id)
-                was_ever_verified = user_data.get('ever_verified', False)
-                vault_kb = get_verification_keyboard(user_id, user_data, show_all=not was_ever_verified)
-                if was_ever_verified:
-                    vault_msg = (
-                        f"🔐 **{user_name}, THE VAULT IS CLOSED TO YOU**\n\n"
-                        f"You clicked the link. The content is right there.\n"
-                        f"But the system doesn't deliver to those who walked out.\n\n"
-                        f"**You left the Vault.**\n"
-                        f"That means you left your privileges at the door.\n\n"
-                        f"💎 **One action separates you from everything:**\n"
-                        f"Rejoin the Vault → Unlock full delivery. Instantly.\n\n"
-                        f"*The content waits. The clock doesn't.*"
+                grace_allowed = user_data.get('grace_allowed', False)
+                grace_consumed = user_data.get('grace_consumed', False)
+                # Brand-new users (no DB record at all) always get a free first pass
+                is_brand_new = not bool(user_data)
+                has_grace = is_brand_new or (grace_allowed and not grace_consumed)
+                
+                if not has_grace:
+                    # No grace available — block with vault lock message
+                    col_user_verification.update_one({"user_id": user_id}, {"$set": {"pending_payload": payload}}, upsert=True)
+                    
+                    was_ever_verified = user_data.get('ever_verified', False)
+                    vault_kb = get_verification_keyboard(user_id, user_data, show_all=not was_ever_verified)
+                    if was_ever_verified:
+                        vault_msg = (
+                            f"🔐 **{user_name}, THE VAULT IS CLOSED TO YOU**\n\n"
+                            f"You clicked the link. The content is right there.\n"
+                            f"But the system doesn't deliver to those who walked out.\n\n"
+                            f"**You left the Vault.**\n"
+                            f"That means you left your privileges at the door.\n\n"
+                            f"💎 **One action separates you from everything:**\n"
+                            f"Rejoin the Vault → Unlock full delivery. Instantly.\n\n"
+                            f"*The content waits. The clock doesn't.*"
+                        )
+                    else:
+                        vault_msg = (
+                            f"🔒 **{user_name}, AGENT ACCESS PAUSED**\n\n"
+                            f"You tried to access another premium asset, but your complimentary pass has been used.\n\n"
+                            f"**The MSA Node Agent is an exclusive ecosystem.** By verifying your free membership, you will instantly unlock:\n\n"
+                            f"📂 **Unlimited Blueprints:** Seamless delivery of all future PDFs and guides.\n"
+                            f"🤖 **Elite AI Tools:** Access to our private arsenal of automation scripts.\n"
+                            f"💎 **The Inner Circle:** Strategies reserved strictly for the Vault.\n\n"
+                            f"To resume your delivery and unlock the entire system at zero cost, simply join the Vault below and return here.\n\n"
+                            f"*The content is waiting. The choice is yours.*"
+                        )
+                    _vault_ans = await message.answer(
+                        vault_msg,
+                        reply_markup=vault_kb,
+                        parse_mode=ParseMode.MARKDOWN
                     )
-                else:
-                    vault_msg = (
-                        f"🔒 **{user_name}, ACCESS LOCKED**\n\n"
-                        f"You found the link. You even clicked it.\n"
-                        f"That tells us you're serious.\n\n"
-                        f"**But the system only delivers to Vault members.**\n"
-                        f"No vault = No content. No exceptions.\n\n"
-                        f"✨ **The fix is simple:**\n"
-                        f"Join the Vault → Come back → Get everything."
+                    _locked_ans = await message.answer(
+                        "🔒 Menu locked until you rejoin the Vault.",
+                        reply_markup=ReplyKeyboardRemove()
                     )
-                _vault_ans = await message.answer(
-                    vault_msg,
-                    reply_markup=vault_kb,
-                    parse_mode=ParseMode.MARKDOWN
-                )
-                _locked_ans = await message.answer(
-                    "🔒 Menu locked until you rejoin the Vault.",
-                    reply_markup=ReplyKeyboardRemove()
-                )
-                col_user_verification.update_one(
-                    {"user_id": user_id},
-                    {"$set": {"pending_delete_msg_ids": [_vault_ans.message_id, _locked_ans.message_id]}},
-                    upsert=True
-                )
-                return
+                    col_user_verification.update_one(
+                        {"user_id": user_id},
+                        {"$set": {"pending_delete_msg_ids": [_vault_ans.message_id, _locked_ans.message_id]}},
+                        upsert=True
+                    )
+                    return
+                
+                # User has grace — consume it now atomically before delivering content
+                try:
+                    col_user_verification.update_one(
+                        {
+                            "user_id": user_id,
+                            "grace_allowed": True,
+                            "grace_consumed": False  # Ensure not already consumed (atomic check)
+                        },
+                        {
+                            "$set": {
+                                "grace_consumed": True,
+                                "grace_consumed_at": now_local(),
+                                "grace_consumed_via": f"{source.upper()}"  # Track which source consumed the grace
+                            }
+                        }
+                    )
+                    just_consumed_grace = True
+                    logger.info(f"✅ Grace-pass consumed for user {user_id} via {source.upper()} link")
+                except Exception as grace_err:
+                    logger.error(f"⚠️ Failed to consume grace for user {user_id}: {grace_err}")
+                # Continue to deliver content (grace consumed successfully)
 
             # =================================================================================
             # 🚀 EXACT SEARCH CODE DELIVERY FORMAT (Dynamic Cross-Platform)
@@ -2491,33 +2885,33 @@ async def cmd_start(message: types.Message, state: FSMContext):
             first_name = message.from_user.first_name
             
             # PDF Title
-            pdf_title_template = random.choice(CONTENT_PACKS["PDF_TITLES"])
+            pdf_title_template = CONTENT_PACKS["PDF_TITLES"][secrets.randbelow(len(CONTENT_PACKS["PDF_TITLES"]))]
             try:
                 pdf_title_text = pdf_title_template.format(name=first_name)
             except:
                 pdf_title_text = pdf_title_template
             
             # Affiliate Title
-            aff_title_text = random.choice(CONTENT_PACKS["AFFILIATE_TITLES"])
+            aff_title_text = CONTENT_PACKS["AFFILIATE_TITLES"][secrets.randbelow(len(CONTENT_PACKS["AFFILIATE_TITLES"]))]
             
             # Dynamic Cross-Platform Logic for Text AND Final Button
             if source == 'ig':
                 # IG -> YT (Use YT_VIDEO_TITLES for text, YT_CODES_BUTTONS for action)
-                msa_code_template = random.choice(CONTENT_PACKS["YT_VIDEO_TITLES"])
-                target_btn_text = random.choice(CONTENT_PACKS["YT_CODES_BUTTONS"])
+                msa_code_template = CONTENT_PACKS["YT_VIDEO_TITLES"][secrets.randbelow(len(CONTENT_PACKS["YT_VIDEO_TITLES"]))]
+                target_btn_text = CONTENT_PACKS["YT_CODES_BUTTONS"][secrets.randbelow(len(CONTENT_PACKS["YT_CODES_BUTTONS"]))]
                 target_link = YOUTUBE_LINK
                 footer_suffix = "| Source: IG -> YT" 
                 
             elif source == 'yt':
                 # YT -> IG (Use IG_VIDEO_TITLES for text, IG_CODES_BUTTONS for action)
-                msa_code_template = random.choice(CONTENT_PACKS["IG_VIDEO_TITLES"])
-                target_btn_text = random.choice(CONTENT_PACKS["IG_CODES_BUTTONS"])
+                msa_code_template = CONTENT_PACKS["IG_VIDEO_TITLES"][secrets.randbelow(len(CONTENT_PACKS["IG_VIDEO_TITLES"]))]
+                target_btn_text = CONTENT_PACKS["IG_CODES_BUTTONS"][secrets.randbelow(len(CONTENT_PACKS["IG_CODES_BUTTONS"]))]
                 target_link = INSTAGRAM_LINK
                 footer_suffix = "| Source: YT -> IG"
                 
             else:
                 # Fallback (legacy/unknown)
-                msa_code_template = random.choice(CONTENT_PACKS["MSACODE"])
+                msa_code_template = CONTENT_PACKS["MSACODE"][secrets.randbelow(len(CONTENT_PACKS["MSACODE"]))]
                 target_btn_text = "📢 JOIN VAULT"
                 target_link = CHANNEL_LINK
                 footer_suffix = ""
@@ -2550,8 +2944,8 @@ async def cmd_start(message: types.Message, state: FSMContext):
             # ---------------------------------------------------------
             # 1️⃣ MESSAGE 1: PDF DELIVERY
             # ---------------------------------------------------------
-            pdf_btn_text = random.choice(CONTENT_PACKS["PDF_BUTTONS"])
-            pdf_footer_template = random.choice(CONTENT_PACKS["PDF_FOOTERS"])
+            pdf_btn_text = CONTENT_PACKS["PDF_BUTTONS"][secrets.randbelow(len(CONTENT_PACKS["PDF_BUTTONS"]))]
+            pdf_footer_template = CONTENT_PACKS["PDF_FOOTERS"][secrets.randbelow(len(CONTENT_PACKS["PDF_FOOTERS"]))]
             try:
                 pdf_footer_text = pdf_footer_template.format(name=first_name)
             except:
@@ -2578,13 +2972,13 @@ async def cmd_start(message: types.Message, state: FSMContext):
             # ---------------------------------------------------------
             if affiliate_link:
                 # Select Random Affiliate Footer
-                aff_footer_template = random.choice(CONTENT_PACKS["AFFILIATE_FOOTERS"])
+                aff_footer_template = CONTENT_PACKS["AFFILIATE_FOOTERS"][secrets.randbelow(len(CONTENT_PACKS["AFFILIATE_FOOTERS"]))]
                 try:
                     aff_footer_text = aff_footer_template.format(name=first_name)
                 except:
                     aff_footer_text = aff_footer_template
 
-                aff_btn_text = random.choice(CONTENT_PACKS["AFFILIATE_BUTTONS"])
+                aff_btn_text = CONTENT_PACKS["AFFILIATE_BUTTONS"][secrets.randbelow(len(CONTENT_PACKS["AFFILIATE_BUTTONS"]))]
                 aff_kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=aff_btn_text, url=affiliate_link)]])
                 await message.answer(
                     f"{aff_title_text}\n\n━━━━━━━━━━━━━━━━\n`{aff_footer_text}`",
@@ -2605,7 +2999,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
             # 3️⃣ MESSAGE 3: NETWORK / CROSS-PLATFORM
             # ---------------------------------------------------------
             # Select Random Affiliate Footer
-            aff_footer_template = random.choice(CONTENT_PACKS["AFFILIATE_FOOTERS"])
+            aff_footer_template = CONTENT_PACKS["AFFILIATE_FOOTERS"][secrets.randbelow(len(CONTENT_PACKS["AFFILIATE_FOOTERS"]))]
             try:
                 base_footer = aff_footer_template.format(name=first_name)
             except:
@@ -2614,8 +3008,8 @@ async def cmd_start(message: types.Message, state: FSMContext):
             final_footer = base_footer 
 
             # Final message — random button text from packs, always both IG + YT links
-            ig_btn_text = random.choice(CONTENT_PACKS["IG_CODES_BUTTONS"])
-            yt_btn_text = random.choice(CONTENT_PACKS["YT_CODES_BUTTONS"])
+            ig_btn_text = CONTENT_PACKS["IG_CODES_BUTTONS"][secrets.randbelow(len(CONTENT_PACKS["IG_CODES_BUTTONS"]))]
+            yt_btn_text = CONTENT_PACKS["YT_CODES_BUTTONS"][secrets.randbelow(len(CONTENT_PACKS["YT_CODES_BUTTONS"]))]
             network_kb = InlineKeyboardMarkup(inline_keyboard=[
                 [
                     InlineKeyboardButton(text=ig_btn_text, url=INSTAGRAM_LINK),
@@ -2630,6 +3024,21 @@ async def cmd_start(message: types.Message, state: FSMContext):
             )
             
             logger.info(f"User {user_id} triggered dynamic start: Source={source}, Code={input_code}")
+            if just_consumed_grace:
+                await send_psychological_vault_lock_message(user_id)
+            # ── PRE-VAULT FIRST-INTERACTION MENU UNLOCK ──────────────────────
+            # User was in vault BEFORE starting bot1. Content just delivered.
+            # Send the reply menu now so they don't need a second /start.
+            if _newly_synced:
+                _sync_msa = get_user_msa_id(user_id) or "Assigned"
+                await message.answer(
+                    f"✅ **VAULT ACCESS CONFIRMED**\n\n"
+                    f"Your account is now fully activated.\n"
+                    f"🆔 **MSA+ ID:** `{_sync_msa}`\n\n"
+                    f"Your full menu is unlocked below ⬇️",
+                    reply_markup=get_user_menu(user_id),
+                    parse_mode=ParseMode.MARKDOWN
+                )
             return
         else:
             # 🚫 PDF NOT FOUND - Invalid Code
@@ -2653,55 +3062,88 @@ async def cmd_start(message: types.Message, state: FSMContext):
 
     # 🎥 NEW FLOW: YT CODE PROMPT (Force MSA Code Entry)
     elif parse_result["status"] == "yt_code_prompt":
-        # � TRACK SOURCE — Record YTCODE immediately before any early return.
-        # This locks source="YTCODE" so handle_vault_join's "UNKNOWN" call never overwrites it.
+        # ──────────────────────────────────────────────────────────────────────
+        # 🔒 STRICT YTCODE LINK VALIDATION
+        # The prefix embedded in the link MUST match the persistent home_yt_code
+        # stored in bot3_settings by Bot 3. This is the ONLY valid YTCODE prefix.
+        # Any other value (guessed, incremented, tampered) is instantly denied.
+        # ──────────────────────────────────────────────────────────────────────
+        _embedded_code = str(parse_result.get("data", {}).get("user_code", ""))
         try:
-            _yt_uname = message.from_user.username or "unknown"
-            _yt_fname = message.from_user.first_name or "User"
-            _yt_msa = get_user_msa_id(user_id)
-            track_user_source(user_id, "YTCODE", _yt_uname, _yt_fname, _yt_msa or "")
-        except Exception as _yt_track_err:
-            logger.warning(f"YTCODE source tracking failed: {_yt_track_err}")
-        # �🔒 VAULT ACCESS CHECK — Block non-members for YTCODE links
-        is_in_vault = await check_channel_membership(user_id)
-        if not is_in_vault:
-            col_user_verification.update_one({"user_id": user_id}, {"$set": {"pending_payload": payload}}, upsert=True)
-            user_data = get_user_verification_status(user_id)
-            was_ever_verified = user_data.get('ever_verified', False)
-            vault_kb = get_verification_keyboard(user_id, user_data, show_all=not was_ever_verified)
-            if was_ever_verified:
-                vault_msg = (
-                    f"🔐 **{user_name}, THE VAULT IS CLOSED TO YOU**\n\n"
-                    f"You clicked the link. The content is right there.\n"
-                    f"But the system doesn't deliver to those who walked out.\n\n"
-                    f"**You left the Vault.**\n"
-                    f"That means you left your privileges at the door.\n\n"
-                    f"💎 **One action separates you from everything:**\n"
-                    f"Rejoin the Vault → Unlock full delivery. Instantly.\n\n"
-                    f"*The content waits. The clock doesn't.*"
-                )
-            else:
-                vault_msg = (
-                    f"🔒 **{user_name}, ACCESS LOCKED**\n\n"
-                    f"You found the link. You even clicked it.\n"
-                    f"That tells us you're serious.\n\n"
-                    f"**But the system only delivers to Vault members.**\n"
-                    f"No vault = No content. No exceptions.\n\n"
-                    f"✨ **The fix is simple:**\n"
-                    f"Join the Vault → Come back → Get everything."
-                )
-            _vault_ans = await message.answer(vault_msg, reply_markup=vault_kb, parse_mode=ParseMode.MARKDOWN)
-            _locked_ans = await message.answer("🔒 Menu locked until you join the Vault.", reply_markup=ReplyKeyboardRemove())
-            col_user_verification.update_one(
-                {"user_id": user_id},
-                {"$set": {
-                    "pending_payload": payload,
-                    "pending_delete_msg_ids": [_vault_ans.message_id, _locked_ans.message_id]
-                }},
-                upsert=True
+            _home_yt_setting = db["bot3_settings"].find_one({"key": "home_yt_code"})
+            _valid_yt_code = str(_home_yt_setting["value"]) if _home_yt_setting else None
+        except Exception as _ytval_err:
+            logger.warning(f"[YTCODE] home_yt_code DB lookup failed: {_ytval_err}")
+            _valid_yt_code = None
+
+        if not _valid_yt_code or _embedded_code != _valid_yt_code:
+            logger.warning(
+                f"[YTCODE] INVALID CODE: embedded={_embedded_code!r} "
+                f"valid={_valid_yt_code!r} — access denied"
             )
+            await show_access_denied_animation(message, user_id)
             return
-        # 🎬 ANIMATION: SOURCE VALIDATION
+
+        # ✅ Ownership verified — proceed
+        # RECORD FIRST-TOUCH SOURCE — lightweight, no bot2_user_tracking write yet
+        _store_initial_source(user_id, "YTCODE")
+        # 🔒 VAULT ACCESS CHECK — Block non-members for YTCODE links
+        is_in_vault = await check_channel_membership(user_id)
+        # ── PRE-VAULT SYNC (idempotent) ──
+        _ytcode_newly_synced = False
+        if is_in_vault:
+            _uname_yt = message.from_user.username or "unknown"
+            _fname_yt = message.from_user.first_name or "User"
+            _, _ytcode_newly_synced = await _sync_pre_vault_user(user_id, _uname_yt, _fname_yt)
+        if not is_in_vault:
+
+            # ── GRACE-PASS CHECK ──────────────────────────────────────────────
+            # First-time users get one free pass through to the MSA code prompt.
+            # Grace is NOT consumed here — it is consumed only after a valid code
+            # is successfully entered (in process_search_code with is_yt_flow).
+            user_data = get_user_verification_status(user_id)
+            grace_consumed = user_data.get('grace_consumed', False)
+            # Also block users who left the vault (ever_verified but not in vault)
+            was_ever_verified = user_data.get('ever_verified', False)
+            
+            if was_ever_verified or grace_consumed:
+                # Returning/lapsed user OR grace already used → hard block
+                col_user_verification.update_one({"user_id": user_id}, {"$set": {"pending_payload": payload}}, upsert=True)
+                vault_kb = get_verification_keyboard(user_id, user_data, show_all=not was_ever_verified)
+                if was_ever_verified:
+                    vault_msg = (
+                        f"🔐 **{user_name}, THE VAULT IS CLOSED TO YOU**\n\n"
+                        f"You clicked the link. The content is right there.\n"
+                        f"But the system doesn't deliver to those who walked out.\n\n"
+                        f"**You left the Vault.**\n"
+                        f"That means you left your privileges at the door.\n\n"
+                        f"💎 **One action separates you from everything:**\n"
+                        f"Rejoin the Vault → Unlock full delivery. Instantly.\n\n"
+                        f"*The content waits. The clock doesn't.*"
+                    )
+                else:
+                    vault_msg = (
+                        f"🔒 **{user_name}, AGENT ACCESS PAUSED**\n\n"
+                        f"You have already used your complimentary content pass.\n\n"
+                        f"**The MSA Node Agent is an exclusive ecosystem.** By joining free, you instantly unlock:\n\n"
+                        f"📂 **Unlimited Blueprints:** Seamless delivery of all future PDFs and guides.\n"
+                        f"🤖 **Elite AI Tools:** Access to our private arsenal of automation scripts.\n"
+                        f"💎 **The Inner Circle:** Strategies reserved strictly for the Vault.\n\n"
+                        f"Join the Vault below and return here to continue.\n\n"
+                        f"*The content is waiting. The choice is yours.*"
+                    )
+                _vault_ans = await message.answer(vault_msg, reply_markup=vault_kb, parse_mode=ParseMode.MARKDOWN)
+                _locked_ans = await message.answer("🔒 Menu locked until you join the Vault.", reply_markup=ReplyKeyboardRemove())
+                col_user_verification.update_one(
+                    {"user_id": user_id},
+                    {"$set": {
+                        "pending_payload": payload,
+                        "pending_delete_msg_ids": [_vault_ans.message_id, _locked_ans.message_id]
+                    }},
+                    upsert=True
+                )
+                return
+            # ── First-time user: grace available → fall through to MSA code prompt ──
         msg = await message.answer("📡")
         await asyncio.sleep(ANIM_MEDIUM)
         await msg.edit_text("📡 **CONNECTING TO SOURCE...**", parse_mode=ParseMode.MARKDOWN)
@@ -2710,7 +3152,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
         await asyncio.sleep(ANIM_SLOW)
         await safe_delete_message(msg)
 
-        # Prompt for MSA Code with Cancel button
+        # Prompt for MSA Code
         first_name = message.from_user.first_name
         
         cancel_kb = ReplyKeyboardMarkup(
@@ -2719,18 +3161,55 @@ async def cmd_start(message: types.Message, state: FSMContext):
             one_time_keyboard=False
         )
         
-        await message.answer(
-            f"🔒 **MSA CODE REQUIRED**\n\n{first_name}, the agent is waiting.\nEnter correct **MSA CODE** and get your blueprints Instantly!.\n\n*Precision is key.*\n\n`ENTER MSA CODE BELOW:`\n\n⚪️ _Press 'CANCEL' to cancel this search operation._",
-            reply_markup=cancel_kb,
-            parse_mode=ParseMode.MARKDOWN
-        )
+        # ── Choose prompt based on user type ─────────────────────────────────
+        # First-time user (not in vault, grace available) → onboarding message, NO cancel button
+        # Vault member / returning user → standard MSA code required message WITH cancel button
+        if not is_in_vault:
+            # 🚀 FIRST-TIME USER — AGENT ACTIVATED onboarding (no cancel button in menu)
+            await message.answer(
+                f"⚡ **AGENT ACTIVATED, {first_name}**\n\n"
+                f"You've just unlocked access to the **MSA NODE** system.\n\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"🔑 **ENTER YOUR MSA CODE**\n\n"
+                f"Every piece of premium content — blueprints, AI tools, guides — is unlocked with a unique **MSA Code**.\n\n"
+                f"📸 Find your code on **Instagram** or **YouTube**.\n"
+                f"Then type it below to unlock your first blueprint instantly.\n\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"`TYPE YOUR MSA CODE BELOW:`",
+                reply_markup=ReplyKeyboardRemove(),
+                parse_mode=ParseMode.MARKDOWN
+            )
+        else:
+            # 🔒 RETURNING / VAULT USER — Standard MSA code prompt with cancel button
+            await message.answer(
+                f"🔒 **MSA CODE REQUIRED**\n\n"
+                f"{first_name}, the agent is waiting.\n"
+                f"Enter correct **MSA CODE** and get your blueprints Instantly!.\n\n"
+                f"*Precision is key.*\n\n"
+                f"`ENTER MSA CODE BELOW:`\n\n"
+                f"⚪️ Press '**CANCEL**' to cancel this search operation.",
+                reply_markup=cancel_kb,
+                parse_mode=ParseMode.MARKDOWN
+            )
         
         # Set state to waiting for code
         await state.set_state(SearchCodeStates.waiting_for_code)
         # Set context flag: User came from YT, so we treat them as a YT source user
         await state.update_data(is_yt_flow=True)
+        # ── PRE-VAULT FIRST-INTERACTION MENU UNLOCK ──────────────────────────
+        # Send menu immediately — no need to wait for a second /start.
+        if _ytcode_newly_synced:
+            _yt_msa = get_user_msa_id(user_id) or "Assigned"
+            await message.answer(
+                f"✅ **VAULT ACCESS CONFIRMED**\n\n"
+                f"Your account is fully activated.\n"
+                f"🆔 **MSA+ ID:** `{_yt_msa}`\n\n"
+                f"Your full menu is unlocked below ⬇️",
+                reply_markup=get_user_menu(user_id),
+                parse_mode=ParseMode.MARKDOWN
+            )
         return
-    
+
     # 🚫 ERROR HANDLING: BROKEN YT CODE PROMPT
     elif parse_result["status"] == "broken_yt_prompt":
         # Log the specific broken payload
@@ -2754,7 +3233,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
         await safe_delete_message(msg)
 
         # Select Random Affiliate Footer
-        aff_footer_template = random.choice(CONTENT_PACKS["AFFILIATE_FOOTERS"])
+        aff_footer_template = CONTENT_PACKS["AFFILIATE_FOOTERS"][secrets.randbelow(len(CONTENT_PACKS["AFFILIATE_FOOTERS"]))]
         try:
             error_footer = aff_footer_template.format(name=message.from_user.first_name)
         except:
@@ -2775,7 +3254,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
         )
 
         # Select Random Affiliate Button
-        aff_btn_text = random.choice(CONTENT_PACKS["AFFILIATE_BUTTONS"])
+        aff_btn_text = CONTENT_PACKS["AFFILIATE_BUTTONS"][secrets.randbelow(len(CONTENT_PACKS["AFFILIATE_BUTTONS"]))]
         aff_link = BOT_FALLBACK_LINK
 
         error_kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -2787,26 +3266,27 @@ async def cmd_start(message: types.Message, state: FSMContext):
     
     # 📸 NEW FLOW: IGCC DEEP LINK (Instant Content + Upsell)
     elif parse_result["status"] == "igcc_deep_link":
-        parsed_data = parse_result["data"]
-        cc_code = parsed_data["cc_code"]
-        user_id_ref = parsed_data["user_id_ref"]
+        _raw_igcc_data = parse_result.get("data")
+        parsed_data: dict = _raw_igcc_data if isinstance(_raw_igcc_data, dict) else {}
+        cc_code = str(parsed_data.get("cc_code", ""))
+        user_id_ref = str(parsed_data.get("user_id_ref", ""))
         
         # Fetch Content
         ig_content = col_ig_content.find_one({"cc_code": cc_code})
         
         if ig_content:
             # ✅ ENSURE CODE EXISTS - Auto-generate if missing
-            ig_content = await ensure_ig_cc_code(ig_content)
+            content_doc: dict = await ensure_ig_cc_code(ig_content)
             
             # 🔒 STRICT FULL LINK VALIDATION
             # Reconstruct expected payload and compare
-            db_start_code = ig_content.get("start_code", "")
+            db_start_code = content_doc.get("start_code", "")
             expected_payload = f"{db_start_code}_igcc_{cc_code}"
             
             # STRICT COMPARISON: Must match EXACTLY
             if not db_start_code or payload != expected_payload:
                 # 🚫 INVALID LINK (Tampered or Mismatch)
-                await show_access_denied_animation(message, user_id, payload, expected_payload)
+                await show_access_denied_animation(message, user_id, payload or "", expected_payload)
                 return
             
             # ✅ VALIDATION PASSED - Continue with content delivery
@@ -2817,74 +3297,107 @@ async def cmd_start(message: types.Message, state: FSMContext):
             first_name = message.from_user.first_name or "User"
             is_in_vault = await check_channel_membership(user_id)
             try:
-                msa_id = get_user_msa_id(user_id)
-                # MSA ID allocated ONLY when user is already a vault member — never before joining
-                if not msa_id and is_in_vault:
-                    msa_id = allocate_msa_id(user_id, username, first_name)
-                
+                # ── FIRST-TOUCH SOURCE: MUST run BEFORE sync so the sync reads
+                # the correct source (IGCC) when writing to bot2_user_tracking.
+                _store_initial_source(user_id, "IGCC")
+
+                # ── PRE-VAULT SYNC (idempotent) — reads the source just stored above ──
+                _igcc_newly_synced = False
+                if is_in_vault:
+                    msa_id, _igcc_newly_synced = await _sync_pre_vault_user(user_id, username, first_name)
+
+                msa_id = msa_id if is_in_vault else get_user_msa_id(user_id)
+
                 # Deduplicated IG CC click — only count each user once per IG content
-                if _is_new_unique_click(user_id, ig_content["_id"], "ig_cc"):
+                if _is_new_unique_click(user_id, content_doc["_id"], "ig_cc"):
                     col_ig_content.update_one(
-                        {"_id": ig_content["_id"]},
+                        {"_id": content_doc["_id"]},
                         {
                             "$inc": {"ig_cc_clicks": 1},
                             "$set": {"last_ig_cc_click": now_local()}
                         }
                     )
-                
-                # Source locked permanently on first click — never overwritten
-                track_user_source(user_id, "IGCC", username, first_name, msa_id or "")
-                
-                logger.info(f"📊 Analytics: User {user_id} clicked IGCC link for '{ig_content.get('name')}'")
+
+                logger.info(f"📊 Analytics: User {user_id} clicked IGCC link for '{content_doc.get('name')}'")
             except Exception as analytics_err:
                 logger.error(f"⚠️ Analytics tracking failed: {analytics_err}")
+
+
             
             # ==========================================
             # 🔒 VAULT ACCESS CHECK — Block non-members (already resolved above)
             # ==========================================
             if not is_in_vault:
-                # Save the pending payload so it can be delivered upon verification
-                col_user_verification.update_one({"user_id": user_id}, {"$set": {"pending_payload": payload}}, upsert=True)
-                
+                # Check if user has grace-pass available
                 user_data = get_user_verification_status(user_id)
-                was_ever_verified = user_data.get('ever_verified', False)
-                vault_kb = get_verification_keyboard(user_id, user_data, show_all=not was_ever_verified)
-                if was_ever_verified:
-                    vault_msg = (
-                        f"🔐 **{user_name}, THE VAULT IS CLOSED TO YOU**\n\n"
-                        f"You clicked the link. The content is right there.\n"
-                        f"But the system doesn't deliver to those who walked out.\n\n"
-                        f"**You left the Vault.**\n"
-                        f"That means you left your privileges at the door.\n\n"
-                        f"💎 **One action separates you from everything:**\n"
-                        f"Rejoin the Vault → Unlock full delivery. Instantly.\n\n"
-                        f"*The content waits. The clock doesn't.*"
+                grace_allowed = user_data.get('grace_allowed', False)
+                grace_consumed = user_data.get('grace_consumed', False)
+                has_grace = grace_allowed and not grace_consumed
+                
+                if not has_grace:
+                    # No grace available — block with vault lock message
+                    col_user_verification.update_one({"user_id": user_id}, {"$set": {"pending_payload": payload}}, upsert=True)
+                    was_ever_verified = user_data.get('ever_verified', False)
+                    vault_kb = get_verification_keyboard(user_id, user_data, show_all=not was_ever_verified)
+                    if was_ever_verified:
+                        vault_msg = (
+                            f"🔐 **{user_name}, THE VAULT IS CLOSED TO YOU**\n\n"
+                            f"You clicked the link. The content is right there.\n"
+                            f"But the system doesn't deliver to those who walked out.\n\n"
+                            f"**You left the Vault.**\n"
+                            f"That means you left your privileges at the door.\n\n"
+                            f"💎 **One action separates you from everything:**\n"
+                            f"Rejoin the Vault → Unlock full delivery. Instantly.\n\n"
+                            f"*The content waits. The clock doesn't.*"
+                        )
+                    else:
+                        vault_msg = (
+                            f"🔒 **{user_name}, AGENT ACCESS PAUSED**\n\n"
+                            f"You tried to access another premium asset, but your complimentary pass has been used.\n\n"
+                            f"**The MSA Node Agent is an exclusive ecosystem.** By verifying your free membership, you will instantly unlock:\n\n"
+                            f"📂 **Unlimited Blueprints:** Seamless delivery of all future PDFs and guides.\n"
+                            f"🤖 **Elite AI Tools:** Access to our private arsenal of automation scripts.\n"
+                            f"💎 **The Inner Circle:** Strategies reserved strictly for the Vault.\n\n"
+                            f"To resume your delivery and unlock the entire system at zero cost, simply join the Vault below and return here.\n\n"
+                            f"*The content is waiting. The choice is yours.*"
+                        )
+                    _vault_ans = await message.answer(
+                        vault_msg,
+                        reply_markup=vault_kb,
+                        parse_mode=ParseMode.MARKDOWN
                     )
-                else:
-                    vault_msg = (
-                        f"🔒 **{user_name}, ACCESS LOCKED**\n\n"
-                        f"You found the link. You even clicked it.\n"
-                        f"That tells us you're serious.\n\n"
-                        f"**But the system only delivers to Vault members.**\n"
-                        f"No vault = No content. No exceptions.\n\n"
-                        f"✨ **The fix is simple:**\n"
-                        f"Join the Vault → Come back → Get everything."
+                    _locked_ans = await message.answer(
+                        "🔒 Menu locked until you rejoin the Vault.",
+                        reply_markup=ReplyKeyboardRemove()
                     )
-                _vault_ans = await message.answer(
-                    vault_msg,
-                    reply_markup=vault_kb,
-                    parse_mode=ParseMode.MARKDOWN
-                )
-                _locked_ans = await message.answer(
-                    "🔒 Menu locked until you rejoin the Vault.",
-                    reply_markup=ReplyKeyboardRemove()
-                )
-                col_user_verification.update_one(
-                    {"user_id": user_id},
-                    {"$set": {"pending_delete_msg_ids": [_vault_ans.message_id, _locked_ans.message_id]}},
-                    upsert=True
-                )
-                return
+                    col_user_verification.update_one(
+                        {"user_id": user_id},
+                        {"$set": {"pending_delete_msg_ids": [_vault_ans.message_id, _locked_ans.message_id]}},
+                        upsert=True
+                    )
+                    return
+                
+                # User has grace — consume it now atomically before delivering content
+                try:
+                    col_user_verification.update_one(
+                        {
+                            "user_id": user_id,
+                            "grace_allowed": True,
+                            "grace_consumed": False  # Ensure not already consumed (atomic check)
+                        },
+                        {
+                            "$set": {
+                                "grace_consumed": True,
+                                "grace_consumed_at": now_local(),
+                                "grace_consumed_via": "IGCC"
+                            }
+                        }
+                    )
+                    just_consumed_grace = True
+                    logger.info(f"✅ Grace-pass consumed for user {user_id} via IGCC")
+                except Exception as grace_err:
+                    logger.error(f"⚠️ Failed to consume grace for user {user_id}: {grace_err}")
+                # Continue to deliver content (grace consumed successfully)
 
             # 🎬 ANIMATION: ACCESSING CONTENT
             msg = await message.answer("◻️")
@@ -2933,8 +3446,8 @@ async def cmd_start(message: types.Message, state: FSMContext):
             has_affiliate = bool(aff_link and len(aff_link) >= 5)
             
             if has_affiliate:
-                title_text = random.choice(CONTENT_PACKS["AFFILIATE_TITLES"])
-                footer_template = random.choice(CONTENT_PACKS["AFFILIATE_FOOTERS"])
+                title_text = CONTENT_PACKS["AFFILIATE_TITLES"][secrets.randbelow(len(CONTENT_PACKS["AFFILIATE_TITLES"]))]
+                footer_template = CONTENT_PACKS["AFFILIATE_FOOTERS"][secrets.randbelow(len(CONTENT_PACKS["AFFILIATE_FOOTERS"]))]
                 try:
                     footer_text = footer_template.format(name=user_name)
                 except:
@@ -2942,7 +3455,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
                     
                 aff_msg = f"{title_text}\n\n`{footer_text}`"
                 
-                aff_btn_text = random.choice(CONTENT_PACKS["AFFILIATE_BUTTONS"])
+                aff_btn_text = CONTENT_PACKS["AFFILIATE_BUTTONS"][secrets.randbelow(len(CONTENT_PACKS["AFFILIATE_BUTTONS"]))]
                 kb_aff = [[InlineKeyboardButton(text=aff_btn_text, url=aff_link)]]
                 
                 await message.answer(aff_msg, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_aff), parse_mode="Markdown")
@@ -2973,7 +3486,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
             )
             
             # Select Random Affiliate Footer
-            aff_footer_template = random.choice(CONTENT_PACKS["AFFILIATE_FOOTERS"])
+            aff_footer_template = CONTENT_PACKS["AFFILIATE_FOOTERS"][secrets.randbelow(len(CONTENT_PACKS["AFFILIATE_FOOTERS"]))]
             try:
                 network_footer = aff_footer_template.format(name=user_name)
             except:
@@ -2992,6 +3505,19 @@ async def cmd_start(message: types.Message, state: FSMContext):
             await message.answer(final_network_msg, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_network), parse_mode="Markdown")
 
             logger.info(f"User {user_id} triggered IGCC deep link for {cc_code}")
+            if just_consumed_grace:
+                await send_psychological_vault_lock_message(user_id)
+            # ── PRE-VAULT FIRST-INTERACTION MENU UNLOCK ──────────────────────
+            if _igcc_newly_synced:
+                _igcc_msa = get_user_msa_id(user_id) or "Assigned"
+                await message.answer(
+                    f"✅ **VAULT ACCESS CONFIRMED**\n\n"
+                    f"Your account is now fully activated.\n"
+                    f"🆔 **MSA+ ID:** `{_igcc_msa}`\n\n"
+                    f"Your full menu is unlocked below ⬇️",
+                    reply_markup=get_user_menu(user_id),
+                    parse_mode=ParseMode.MARKDOWN
+                )
             return
         else:
             # 🚫 IG Content not found
@@ -3030,10 +3556,20 @@ async def cmd_start(message: types.Message, state: FSMContext):
     
     # ALWAYS check if user is in vault channel (real-time check)
     is_in_vault = await check_channel_membership(user_id)
-    
-    # Update vault status in database based on real-time check
-    update_verification_status(user_id, vault_joined=is_in_vault)
-    
+
+    # ── PRE-VAULT SYNC (idempotent) — runs only once, skips if already synced ──
+    # Handles the special case: user was already in vault BEFORE ever starting bot1.
+    # For these users: sets vault_joined=True, allocates MSA ID, writes bot2_user_tracking.
+    # For normal users (not in vault): falls back to a plain status update.
+    _start_newly_synced = False
+    if is_in_vault:
+        _u = message.from_user
+        _, _start_newly_synced = await _sync_pre_vault_user(
+            user_id, _u.username or "unknown", _u.first_name or "User"
+        )
+    else:
+        update_verification_status(user_id, vault_joined=False)
+
     # Check if user was EVER verified before (old user detection)
     was_ever_verified = user_data.get('ever_verified', False)
     
@@ -3042,53 +3578,60 @@ async def cmd_start(message: types.Message, state: FSMContext):
     
     # If not verified (not in vault) AND this is a NEW user (never verified before)
     if not all_verified and not was_ever_verified:
-        join_text = f"""
-✨ **{user_name}, Welcome to Your New Journey!**
+        grace_consumed = user_data.get('grace_consumed', False)
+        
+        if not grace_consumed:
+            # ── FIRST-TIME USER: Grace available ─────────────────────────────
+            # Do NOT block them. Let them fall through so they reach the MSA code
+            # prompt or tutorial below. The grace will be consumed after valid delivery.
+            logger.info(f"First-time non-vault user {user_id} — allowing through to MSA code prompt")
+            # Fall through to the verified interface below (skip the vault block)
+        else:
+            # ── RETURNING NON-VAULT USER: Grace consumed, no vault ───────────
+            # Block them with vault join screen
+            join_text = f"""
+✨ **{user_name}, The System Awaits.**
 
-You've just taken the first step into something **extraordinary**. The MSA NODE Family isn't just a community — it's a movement of **visionaries, creators, and leaders** shaping the future.
-
-━━━━━━━━━━━━━━━━━━━━
-
-**🌟 Your Gateway to Excellence:**
-
-📺 **YouTube** → Master market strategies & high-impact content
-📸 **Instagram** → Real-time insights, updates & behind-the-scenes
-💎 **MSA NODE Vault** → Your **exclusive VIP pass** to our inner circle
-
-━━━━━━━━━━━━━━━━━━━━
-
-**🔑 Here's What Happens Next:**
-
-1️⃣ **Follow** us on YouTube & Instagram to stay in the loop
-2️⃣ Tap **💎 MSA NODE Vault** below to enter our exclusive circle
-3️⃣ **Instant verification** → The red carpet is already rolled out for you
+You have just activated the **MSA NODE Agent**. This isn't just a bot — it's your personal gateway to elite-level automation, blueprints, and strategies.
 
 ━━━━━━━━━━━━━━━━━━━━
 
-🚀 **Your transformation starts now.**
-*The best decision you'll make today is the one you make right now.*
+🌟 **UNLOCK THE FULL ARSENAL FOR FREE:**
+
+📂 **Unlimited Blueprints**: Instant delivery of all premium guides.
+🤖 **Powerful AI Tools**: Access secret automation scripts.
+💎 **Full Agent Power**: Search codes, dash, and priority updates.
+
+━━━━━━━━━━━━━━━━━━━━
+
+**🔑 How to Get Instant Access:**
+
+1️⃣ Tap **💎 JOIN MSA VAULT** below to enter our exclusive circle.
+2️⃣ Follow us on **YouTube & Instagram** for the latest MSA Codes.
+3️⃣ Return here → Your agent will automatically unlock all features.
+
+━━━━━━━━━━━━━━━━━━━━
+
+🚀 **Your integration starts now.**
+*Join the Vault to turn on full agent power.*
 """
-        verification_msg = await msg.edit_text(
-            join_text,
-            reply_markup=get_verification_keyboard(user_id, user_data),
-            parse_mode=ParseMode.MARKDOWN
-        )
-        # Hide menu keyboard for non-vault users
-        await message.answer(
-            "🔒 No access to menu and features",
-            reply_markup=ReplyKeyboardRemove()
-        )
-        # Store verification message ID for later deletion
-        update_verification_status(user_id, verification_msg_id=verification_msg.message_id)
-        return
+            verification_msg = await msg.edit_text(
+                join_text,
+                reply_markup=get_verification_keyboard(user_id, user_data),
+                parse_mode=ParseMode.MARKDOWN
+            )
+            # Hide menu keyboard for non-vault users
+            await message.answer(
+                "🔒 No access to menu and features",
+                reply_markup=ReplyKeyboardRemove()
+            )
+            # Store verification message ID for later deletion
+            update_verification_status(user_id, verification_msg_id=verification_msg.message_id)
+            return
     
     # If not verified but WAS verified before (old user who left), just tell them to rejoin
     if not all_verified and was_ever_verified:
-        # Register/refresh tracking record immediately so admin can find user in bot2
-        # even before they click rejoin — uses existing msa_id if they have one
-        _uname_tv = message.from_user.username or "unknown"
-        _msa_tv = get_user_msa_id(user_id) or ""
-        track_user_source(user_id, "UNKNOWN", _uname_tv, user_name, _msa_tv)
+        # No tracking needed here — bot2_user_tracking is only written on vault join
         await msg.edit_text(
             f"👋 **{user_name}, We've Missed You!**\n\nYour seat in the **MSA NODE Vault** is still reserved, waiting for your return.\n\n💎 **Everything you left behind?** Still yours.\n🎯 **Your community?** Still here for you.\n\n**One tap. Full access restored. Welcome home.**",
             reply_markup=get_verification_keyboard(user_id, user_data, show_all=False),
@@ -3101,6 +3644,33 @@ You've just taken the first step into something **extraordinary**. The MSA NODE 
         )
         return
     
+    # ── FIRST-TIME NON-VAULT USER BRANCH ────────────────────────────────────
+    # Users who fell through the grace check above (not in vault, grace not consumed,
+    # never verified before) should see a welcome + MSA code prompt, NOT the premium
+    # verified dashboard. This keeps the experience clean and honest.
+    # ⚠️ CRITICAL FIX: vault-first users (joined vault BEFORE ever opening bot) must
+    # NOT enter the code-entry state — they are full members and should go straight
+    # to the verified welcome interface. Only set code-entry state if NOT in vault.
+    if not is_in_vault and not was_ever_verified and not user_data.get('grace_consumed', False):
+        await safe_delete_message(msg)
+        first_name_ft = message.from_user.first_name or "Agent"
+        await message.answer(
+            f"⚡ **AGENT ACTIVATED, {first_name_ft}**\n\n"
+            f"You've just unlocked access to the MSA NODE system.\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"🔑 **ENTER YOUR MSA CODE**\n\n"
+            f"Every piece of premium content — blueprints, AI tools, guides — is unlocked with a unique MSA Code.\n\n"
+            f"📸 Find your code on **Instagram** or **YouTube**.\n"
+            f"Then type it below to unlock your first blueprint instantly.\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"`TYPE YOUR MSA CODE BELOW:`",
+            reply_markup=ReplyKeyboardRemove(),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        await state.set_state(SearchCodeStates.waiting_for_first_code)
+        logger.info(f"First-time non-vault user {user_id} — shown MSA code prompt")
+        return
+
     # User is verified - show welcome interface
     # Mark as verified if not already
     if not user_data.get('verified'):
@@ -3111,9 +3681,7 @@ You've just taken the first step into something **extraordinary**. The MSA NODE 
     _uname_track = message.from_user.username or "unknown"
     if not user_msa_id:
         user_msa_id = allocate_msa_id(user_id, _uname_track, user_name)
-    # Ensure user is in bot10_user_tracking for broadcast targeting
-    # Source is set ONCE at first-ever tracking; source never overwritten for existing users
-    track_user_source(user_id, "UNKNOWN", _uname_track, user_name, user_msa_id)
+    # bot2_user_tracking is only written at vault join — no call needed here
 
     # Final: Enhanced premium interface with ONLINE status
     welcome_text = f"""
@@ -3181,7 +3749,7 @@ _Select a service from the menu ⬇️_
     # NOTE: Pending deep-link payloads are delivered by handle_vault_join when the user joins the
     # vault channel. We do NOT re-deliver here to avoid duplicates.
     # ── 🎬 STARTER TUTORIAL — Only on plain empty /start (no referral payload) ──
-    # Looks up the universal tutorial link stored via bot9 TUTORIAL manager.
+    # Looks up the universal tutorial link stored via bot3 TUTORIAL manager.
     # Delivered as a premium framed message with an inline watch button.
     # If no link stored yet → professional "coming soon" message instead.
     if not payload:
@@ -3231,7 +3799,7 @@ _Select a service from the menu ⬇️_
 
     # Check for deep link payload (Legacy check or fallback)
     if payload == "80919449_YTCODE":
-        # Track user source for bot10 broadcasts
+        # Track user source for bot2 broadcasts
         try:
             # Get or allocate MSA+ ID for user
             username = message.from_user.username or "unknown"
@@ -3240,8 +3808,8 @@ _Select a service from the menu ⬇️_
             if not msa_id:
                 msa_id = allocate_msa_id(user_id, username, first_name)
             
-            # Track user source permanently (first start only — never overwritten)
-            track_user_source(user_id, "YTCODE", username, first_name, msa_id)
+            # Record first-touch source in col_user_verification only
+            _store_initial_source(user_id, "YTCODE")
         except Exception as track_err:
             logger.error(f"⚠️ Bot2 user tracking failed: {track_err}")
         
@@ -3253,8 +3821,19 @@ _Select a service from the menu ⬇️_
         )
         await state.set_state(SearchCodeStates.waiting_for_code)
         logger.info(f"User {user_id} triggered via YTCODE deep link")
-    
+
     logger.info(f"User {user_id} started with premium interface")
+    
+    # Auto-deliver vault unlock message for unknown plain /start only if grace already consumed
+    # (First-time users: skip vault prompt so they can use the MSA code prompt freely)
+    if not payload:
+        _is_in_vault = await check_channel_membership(user_id)
+        if not _is_in_vault:
+            _udata_plain = get_user_verification_status(user_id)
+            _grace_consumed_plain = _udata_plain.get('grace_consumed', False)
+            if _grace_consumed_plain:
+                # Returning non-vault user → show vault lock
+                await send_psychological_vault_lock_message(user_id)
 
 # ==========================================
 # 🎉 AUTO-WELCOME ON VAULT JOIN
@@ -3275,19 +3854,28 @@ async def handle_vault_join(event: ChatMemberUpdated):
     if old_status in ["left", "kicked"] and new_status in ["member", "administrator", "creator"]:
         user_id = event.from_user.id
         user_name = event.from_user.first_name or "User"
+        
+        # 🔑 KEY REQUIREMENT: DO NOT ADD OR TRACK USERS WHO NEVER INTERACTED WITH BOT 1
+        existing_bot1_user = col_user_verification.find_one({"user_id": user_id})
+        if not existing_bot1_user:
+            logger.info(f"Ignored vault join for {user_id} - never interacted with Bot 1")
+            return
+        
 
         # ==========================================
         # 🛑 MAINTENANCE MODE CHECK (Chat Member)
         # ==========================================
         try:
-            settings = col_bot8_settings.find_one({"setting": "maintenance_mode"})
+            settings = col_bot1_settings.find_one({"setting": "maintenance_mode"})
             if settings and settings.get("value", False) and user_id != OWNER_ID:
                 # Maintenance is ON — update DB status but skip welcome messages
                 update_verification_status(user_id, vault_joined=True, verified=True, ever_verified=True, rejoin_msg_id=None)
                 username = event.from_user.username or "unknown"
                 _msa_mm = allocate_msa_id(user_id, username, user_name)
-                # Always write a tracking record — ensures admin can find user in bot2 even during maintenance
-                track_user_source(user_id, "UNKNOWN", username, user_name, _msa_mm)
+                # Read first-touch source and write to bot2_user_tracking at this vault join
+                _v_stored_source = col_user_verification.find_one({"user_id": user_id}, {"initial_source": 1}) or {}
+                _v_source = _v_stored_source.get("initial_source", "UNKNOWN")
+                track_user_source(user_id, _v_source, username, user_name, _msa_mm)
                 try:
                     await bot.send_message(
                         user_id,
@@ -3329,20 +3917,25 @@ async def handle_vault_join(event: ChatMemberUpdated):
         username = event.from_user.username or "unknown"
         msa_id = allocate_msa_id(user_id, username, user_name)
 
-        # 🔑 KEY FIX: Check if user already has a source tracked (from previous /start click)
-        existing_tracking = db["bot10_user_tracking"].find_one({"user_id": user_id}, {"source": 1})
-        user_source = existing_tracking.get("source") if existing_tracking and "source" in existing_tracking else None
-        
-        # Track source: only use UNKNOWN if user has NO prior source
-        # If user clicked IG/YT/IGCC/YTCODE link before, that source persists
-        if not user_source:
-            track_user_source(user_id, "UNKNOWN", username, user_name, msa_id)
-        else:
-            # User has existing source — just update their msa_id in tracking if not already set
-            db["bot10_user_tracking"].update_one(
+        # 📌 WRITE TO BOT2_USER_TRACKING — vault join is the ONLY moment we do this
+        # Read the first-touch source that was stored in col_user_verification
+        _stored_source = user_data.get("initial_source", "UNKNOWN")
+        track_user_source(user_id, _stored_source, username, user_name, msa_id)
+        logger.info(f"📊 Vault join: user {user_id} tracked with source '{_stored_source}'")
+
+        # 📊 GRACE-TO-VAULT CONVERSION TRACKING
+        # If this user previously consumed their grace pass, record that they converted.
+        # This measures the real ROI of the free-pass feature.
+        if user_data.get("grace_consumed") and not user_data.get("grace_converted_to_vault"):
+            col_user_verification.update_one(
                 {"user_id": user_id},
-                {"$set": {"msa_id": msa_id, "last_start": now_local()}}
+                {"$set": {
+                    "grace_converted_to_vault": True,
+                    "grace_converted_at": now_local(),
+                    "grace_converted_via": user_data.get("grace_consumed_via", "UNKNOWN")
+                }}
             )
+            logger.info(f"[GRACE→VAULT] User {user_id} converted: grace pass → vault member")
 
         # 🗑️ DELETE ALL BLOCKING MESSAGES (IN PROPER ORDER)
         messages_to_delete = []
@@ -3380,11 +3973,23 @@ async def handle_vault_join(event: ChatMemberUpdated):
         
         # Send welcome message to user's DM
         try:
-            await bot.send_message(
-                user_id,
-                f"🎉 **{user_name}, You're In!**\n\n✨ **Verification Complete** → Your journey begins this very moment.\n\n━━━━━━━━━━━━━━━━━━━━\n\n🆔 **Your MSA+ ID**: `{msa_id}`\n💎 **Premium Access**: Unlocked\n🏆 **Elite Community**: You're now among the visionaries\n🚀 **Exclusive Content**: At your fingertips\n\n**Your dashboard awaits.**\n\n━━━━━━━━━━━━━━━━━━━━\n\n*Welcome home, {user_name}. This is where legends are made.* ⚡",
-                parse_mode=ParseMode.MARKDOWN
+            msg_success = (
+                f"👑 **{user_name}, You're Inside. Access Granted.**\n\n"
+                f"The **MSA NODE Agent** has verified your clearance.\n"
+                f"You are now part of the most exclusive network in the system.\n\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"⚡ **WHAT YOU JUST UNLOCKED (100% FREE):**\n\n"
+                f"🆔 **MSA+ ID**: `{msa_id}` — Your permanent agent identity\n"
+                f"📂 **Full Blueprint Library**: Every premium guide, strategy & PDF, delivered on demand\n"
+                f"🤖 **Elite AI Tools**: Private automation scripts and agent-grade playbooks\n"
+                f"📊 **Live Intel Dashboard**: Real-time performance, stats, and insider announcements\n"
+                f"🔎 **MSA Code Access**: Search any code and unlock exclusive drops instantly\n"
+                f"💬 **Priority Support**: Direct line to the MSA NODE team\n\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"Most people never reach this level. You did.\n"
+                f"The agent is online. The system is yours. \u26a1"
             )
+            await bot.send_message(user_id, msg_success, parse_mode=ParseMode.MARKDOWN)
             
             # Send menu keyboard immediately
             await bot.send_message(
@@ -3415,7 +4020,9 @@ async def handle_vault_join(event: ChatMemberUpdated):
                 class _MockMessage:
                     """Duck-typed Message that routes .answer() to bot.send_message."""
                     def __init__(self, uid, fname, uname, payload_text):
-                        self.from_user = type('U', (), {'id': uid, 'first_name': fname, 'username': uname})()
+                        class _FU:
+                            def __init__(self, i, fn, un): self.id = i; self.first_name = fn; self.username = un
+                        self.from_user = _FU(uid, fname, uname)
                         self.text = f"/start {payload_text}"
                         self.chat = _MockChat(uid)
                         self.message_id = int(time.time())
@@ -3497,7 +4104,7 @@ async def handle_vault_join(event: ChatMemberUpdated):
 
 
 # ==========================================
-# 📢 ANNOUNCEMENT HELPERS (reads bot10_broadcasts)
+# 📢 ANNOUNCEMENT HELPERS (reads bot2_broadcasts)
 # ==========================================
 
 _DASH_CHAR_LIMIT     = 3900  # safe buffer below Telegram's 4096-char cap
@@ -3580,7 +4187,7 @@ def _build_ann_page(broadcasts: list, page: int) -> str:
 
     if raw_text:
         if len(raw_text) > _ANN_PAGE_MAX_CHARS:
-            raw_text = raw_text[:_ANN_PAGE_MAX_CHARS].rsplit(" ", 1)[0] + "…"
+            raw_text = str(raw_text)[:_ANN_PAGE_MAX_CHARS].rsplit(" ", 1)[0] + "…"
         preview = _escape_dashboard_md(raw_text)
     elif media_type:
         preview = f"📎 _[{media_type.capitalize()} content]_"
@@ -3689,7 +4296,7 @@ async def dashboard(message: types.Message):
 
     # Check suspended features
     suspend_doc = col_suspended_features.find_one({"user_id": message.from_user.id})
-    if suspend_doc and "DASHBOARD" in suspend_doc.get("suspended_features", []):
+    if suspend_doc and "DASHBOARD" in suspend_doc.get("bot1_suspended_features", []):
         await message.answer(
             "⚠️ **FEATURE SUSPENDED**\n\nDashboard access has been suspended for your account.",
             parse_mode=ParseMode.MARKDOWN
@@ -3702,19 +4309,30 @@ async def dashboard(message: types.Message):
         user_data = get_user_verification_status(message.from_user.id)
         was_ever_verified = user_data.get('ever_verified', False)
         user_name = message.from_user.first_name or "User"
-        await message.answer(
-            f"🔒 **{user_name}, ACCESS DENIED**\n\n"
-            f"You walked away from the **MSA NODE Vault**.\n"
-            f"That means you walked away from your dashboard.\n\n"
-            f"The system doesn't reward hesitation.\n"
-            f"Every second you're out, you're losing visibility on your progress.\n\n"
-            f"**The choice is simple:**\n"
-            f"• Stay out \u2192 Stay blind.\n"
-            f"• Get back in \u2192 Get back to work.\n\n"
-            f"💎 **Rejoin the Vault. Reclaim your access.**",
-            reply_markup=get_verification_keyboard(message.from_user.id, user_data, show_all=not was_ever_verified),
-            parse_mode=ParseMode.MARKDOWN
-        )
+        
+        if was_ever_verified:
+            await message.answer(
+                f"🔒 **{user_name}, ACCESS DENIED**\n\n"
+                f"You walked away from the **MSA NODE Vault**.\n"
+                f"That means you walked away from your dashboard.\n\n"
+                f"The system doesn't reward hesitation.\n"
+                f"Every second you're out, you're losing visibility on your progress.\n\n"
+                f"**The choice is simple:**\n"
+                f"• Stay out \u2192 Stay blind.\n"
+                f"• Get back in \u2192 Get back to work.\n\n"
+                f"💎 **Rejoin the Vault. Reclaim your access.**",
+                reply_markup=get_verification_keyboard(message.from_user.id, user_data, show_all=not was_ever_verified),
+                parse_mode=ParseMode.MARKDOWN
+            )
+        else:
+            await message.answer(
+                f"🔐 **VAULT ACCESS REQUIRED**\n\n"
+                f"Hey {user_name}, the **Dashboard** feature is exclusive to Vault Members.\n\n"
+                f"📌 **Click the join button below** to unlock full access.\n\n"
+                f"_Once joined, all features will be available immediately._",
+                reply_markup=get_verification_keyboard(message.from_user.id, user_data, show_all=not was_ever_verified),
+                parse_mode=ParseMode.MARKDOWN
+            )
         return
 
     user_id   = message.from_user.id
@@ -3757,7 +4375,7 @@ async def dashboard(message: types.Message):
         dashboard_text = _build_dashboard_text(user_name, display_msa_id, member_since, ann_text)
         if len(dashboard_text) > _DASH_CHAR_LIMIT:
             excess = len(dashboard_text) - _DASH_CHAR_LIMIT + 5
-            ann_text = ann_text[:-excess].rsplit(" ", 1)[0] + "…"
+            ann_text = str(ann_text[:-excess]).rsplit(" ", 1)[0] + "…"
             dashboard_text = _build_dashboard_text(user_name, display_msa_id, member_since, ann_text)
 
         if total_bc > 1:
@@ -3874,7 +4492,7 @@ async def ann_page_callback(callback: types.CallbackQuery):
         # Guard: hard trim if still over limit
         if len(dashboard_text) > _DASH_CHAR_LIMIT:
             excess = len(dashboard_text) - _DASH_CHAR_LIMIT + 5
-            ann_text = ann_text[:-excess].rsplit(" ", 1)[0] + "…"
+            ann_text = str(ann_text[:-excess]).rsplit(" ", 1)[0] + "…"
             dashboard_text = _build_dashboard_text(user_name, display_msa_id, member_since, ann_text)
 
         # Rebuild nav keyboard — only arrows when more than 1 broadcast; no duplicates
@@ -3923,12 +4541,35 @@ async def ann_noop_callback(callback: types.CallbackQuery):
 # ==========================================
 # 🚫 CANCEL SEARCH HANDLER
 # ==========================================
-@dp.message(F.text == "❌ CANCEL")
+@dp.message(
+    F.text == "❌ CANCEL",
+    ~StateFilter(SearchCodeStates.waiting_for_code, SearchCodeStates.waiting_for_first_code)
+)
 @rate_limit(1.0)  # 1 second cooldown for cancel
 async def cancel_search_handler(message: types.Message, state: FSMContext):
     """Handle cancel button in search flow"""
     # Check Maintenance Mode
     if await check_maintenance_mode(message):
+        return
+
+    user_id = message.from_user.id
+
+    # 🔒 STRICT VAULT GATE — Only vault members can cancel and access main menu
+    is_in_vault = await check_channel_membership(user_id)
+    if not is_in_vault:
+        # Non-vault user typed ❌ CANCEL manually — block it silently or remind them
+        await state.clear()
+        user_data = get_user_verification_status(user_id)
+        was_ever_verified = user_data.get('ever_verified', False)
+        user_name = message.from_user.first_name or "User"
+        await message.answer(
+            f"🔐 **VAULT ACCESS REQUIRED**\n\n"
+            f"Hey {user_name}, this feature is exclusive to Vault Members.\n\n"
+            f"📌 **Click the join button below** to unlock full access.\n\n"
+            f"_Once joined, all features will be available immediately._",
+            reply_markup=get_verification_keyboard(user_id, user_data, show_all=not was_ever_verified),
+            parse_mode=ParseMode.MARKDOWN
+        )
         return
 
     # Animation: Aborting operation
@@ -3943,10 +4584,10 @@ async def cancel_search_handler(message: types.Message, state: FSMContext):
     await state.clear()
     await message.answer(
         "❌ **SEARCH CANCELLED**\n\n`Operation aborted. Returning to main menu...`",
-        reply_markup=get_user_menu(message.from_user.id),
+        reply_markup=get_user_menu(user_id),
         parse_mode=ParseMode.MARKDOWN
     )
-    logger.info(f"User {message.from_user.id} cancelled search")
+    logger.info(f"User {user_id} cancelled search")
 
 @dp.message(F.text == "🔍 SEARCH CODE")
 @rate_limit(2.0)  # 2 second cooldown for search
@@ -3971,7 +4612,7 @@ async def search(message: types.Message, state: FSMContext):
     
     # Check suspended features
     suspend_doc = col_suspended_features.find_one({"user_id": message.from_user.id})
-    if suspend_doc and "SEARCH_CODE" in suspend_doc.get("suspended_features", []):
+    if suspend_doc and "SEARCH_CODE" in suspend_doc.get("bot1_suspended_features", []):
         await message.answer(
             "⚠️ **FEATURE SUSPENDED**\n\nSearch Code access has been suspended for your account.",
             parse_mode=ParseMode.MARKDOWN
@@ -3984,16 +4625,29 @@ async def search(message: types.Message, state: FSMContext):
         user_data = get_user_verification_status(message.from_user.id)
         was_ever_verified = user_data.get('ever_verified', False)
         user_name = message.from_user.first_name or "User"
-        await message.answer(
-            f"🔒 **{user_name}, SEARCH IS BLOCKED**\n\n"
-            f"You can't search for codes if you're not in the **Vault**.\n"
-            f"The system protects its assets.\n\n"
-            f"**Want to search?**\n"
-            f"Get in the vault. It's that simple.\n\n"
-            f"💎 **Rejoin. Unlock Search.**",
-            reply_markup=get_verification_keyboard(message.from_user.id, user_data, show_all=not was_ever_verified),
-            parse_mode=ParseMode.MARKDOWN
-        )
+        
+        if was_ever_verified:
+            await message.answer(
+                f"🔒 **{user_name}, AGENT ACCESS PAUSED**\n\n"
+                f"You tried to access another premium asset, but your complimentary pass has been used.\n\n"
+                f"**The MSA Node Agent is an exclusive ecosystem.** By verifying your free membership, you will instantly unlock:\n\n"
+                f"📂 **Unlimited Blueprints:** Seamless delivery of all future PDFs.\n"
+                f"🤖 **Elite AI Tools:** Access to our private arsenal.\n"
+                f"💎 **The Inner Circle:** Strategies reserved strictly for the Vault.\n\n"
+                f"To resume search and unlock the entire system at zero cost, simply join the Vault below and return here.\n\n"
+                f"*The content is waiting. The choice is yours.*",
+                reply_markup=get_verification_keyboard(message.from_user.id, user_data, show_all=not was_ever_verified),
+                parse_mode=ParseMode.MARKDOWN
+            )
+        else:
+            await message.answer(
+                f"🔐 **VAULT ACCESS REQUIRED**\n\n"
+                f"Hey {user_name}, the **Search Code** feature is exclusive to Vault Members.\n\n"
+                f"📌 **Click the join button below** to unlock full access.\n\n"
+                f"_Once joined, all features will be available immediately._",
+                reply_markup=get_verification_keyboard(message.from_user.id, user_data, show_all=not was_ever_verified),
+                parse_mode=ParseMode.MARKDOWN
+            )
         return
     
     # 🎬 CYBER LOADING ANIMATION
@@ -4032,6 +4686,8 @@ async def search(message: types.Message, state: FSMContext):
 @anti_spam("process_search")
 async def process_search_code(message: types.Message, state: FSMContext):
     """Process the MSA code input"""
+    just_consumed_grace = False
+    just_consumed_grace = False
     # Check Maintenance Mode
     if await check_maintenance_mode(message):
         await state.clear()
@@ -4064,10 +4720,30 @@ async def process_search_code(message: types.Message, state: FSMContext):
         return
 
     if incoming_text in {"❌ CANCEL", "CANCEL", "🏠 MAIN MENU", "🔙 BACK TO MENU"}:
+        _cancel_uid = message.from_user.id
+        _cancel_in_vault = await check_channel_membership(_cancel_uid)
+        # 🔒 STRICT SECURITY: Only vault members can cancel — non-vault users must enter code
+        if not _cancel_in_vault:
+            first_name = message.from_user.first_name or "User"
+            await message.answer(
+                f"⚡ **AGENT ACTIVATED, {first_name}**\n\n"
+                f"You've just unlocked access to the **MSA NODE** system.\n\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"🔑 **ENTER YOUR MSA CODE**\n\n"
+                f"Every piece of premium content — blueprints, AI tools, guides — is unlocked with a unique **MSA Code**.\n\n"
+                f"📸 Find your code on **Instagram** or **YouTube**.\n"
+                f"Then type it below to unlock your first blueprint instantly.\n\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"`TYPE YOUR MSA CODE BELOW:`",
+                reply_markup=ReplyKeyboardRemove(),
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return  # State preserved — user must enter a valid code
+        # ✅ Vault member — allow cancel and return to menu
         await state.clear()
         await message.answer(
             "❌ **SEARCH CANCELLED**\n\n`Operation aborted. Returning to main menu...`",
-            reply_markup=get_user_menu(message.from_user.id),
+            reply_markup=get_user_menu(_cancel_uid),
             parse_mode=ParseMode.MARKDOWN
         )
         return
@@ -4087,9 +4763,11 @@ async def process_search_code(message: types.Message, state: FSMContext):
     await msg.edit_text("🔍 Verifying MSA CODE...")
     await asyncio.sleep(ANIM_SLOW)
     
-    # 🔍 DATABASE QUERY (Case-insensitive)
-    # Using regex for case-insensitive match on 'msa_code'
-    pdf_doc = col_pdfs.find_one({"msa_code": {"$regex": f"^{code}$", "$options": "i"}})
+    # 🔍 DATABASE QUERY (Case-insensitive, ReDoS-safe)
+    # Sanitize user input: strip invisible unicode + escape regex metacharacters
+    import re as _re
+    _safe_code = _re.escape(code.encode('ascii', 'ignore').decode('ascii').strip())
+    pdf_doc = col_pdfs.find_one({"msa_code": {"$regex": f"^{_safe_code}$", "$options": "i"}})
     
     # Check if code exists
     if not pdf_doc:
@@ -4104,17 +4782,22 @@ async def process_search_code(message: types.Message, state: FSMContext):
         
         # Personalize error message
         first_name = message.from_user.first_name
+        is_vault_member = await check_channel_membership(message.from_user.id)
         
-        # Invalid code — same response regardless of flow context
+        # Invalid code — YT for codes, IG for more content
         error_msg = (
-            f"⚠️ **INCORRECT CODE**\n\n{first_name}, that MSA CODE does not match our records.\n\n"
-            f"🎯 **The correct code is waiting for you in the video.**\n\n"
-            f"Return to the source. Watch carefully. Try again.\n\n"
-            f"`Click below or enter the correct code:`\n\n"
-            f"⚪️ _Click 'CANCEL' to cancel._"
+            f"⚠️ **INCORRECT MSA CODE**\n\n"
+            f"{first_name}, that code doesn't exist in the system.\n"
+            f"**Please enter the correct code and try again.**\n\n"
+            f"▶️ **MSA Codes are found in YouTube videos only.**\n"
+            f"Watch the video, find the code, and enter it here.\n\n"
+            f"📸 **On Instagram?** Explore more exclusive blueprints and premium content — no codes needed."
         )
+        if is_vault_member:
+            error_msg += "\n\n⚪️ _Press 'CANCEL' to abort._"
         retry_kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📺 GET CORRECT CODE", url=YOUTUBE_LINK)]
+            [InlineKeyboardButton(text="▶️ GET CODE FROM YOUTUBE", url=YOUTUBE_LINK)],
+            [InlineKeyboardButton(text="📸 MORE BLUEPRINTS ON INSTAGRAM", url=INSTAGRAM_LINK)]
         ])
         await message.answer(error_msg, reply_markup=retry_kb, parse_mode=ParseMode.MARKDOWN)
         # Keep state active — user can retry or cancel
@@ -4123,6 +4806,35 @@ async def process_search_code(message: types.Message, state: FSMContext):
     # ✅ VALID CODE HANDLER
     await msg.edit_text("🔐 Decrypting Access Code...")
     await asyncio.sleep(ANIM_SLOW)
+    
+    # 🎁 CONSUME GRACE-PASS if available (user is not in vault but has one free pass)
+    user_id = message.from_user.id
+    user_data = get_user_verification_status(user_id)
+    grace_allowed = user_data.get('grace_allowed', False)
+    grace_consumed = user_data.get('grace_consumed', False)
+    is_in_vault = await check_channel_membership(user_id)
+    
+    if not is_in_vault and grace_allowed and not grace_consumed:
+        # User has grace and hasn't used it yet - consume it now atomically
+        try:
+            col_user_verification.update_one(
+                {
+                    "user_id": user_id,
+                    "grace_allowed": True,
+                    "grace_consumed": False  # Ensure not already consumed (atomic check)
+                },
+                {
+                    "$set": {
+                        "grace_consumed": True,
+                        "grace_consumed_at": now_local(),
+                        "grace_consumed_via": "UNKNOWN_SEARCH"
+                    }
+                }
+            )
+            just_consumed_grace = True
+            logger.info(f"✅ Grace-pass consumed for user {user_id} via SEARCH CODE")
+        except Exception as grace_err:
+            logger.error(f"⚠️ Failed to consume grace for user {user_id}: {grace_err}")
     
     # 📊 TRACK CLICK ANALYTICS for YT Code clicks
     try:
@@ -4136,13 +4848,8 @@ async def process_search_code(message: types.Message, state: FSMContext):
                     "$set": {"last_yt_code_click": now_local(), "last_clicked_at": now_local()}
                 }
             )
-        # Track user source permanently
-        yt_username = message.from_user.username or "unknown"
-        yt_firstname = message.from_user.first_name or "User"
-        yt_msa_id = get_user_msa_id(yt_uid)
-        if not yt_msa_id:
-            yt_msa_id = allocate_msa_id(yt_uid, yt_username, yt_firstname)
-        track_user_source(yt_uid, "YTCODE", yt_username, yt_firstname, yt_msa_id)
+        # Record first-touch source — bot2_user_tracking written only on vault join
+        _store_initial_source(yt_uid, "YTCODE")
         logger.info(f"📊 Analytics: User {yt_uid} entered YT code for PDF '{pdf_doc.get('name')}'")
     except Exception as analytics_err:
         logger.error(f"⚠️ Analytics tracking failed: {analytics_err}")
@@ -4163,39 +4870,39 @@ async def process_search_code(message: types.Message, state: FSMContext):
     if is_yt_flow:
         # User came from YT -> Treat as YT Source -> Show IG Titles/Buttons (Cross-pollinate)
         # 1. PDF Title: Standard
-        pdf_title_template = random.choice(CONTENT_PACKS["PDF_TITLES"])
+        pdf_title_template = CONTENT_PACKS["PDF_TITLES"][secrets.randbelow(len(CONTENT_PACKS["PDF_TITLES"]))]
         
         # 2. Affiliate Title: Standard
-        aff_title_text = random.choice(CONTENT_PACKS["AFFILIATE_TITLES"])
+        aff_title_text = CONTENT_PACKS["AFFILIATE_TITLES"][secrets.randbelow(len(CONTENT_PACKS["AFFILIATE_TITLES"]))]
         
         # 3. Network Message: FORCE IG CONTENT
         # Use IG Video Titles (since they are watching on YT, we sell them on IG)
-        msa_code_template = random.choice(CONTENT_PACKS["IG_VIDEO_TITLES"])
+        msa_code_template = CONTENT_PACKS["IG_VIDEO_TITLES"][secrets.randbelow(len(CONTENT_PACKS["IG_VIDEO_TITLES"]))]
         
         # Use IG Buttons (Force them to IG)
         # We need a list of just IG buttons to pick from
-        network_btn_text = random.choice(CONTENT_PACKS["IG_CODES_BUTTONS"])
+        network_btn_text = CONTENT_PACKS["IG_CODES_BUTTONS"][secrets.randbelow(len(CONTENT_PACKS["IG_CODES_BUTTONS"]))]
         network_url = INSTAGRAM_LINK
         
     else:
         # Standard Manual Entry -> Randomize or Standard Logic
         # For now, keep existing random logic or define a "Neutral" flow?
         # Let's keep existing random mix for manual entry
-        pdf_title_template = random.choice(CONTENT_PACKS["PDF_TITLES"])
-        aff_title_text = random.choice(CONTENT_PACKS["AFFILIATE_TITLES"])
-        msa_code_template = random.choice(CONTENT_PACKS["MSACODE"])
+        pdf_title_template = CONTENT_PACKS["PDF_TITLES"][secrets.randbelow(len(CONTENT_PACKS["PDF_TITLES"]))]
+        aff_title_text = CONTENT_PACKS["AFFILIATE_TITLES"][secrets.randbelow(len(CONTENT_PACKS["AFFILIATE_TITLES"]))]
+        msa_code_template = CONTENT_PACKS["MSACODE"][secrets.randbelow(len(CONTENT_PACKS["MSACODE"]))]
         network_btn_text = None # Will use dual buttons below
 
     # Format Titles
     try:
         pdf_title_text = pdf_title_template.format(name=first_name)
     except:
-        pdf_title_text = pdf_title_template
+        pdf_title_text = str(pdf_title_template)
         
     try:
         msa_code_text = msa_code_template.format(name=first_name)
     except:
-        msa_code_text = msa_code_template
+        msa_code_text = str(msa_code_template)
     
     # Retrieve Links from DB
     pdf_link = pdf_doc.get("link") or BOT_FALLBACK_LINK
@@ -4203,8 +4910,8 @@ async def process_search_code(message: types.Message, state: FSMContext):
 
     # 1️⃣ SEND PDF MESSAGE (Standard)
     # ... (same as before) ...
-    pdf_btn_text = random.choice(CONTENT_PACKS["PDF_BUTTONS"])
-    pdf_footer_template = random.choice(CONTENT_PACKS["PDF_FOOTERS"])
+    pdf_btn_text = CONTENT_PACKS["PDF_BUTTONS"][secrets.randbelow(len(CONTENT_PACKS["PDF_BUTTONS"]))]
+    pdf_footer_template = CONTENT_PACKS["PDF_FOOTERS"][secrets.randbelow(len(CONTENT_PACKS["PDF_FOOTERS"]))]
     try:
         pdf_footer_text = pdf_footer_template.format(name=first_name)
     except:
@@ -4228,7 +4935,7 @@ async def process_search_code(message: types.Message, state: FSMContext):
 
     # 2️⃣ SEND AFFILIATE MESSAGE with Footer
     # Select random footer
-    aff_footer_template = random.choice(CONTENT_PACKS["AFFILIATE_FOOTERS"])
+    aff_footer_template = CONTENT_PACKS["AFFILIATE_FOOTERS"][secrets.randbelow(len(CONTENT_PACKS["AFFILIATE_FOOTERS"]))]
     try:
         aff_footer_text = aff_footer_template.format(name=first_name)
     except:
@@ -4258,7 +4965,7 @@ async def process_search_code(message: types.Message, state: FSMContext):
             [InlineKeyboardButton(text=network_btn_text, url=network_url)]
         ])
         # Add random IG Video Footer
-        ig_footer_template = random.choice(CONTENT_PACKS["IG_VIDEO_FOOTERS"])
+        ig_footer_template = CONTENT_PACKS["IG_VIDEO_FOOTERS"][secrets.randbelow(len(CONTENT_PACKS["IG_VIDEO_FOOTERS"]))]
         try:
             ig_footer_text = ig_footer_template.format(name=first_name)
         except:
@@ -4266,8 +4973,8 @@ async def process_search_code(message: types.Message, state: FSMContext):
         msa_code_text += f"\n\n━━━━━━━━━━━━━━━━\n`{ig_footer_text}`"
     else:
         # Standard Flow: Dual Buttons (YT + IG)
-        yt_btn_text_std, ig_btn_text_std = random.choice(CONTENT_PACKS["MSACODE_BUTTONS"])
-        footer_template_std = random.choice(CONTENT_PACKS["MSACODE_FOOTERS"])
+        yt_btn_text_std, ig_btn_text_std = CONTENT_PACKS["MSACODE_BUTTONS"][secrets.randbelow(len(CONTENT_PACKS["MSACODE_BUTTONS"]))]
+        footer_template_std = CONTENT_PACKS["MSACODE_FOOTERS"][secrets.randbelow(len(CONTENT_PACKS["MSACODE_FOOTERS"]))]
         try:
              footer_text_std = footer_template_std.format(name=first_name)
         except:
@@ -4293,11 +5000,228 @@ async def process_search_code(message: types.Message, state: FSMContext):
     # Re-prompt for another MSA CODE
     await asyncio.sleep(ANIM_DELAY)  # Brief pause after content delivery
     
-    await message.answer(
-        f"🔒 **AUTHENTICATION REQUIRED**\n\n{first_name}, the agent is waiting.\nEnter your **MSA CODE** to decrypt the asset.\n\n*Precision is key.*\n\n`ENTER MSA CODE BELOW:`\n\n⚪️ _Reply 'CANCEL' to cancel this operation._",
+    if just_consumed_grace:
+        await send_psychological_vault_lock_message(user_id)
+    else:
+        await message.answer(
+            f"🔒 **AUTHENTICATION REQUIRED**\n\n{first_name}, the agent is waiting.\nEnter your **MSA CODE** to decrypt the asset.\n\n*Precision is key.*\n\n`ENTER MSA CODE BELOW:`\n\n⚪️ _Reply 'CANCEL' to cancel this operation._",
+            parse_mode=ParseMode.MARKDOWN
+        )
+    # State remains active - user can enter another code or cancel
+
+
+
+@dp.message(SearchCodeStates.waiting_for_first_code)
+@rate_limit(1.5)
+@anti_spam("process_first_search")
+async def process_first_unknown_start_code(message: types.Message, state: FSMContext):
+    """Process the MSA code input for first-time unknown start"""
+    user_id = message.from_user.id
+    incoming_text = (message.text or "").strip()
+
+    # 🔒 STRICT SECURITY: Cancel only works for vault members — non-vault must enter code
+    if incoming_text in {"❌ CANCEL", "CANCEL", "🏠 MAIN MENU", "🔙 BACK TO MENU"}:
+        _f_cancel_uid = message.from_user.id
+        _f_cancel_in_vault = await check_channel_membership(_f_cancel_uid)
+        if not _f_cancel_in_vault:
+            # Non-vault first-time user — block cancel, keep state active
+            first_name = message.from_user.first_name or "User"
+            await message.answer(
+                f"⚡ **AGENT ACTIVATED, {first_name}**\n\n"
+                f"You've just unlocked access to the **MSA NODE** system.\n\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"🔑 **ENTER YOUR MSA CODE**\n\n"
+                f"Every piece of premium content — blueprints, AI tools, guides — is unlocked with a unique **MSA Code**.\n\n"
+                f"📸 Find your code on **Instagram** or **YouTube**.\n"
+                f"Then type it below to unlock your first blueprint instantly.\n\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"`TYPE YOUR MSA CODE BELOW:`",
+                reply_markup=ReplyKeyboardRemove(),
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return  # State preserved — must enter valid code
+        # Vault member — allow cancel
+        await state.clear()
+        await message.answer(
+            "❌ **SEARCH CANCELLED**\n\n`Operation aborted. Returning to main menu...`",
+            reply_markup=get_user_menu(_f_cancel_uid),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    if not incoming_text:
+        await message.answer("⚠️ Please type a valid MSA CODE.")
+        return
+
+    code = incoming_text
+
+    # 🎬 CYBER LOADING ANIMATION
+    msg = await message.answer("📡 Establishing Secure Uplink...")
+    await asyncio.sleep(ANIM_MEDIUM)
+
+    steps = ["▱▱▱▱▱", "▰▱▱▱▱", "▰▰▱▱▱", "▰▰▰▱▱", "▰▰▰▰▱", "▰▰▰▰▰"]
+    for step in steps:
+        await msg.edit_text(f"[{step}] Establishing Secure Uplink...")
+        await asyncio.sleep(0.1)
+
+    await msg.edit_text("🔍 Verifying MSA CODE...")
+    await asyncio.sleep(ANIM_SLOW)
+
+    # 🔍 DATABASE QUERY (Case-insensitive, ReDoS-safe)
+    import re as _re
+    _safe_code = _re.escape(code.encode('ascii', 'ignore').decode('ascii').strip())
+    pdf_doc = col_pdfs.find_one({"msa_code": {"$regex": f"^{_safe_code}$", "$options": "i"}})
+
+    if not pdf_doc:
+        await msg.edit_text("🚫 ACCESS DENIED")
+        await asyncio.sleep(ANIM_SLOW)
+        await safe_delete_message(msg)
+
+        first_name = message.from_user.first_name
+        is_vault_member = await check_channel_membership(message.from_user.id)
+        
+        # Invalid code — YT for codes, IG for more content
+        error_msg = (
+            f"⚠️ **INCORRECT MSA CODE**\n\n"
+            f"{first_name}, that code doesn't exist in the system.\n"
+            f"**Please enter the correct code and try again.**\n\n"
+            f"▶️ **MSA Codes are found in YouTube videos only.**\n"
+            f"Watch the video, find the code, and enter it here.\n\n"
+            f"📸 **On Instagram?** Explore more exclusive blueprints and premium content — no codes needed."
+        )
+        if is_vault_member:
+            error_msg += "\n\n⚪️ _Press 'CANCEL' to abort._"
+        retry_kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="▶️ GET CODE FROM YOUTUBE", url=YOUTUBE_LINK)],
+            [InlineKeyboardButton(text="📸 MORE BLUEPRINTS ON INSTAGRAM", url=INSTAGRAM_LINK)]
+        ])
+        await message.answer(error_msg, reply_markup=retry_kb, parse_mode=ParseMode.MARKDOWN)
+        return
+
+    # ✅ VALID CODE — Identity confirmation
+    await msg.edit_text("🔐 Decrypting Access Code...")
+    await asyncio.sleep(ANIM_SLOW)
+
+    first_name = message.from_user.first_name
+    await msg.edit_text(
+        f"✅ **IDENTITY CONFIRMED: {first_name}**\n\n`Secure Delivery In Progress...`",
         parse_mode=ParseMode.MARKDOWN
     )
-    # State remains active - user can enter another code or cancel
+    await asyncio.sleep(ANIM_DELAY)
+    await safe_delete_message(msg)
+
+    # 1️⃣ PDF DELIVERY
+    pdf_link = pdf_doc.get("link") or BOT_FALLBACK_LINK
+    pdf_btn_text = CONTENT_PACKS["PDF_BUTTONS"][secrets.randbelow(len(CONTENT_PACKS["PDF_BUTTONS"]))]
+    pdf_title_template = CONTENT_PACKS["PDF_TITLES"][secrets.randbelow(len(CONTENT_PACKS["PDF_TITLES"]))]
+    pdf_footer_template = CONTENT_PACKS["PDF_FOOTERS"][secrets.randbelow(len(CONTENT_PACKS["PDF_FOOTERS"]))]
+    try:
+        pdf_title_text = pdf_title_template.format(name=first_name)
+    except:
+        pdf_title_text = str(pdf_title_template)
+    try:
+        pdf_footer_text = pdf_footer_template.format(name=first_name)
+    except:
+        pdf_footer_text = str(pdf_footer_template)
+
+    pdf_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=pdf_btn_text, url=pdf_link)]
+    ])
+    await message.answer(
+        f"{pdf_title_text}\n\n`{pdf_footer_text}`",
+        reply_markup=pdf_kb,
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+    # ⏳ DOT ANIMATION 1
+    wait_msg = await message.answer("▪️")
+    await asyncio.sleep(ANIM_MEDIUM)
+    await wait_msg.edit_text("▪️▪️")
+    await asyncio.sleep(ANIM_MEDIUM)
+    await wait_msg.edit_text("▪️▪️▪️")
+    await asyncio.sleep(ANIM_MEDIUM)
+    await safe_delete_message(wait_msg)
+
+    # 2️⃣ AFFILIATE DELIVERY
+    affiliate_link = pdf_doc.get("affiliate_link") or BOT_FALLBACK_LINK
+    aff_title_text = CONTENT_PACKS["AFFILIATE_TITLES"][secrets.randbelow(len(CONTENT_PACKS["AFFILIATE_TITLES"]))]
+    aff_footer_template = CONTENT_PACKS["AFFILIATE_FOOTERS"][secrets.randbelow(len(CONTENT_PACKS["AFFILIATE_FOOTERS"]))]
+    try:
+        aff_footer_text = aff_footer_template.format(name=first_name)
+    except:
+        aff_footer_text = str(aff_footer_template)
+
+    aff_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💰 ACCESS OPPORTUNITY", url=affiliate_link)]
+    ])
+    await message.answer(
+        f"{aff_title_text}\n\n━━━━━━━━━━━━━━━━\n`{aff_footer_text}`",
+        reply_markup=aff_kb,
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+    # ⏳ DOT ANIMATION 2
+    wait_msg = await message.answer("▪️")
+    await asyncio.sleep(ANIM_MEDIUM)
+    await wait_msg.edit_text("▪️▪️")
+    await asyncio.sleep(ANIM_MEDIUM)
+    await wait_msg.edit_text("▪️▪️▪️")
+    await asyncio.sleep(ANIM_MEDIUM)
+    await safe_delete_message(wait_msg)
+
+    # 3️⃣ NETWORK / MSA CODE MESSAGE (dual YT + IG buttons)
+    msa_code_template = CONTENT_PACKS["MSACODE"][secrets.randbelow(len(CONTENT_PACKS["MSACODE"]))]
+    try:
+        msa_code_text = msa_code_template.format(name=first_name)
+    except:
+        msa_code_text = str(msa_code_template)
+
+    yt_btn_text_std, ig_btn_text_std = CONTENT_PACKS["MSACODE_BUTTONS"][secrets.randbelow(len(CONTENT_PACKS["MSACODE_BUTTONS"]))]
+    footer_template_std = CONTENT_PACKS["MSACODE_FOOTERS"][secrets.randbelow(len(CONTENT_PACKS["MSACODE_FOOTERS"]))]
+    try:
+        footer_text_std = footer_template_std.format(name=first_name)
+    except:
+        footer_text_std = str(footer_template_std)
+
+    network_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=yt_btn_text_std, url=YOUTUBE_LINK)],
+        [InlineKeyboardButton(text=ig_btn_text_std, url=INSTAGRAM_LINK)]
+    ])
+    await message.answer(
+        f"{msa_code_text}\n\n━━━━━━━━━━━━━━━━\n`{footer_text_std}`",
+        reply_markup=network_kb,
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+    logger.info(f"First-time user {user_id} got full content delivery for code '{code}'")
+
+    await asyncio.sleep(ANIM_DELAY)
+
+    # 4. Consume grace atomically
+    await state.clear()
+    try:
+        col_user_verification.update_one(
+            {
+                "user_id": user_id,
+                "grace_allowed": True,
+                "grace_consumed": False,
+            },
+            {
+                "$set": {
+                    "grace_consumed": True,
+                    "grace_consumed_at": now_local(),
+                    "grace_consumed_via": "UNKNOWN_SEARCH",
+                }
+            }
+        )
+        logger.info(f"✅ Grace-pass consumed for user {user_id} via UNKNOWN_SEARCH")
+    except Exception as _g_err:
+        logger.error(f"⚠️ Grace consume failed for {user_id}: {_g_err}")
+
+    # 5. Vault unlock message
+    await send_psychological_vault_lock_message(user_id)
+    update_verification_status(user_id, verification_msg_id=None)
+
 
 
 async def _handle_main_tutorial_request(message: types.Message, state: FSMContext):
@@ -4318,7 +5242,7 @@ async def _handle_main_tutorial_request(message: types.Message, state: FSMContex
         return
 
     suspend_doc = col_suspended_features.find_one({"user_id": user_id})
-    if suspend_doc and "TUTORIAL" in suspend_doc.get("suspended_features", []):
+    if suspend_doc and "TUTORIAL" in suspend_doc.get("bot1_suspended_features", []):
         await message.answer(
             "⚠️ **FEATURE SUSPENDED**\n\nTutorial access has been suspended for your account.",
             parse_mode=ParseMode.MARKDOWN
@@ -4330,14 +5254,25 @@ async def _handle_main_tutorial_request(message: types.Message, state: FSMContex
         user_data = get_user_verification_status(user_id)
         was_ever_verified = user_data.get('ever_verified', False)
         user_name = message.from_user.first_name or "User"
-        await message.answer(
-            f"🔒 **{user_name}, TUTORIAL IS VAULT-EXCLUSIVE**\n\n"
-            f"The tutorial video is reserved for verified vault members.\n\n"
-            f"Rejoin the vault to unlock it instantly.\n\n"
-            f"💎 **Rejoin. Watch. Learn.**",
-            reply_markup=get_verification_keyboard(user_id, user_data, show_all=not was_ever_verified),
-            parse_mode=ParseMode.MARKDOWN
-        )
+        
+        if was_ever_verified:
+            await message.answer(
+                f"🔒 **{user_name}, TUTORIAL IS VAULT-EXCLUSIVE**\n\n"
+                f"The tutorial video is reserved for verified vault members.\n\n"
+                f"Rejoin the vault to unlock it instantly.\n\n"
+                f"💎 **Rejoin. Watch. Learn.**",
+                reply_markup=get_verification_keyboard(user_id, user_data, show_all=not was_ever_verified),
+                parse_mode=ParseMode.MARKDOWN
+            )
+        else:
+            await message.answer(
+                f"🔐 **VAULT ACCESS REQUIRED**\n\n"
+                f"Hey {user_name}, the **Tutorial** is exclusive to Vault Members.\n\n"
+                f"📌 **Click the join button below** to unlock full access.\n\n"
+                f"_Once joined, all features will be available immediately._",
+                reply_markup=get_verification_keyboard(user_id, user_data, show_all=not was_ever_verified),
+                parse_mode=ParseMode.MARKDOWN
+            )
         return
 
     await state.clear()
@@ -4573,7 +5508,7 @@ async def rules_regulations(message: types.Message, state: FSMContext):
     
     # Check suspended features
     suspend_doc = col_suspended_features.find_one({"user_id": message.from_user.id})
-    if suspend_doc and "RULES" in suspend_doc.get("suspended_features", []):
+    if suspend_doc and "RULES" in suspend_doc.get("bot1_suspended_features", []):
         await message.answer(
             "⚠️ **FEATURE SUSPENDED**\n\nRules access has been suspended for your account.",
             parse_mode=ParseMode.MARKDOWN
@@ -4586,16 +5521,27 @@ async def rules_regulations(message: types.Message, state: FSMContext):
         user_data = get_user_verification_status(message.from_user.id)
         was_ever_verified = user_data.get('ever_verified', False)
         user_name = message.from_user.first_name or "User"
-        await message.answer(
-            f"🔒 **{user_name}, RULES ARE VAULT-ONLY**\n\n"
-            f"The rules aren't public. They're protected.\n"
-            f"Only vault members see the blueprint.\n\n"
-            f"**You want the rules?**\n"
-            f"Earn them. Join the vault.\n\n"
-            f"💎 **Rejoin. See the system.**",
-            reply_markup=get_verification_keyboard(message.from_user.id, user_data, show_all=not was_ever_verified),
-            parse_mode=ParseMode.MARKDOWN
-        )
+        
+        if was_ever_verified:
+            await message.answer(
+                f"🔒 **{user_name}, RULES ARE VAULT-ONLY**\n\n"
+                f"The rules aren't public. They're protected.\n"
+                f"Only vault members see the blueprint.\n\n"
+                f"**You want the rules?**\n"
+                f"Earn them. Join the vault.\n\n"
+                f"💎 **Rejoin. See the system.**",
+                reply_markup=get_verification_keyboard(message.from_user.id, user_data, show_all=not was_ever_verified),
+                parse_mode=ParseMode.MARKDOWN
+            )
+        else:
+            await message.answer(
+                f"🔐 **VAULT ACCESS REQUIRED**\n\n"
+                f"Hey {user_name}, the **Rules** are exclusive to Vault Members.\n\n"
+                f"📌 **Click the join button below** to unlock full access.\n\n"
+                f"_Once joined, all features will be available immediately._",
+                reply_markup=get_verification_keyboard(message.from_user.id, user_data, show_all=not was_ever_verified),
+                parse_mode=ParseMode.MARKDOWN
+            )
         return
     
     # 🎬 RULES ANIMATION
@@ -4890,7 +5836,7 @@ async def guide(message: types.Message, state: FSMContext):
         return
 
     suspend_doc = col_suspended_features.find_one({"user_id": message.from_user.id})
-    if suspend_doc and "GUIDE" in suspend_doc.get("suspended_features", []):
+    if suspend_doc and "GUIDE" in suspend_doc.get("bot1_suspended_features", []):
         await message.answer(
             "⚠️ **FEATURE SUSPENDED**\n\nGuide access has been suspended for your account.",
             parse_mode=ParseMode.MARKDOWN
@@ -4902,13 +5848,24 @@ async def guide(message: types.Message, state: FSMContext):
         user_data = get_user_verification_status(message.from_user.id)
         was_ever_verified = user_data.get('ever_verified', False)
         user_name = message.from_user.first_name or "User"
-        await message.answer(
-            f"🔒 **{user_name}, GUIDE IS LOCKED**\n\n"
-            f"The **Guide** is vault-exclusive.\n\n"
-            f"💎 **Rejoin to unlock it.**",
-            reply_markup=get_verification_keyboard(message.from_user.id, user_data, show_all=not was_ever_verified),
-            parse_mode=ParseMode.MARKDOWN
-        )
+        
+        if was_ever_verified:
+            await message.answer(
+                f"🔒 **{user_name}, GUIDE IS LOCKED**\n\n"
+                f"The **Guide** is vault-exclusive.\n\n"
+                f"💎 **Rejoin to unlock it.**",
+                reply_markup=get_verification_keyboard(message.from_user.id, user_data, show_all=not was_ever_verified),
+                parse_mode=ParseMode.MARKDOWN
+            )
+        else:
+            await message.answer(
+                f"🔐 **VAULT ACCESS REQUIRED**\n\n"
+                f"Hey {user_name}, the **Guide** is exclusive to Vault Members.\n\n"
+                f"📌 **Click the join button below** to unlock full access.\n\n"
+                f"_Once joined, all features will be available immediately._",
+                reply_markup=get_verification_keyboard(message.from_user.id, user_data, show_all=not was_ever_verified),
+                parse_mode=ParseMode.MARKDOWN
+            )
         return
 
     # 🎬 GUIDE BOOT ANIMATION
@@ -4923,7 +5880,7 @@ async def guide(message: types.Message, state: FSMContext):
     await safe_delete_message(msg)
 
     page = 1
-    await state.set_state(GuideStates.viewing_bot8)
+    await state.set_state(GuideStates.viewing_bot1)
     await state.update_data(guide_page=page)
     await message.answer(
         _AGENT_GUIDE_PAGES[page - 1],
@@ -4932,8 +5889,8 @@ async def guide(message: types.Message, state: FSMContext):
     )
     logger.info(f"User {message.from_user.id} opened Agent Guide page 1")
 
-@dp.message(GuideStates.viewing_bot8, F.text == "NEXT ➡️")
-async def guide_bot8_next(message: types.Message, state: FSMContext):
+@dp.message(GuideStates.viewing_bot1, F.text == "NEXT ➡️")
+async def guide_bot1_next(message: types.Message, state: FSMContext):
     data = await state.get_data()
     page = min(data.get("guide_page", 1) + 1, len(_AGENT_GUIDE_PAGES))
     await state.update_data(guide_page=page)
@@ -4948,8 +5905,8 @@ async def guide_bot8_next(message: types.Message, state: FSMContext):
         reply_markup=_agent_guide_kb(page, len(_AGENT_GUIDE_PAGES)),
     )
 
-@dp.message(GuideStates.viewing_bot8, F.text == "⬅️ PREV")
-async def guide_bot8_prev(message: types.Message, state: FSMContext):
+@dp.message(GuideStates.viewing_bot1, F.text == "⬅️ PREV")
+async def guide_bot1_prev(message: types.Message, state: FSMContext):
     data = await state.get_data()
     page = max(data.get("guide_page", 1) - 1, 1)
     await state.update_data(guide_page=page)
@@ -4968,12 +5925,19 @@ async def guide_legacy_menu_btn(message: types.Message, state: FSMContext):
     """Legacy GUIDE MENU button — redirects safely to the canonical Agent Guide handler."""
     await guide(message, state)
 
-@dp.message(F.text == "🏠 MAIN MENU")
-async def guide_back_to_main_bot8(message: types.Message, state: FSMContext):
-    """Return to main menu, clearing any guide state (bot8)."""
+@dp.message(
+    F.text == "🏠 MAIN MENU",
+    ~StateFilter(SearchCodeStates.waiting_for_code, SearchCodeStates.waiting_for_first_code)
+)
+async def guide_back_to_main_bot1(message: types.Message, state: FSMContext):
+    """Return to main menu, clearing any guide state (bot1)."""
     await state.clear()
     user_id = message.from_user.id
     first_name = message.from_user.first_name or "Member"
+
+    # 🔒 STRICT VAULT GATE — non-vault users cannot access main menu
+    if await _require_vault_check(message):
+        return
 
     msg = await message.answer("🔄 Returning to main menu...")
     await asyncio.sleep(ANIM_FAST)
@@ -5011,7 +5975,7 @@ async def cmd_checkvault(message: types.Message):
         perm_banned     = col_banned_users.count_documents({"ban_type": "permanent"})
         temp_banned     = col_banned_users.count_documents({"ban_type": "temporary"})
         total_suspended = col_suspended_features.count_documents({})
-        _tracking = db["bot10_user_tracking"]
+        _tracking = db["bot2_user_tracking"]
         total_tracked   = _tracking.count_documents({})
 
         yt_count      = _tracking.count_documents({"source": "YT"})
@@ -5050,6 +6014,67 @@ async def cmd_checkvault(message: types.Message):
         await message.answer(f"❌ checkvault error: {str(e)[:150]}", parse_mode=ParseMode.MARKDOWN)
 
 
+@dp.message(Command("traffic"))
+async def cmd_traffic(message: types.Message):
+    """Owner-only: Real-time traffic source analytics (Bot 1, no duplicates, no cross-bot data)"""
+    if message.from_user.id != OWNER_ID:
+        return
+    try:
+        _tracking = db["bot2_user_tracking"]
+
+        # ── Core counts (strictly Bot 1 first-touch sources) ──────────────────
+        total_tracked   = _tracking.count_documents({})
+        active_tracked  = _tracking.count_documents({"is_archived": {"$ne": True}})
+        archived_count  = _tracking.count_documents({"is_archived": True})
+
+        # Each doc has unique user_id index — no duplicates possible by design
+        yt_count      = _tracking.count_documents({"source": "YT"})
+        ig_count      = _tracking.count_documents({"source": "IG"})
+        igcc_count    = _tracking.count_documents({"source": "IGCC"})
+        ytcode_count  = _tracking.count_documents({"source": "YTCODE"})
+        unknown_count = _tracking.count_documents({"source": "UNKNOWN"})
+        known_count   = yt_count + ig_count + igcc_count + ytcode_count
+
+        def pct(n: int) -> str:
+            return f"{(n / total_tracked * 100):.1f}%" if total_tracked else "0.0%"
+
+        # ── Last 7 days new sign-ups ───────────────────────────────────────────
+        from datetime import timedelta
+        week_ago  = now_local() - timedelta(days=7)
+        new_7d    = _tracking.count_documents({"joined_at": {"$gte": week_ago}})
+
+        # ── Build report ──────────────────────────────────────────────────────
+        bar_len = 20
+        def mini_bar(n: int) -> str:
+            if not total_tracked:
+                return "░" * bar_len
+            filled = round(n / total_tracked * bar_len)
+            return "█" * filled + "░" * (bar_len - filled)
+
+        report = (
+            "📊 **BOT 1 — REAL-TIME TRAFFIC ANALYTICS** _(/traffic)_\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"👥 **Total Tracked:** {total_tracked:,}\n"
+            f"   ✅ Active: {active_tracked:,}  |  🗄 Archived: {archived_count:,}\n"
+            f"   🆕 Last 7 days: +{new_7d:,}\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "📍 **Traffic Sources (first-touch, no duplicates):**\n\n"
+            f"📺 **YT**       {yt_count:>5,}  {pct(yt_count):>7}  `{mini_bar(yt_count)}`\n"
+            f"📸 **IG**       {ig_count:>5,}  {pct(ig_count):>7}  `{mini_bar(ig_count)}`\n"
+            f"📎 **IGCC**     {igcc_count:>5,}  {pct(igcc_count):>7}  `{mini_bar(igcc_count)}`\n"
+            f"🔗 **YTCODE**   {ytcode_count:>5,}  {pct(ytcode_count):>7}  `{mini_bar(ytcode_count)}`\n"
+            f"👤 **UNKNOWN**  {unknown_count:>5,}  {pct(unknown_count):>7}  `{mini_bar(unknown_count)}`\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🎯 **Known source rate:** {pct(known_count)} ({known_count:,} / {total_tracked:,})\n"
+            f"🔒 **Dedup status:** ✅ Unique by user_id (no duplicates)\n"
+            f"🗂 **Scope:** `bot2_user_tracking` — Bot 1 only, isolated from Bot 2 & Bot 3\n\n"
+            f"🕒 {now_local().strftime('%b %d, %Y  %I:%M:%S %p')}"
+        )
+        await message.answer(report, parse_mode=ParseMode.MARKDOWN)
+    except Exception as e:
+        await message.answer(f"❌ /traffic error: {str(e)[:200]}", parse_mode=ParseMode.MARKDOWN)
+
+
 @dp.message(Command("menu"))
 @rate_limit(2.0)  # 2 second cooldown for menu command
 async def cmd_menu(message: types.Message):
@@ -5067,6 +6092,10 @@ async def cmd_menu(message: types.Message):
             reply_markup=get_banned_user_keyboard(ban_type),
             parse_mode=ParseMode.MARKDOWN
         )
+        return
+
+    # 🔒 STRICT VAULT GATE — non-vault users cannot use /menu
+    if await _require_vault_check(message):
         return
     
     first_name = message.from_user.first_name or "Member"
@@ -5116,15 +6145,26 @@ async def support_menu(message: types.Message, state: FSMContext):
         user_data = get_user_verification_status(message.from_user.id)
         was_ever_verified = user_data.get('ever_verified', False)
         user_name = message.from_user.first_name or "User"
-        await message.answer(
-            f"🔒 **{user_name}, SUPPORT IS VAULT-ONLY**\n\n"
-            f"Support is for **verified members only**.\n"
-            f"You need access to get help.\n\n"
-            f"**Join the vault first.**\n\n"
-            f"💎 **Rejoin. Get Support.**",
-            reply_markup=get_verification_keyboard(message.from_user.id, user_data, show_all=not was_ever_verified),
-            parse_mode=ParseMode.MARKDOWN
-        )
+        
+        if was_ever_verified:
+            await message.answer(
+                f"🔒 **{user_name}, SUPPORT IS VAULT-ONLY**\n\n"
+                f"Support is for **verified members only**.\n"
+                f"You need access to get help.\n\n"
+                f"**Join the vault first.**\n\n"
+                f"💎 **Rejoin. Get Support.**",
+                reply_markup=get_verification_keyboard(message.from_user.id, user_data, show_all=not was_ever_verified),
+                parse_mode=ParseMode.MARKDOWN
+            )
+        else:
+            await message.answer(
+                f"🔐 **VAULT ACCESS REQUIRED**\n\n"
+                f"Hey {user_name}, **Support** is exclusive to Vault Members.\n\n"
+                f"📌 **Click the join button below** to unlock full access.\n\n"
+                f"_Once joined, all features will be available immediately._",
+                reply_markup=get_verification_keyboard(message.from_user.id, user_data, show_all=not was_ever_verified),
+                parse_mode=ParseMode.MARKDOWN
+            )
         return
     
     # Clear any existing state
@@ -5216,7 +6256,7 @@ async def pdf_link_issues_handler(message: types.Message):
         await msg.edit_text(f"[{step}] Preparing Solutions...")
         await asyncio.sleep(0.1)
     
-    await msg.edit_text("✅ **Solutions Ready!**")
+    await msg.edit_text("✅ **S olutions Ready!**")
     await asyncio.sleep(ANIM_FAST)
     await safe_delete_message(msg)
     
@@ -5536,12 +6576,16 @@ async def _require_vault_check(
         if state:
             await state.clear()
         first_name = message.from_user.first_name or "Member"
+        user_id = message.from_user.id
+        user_data = get_user_verification_status(user_id)
+        was_ever_verified = user_data.get('ever_verified', False)
+        
         await message.answer(
             f"🔐 **VAULT ACCESS REQUIRED**\n\n"
             f"Hey {first_name}, this feature is exclusive to Vault Members.\n\n"
-            f"📌 **Join the Vault Channel first** to unlock full support access:\n"
-            f"👉 {CHANNEL_LINK}\n\n"
-            f"_Once you join, all features will be available immediately._",
+            f"📌 **Click the join button below** to unlock full support access.\n\n"
+            f"_Once joined, all features will be available immediately._",
+            reply_markup=get_verification_keyboard(user_id, user_data, show_all=not was_ever_verified),
             parse_mode=ParseMode.MARKDOWN
         )
         return True
@@ -5630,7 +6674,26 @@ async def raise_ticket_handler(message: types.Message, state: FSMContext):
         return
     
     user_id = message.from_user.id
-    
+    first_name = message.from_user.first_name or "Member"
+
+    # ── Security lock gate — block BEFORE showing the form ────────────────────
+    # Lock is stored in MongoDB, persists across bot restarts and vault leave/rejoin
+    lock_remaining = _get_support_lock_remaining(user_id)
+    if lock_remaining > 0:
+        await message.answer(
+            _build_support_security_notice(
+                first_name,
+                "Temporary lock due to repeated unsafe/spam submissions",
+                warning_count=0,
+                lock_remaining=lock_remaining,
+            ),
+            reply_markup=get_support_menu(),
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        logger.info(f"User {user_id} blocked at RAISE A TICKET entry — support lock active ({lock_remaining}s remaining)")
+        return
+    # ──────────────────────────────────────────────────────────────────────────
+
     # Check if user has an open ticket
     existing_ticket = col_support_tickets.find_one({
         "user_id": user_id,
@@ -5670,7 +6733,6 @@ async def raise_ticket_handler(message: types.Message, state: FSMContext):
         return
 
     # Cooldown gate — one ticket every 24h, with live auto-refresh preview
-    first_name = message.from_user.first_name or "Member"
     rate_ok, rate_msg = check_ticket_rate_limit(user_id, first_name)
     if not rate_ok:
         cooldown_msg = await message.answer(rate_msg, parse_mode=ParseMode.MARKDOWN)
@@ -5732,7 +6794,8 @@ async def process_ticket_submission(message: types.Message, state: FSMContext):
         return
 
     # Vault check (clears state if user left vault mid-flow)
-    if await _require_vault_check(message, state):
+    if await _require_vault_check(message):
+        await state.clear()
         return
 
     # Get user info for personalization
@@ -6035,7 +7098,7 @@ async def process_ticket_submission(message: types.Message, state: FSMContext):
         .replace('[', '\\[')
     )
     if len(safe_issue) > _MAX_CHAN_ISSUE:
-        safe_issue = safe_issue[:_MAX_CHAN_ISSUE] + "\n_… (message truncated — full text stored in database)_"
+        safe_issue = str(safe_issue)[:_MAX_CHAN_ISSUE] + "\n_… (message truncated — full text stored in database)_"
 
     # Create ticket message for admin channel
     ticket_msg = f"""
@@ -6274,12 +7337,18 @@ async def my_ticket_handler(message: types.Message):
         logger.info(f"User {user_id} viewed active ticket status")
         return
 
-    # ── No open ticket → show latest 3 tickets only ──────────────────────────
+    # ── No open ticket → show submitted ticket history only ──────────────────
+    # Strictly: only real submitted tickets (open/resolved/archived)
+    # Excludes: security_lock docs, cancelled tickets (already hard-deleted on cancel)
     all_tickets = list(
         col_support_tickets
-        .find({"user_id": user_id})
+        .find({
+            "user_id": user_id,
+            "status": {"$in": ["open", "resolved", "archived"]},
+            "type":   {"$ne": "security_lock"},   # exclude support lock records
+        })
         .sort("created_at", -1)
-        .limit(3)
+        .limit(5)
     )
     total = len(all_tickets)
 
@@ -6296,7 +7365,7 @@ async def my_ticket_handler(message: types.Message):
 
     await safe_delete_message(msg)
     await _send_ticket_history_page(message, user_id, all_tickets, 0, first_name)
-    logger.info(f"User {user_id} viewed ticket history ({total} tickets)")
+    logger.info(f"User {user_id} viewed ticket history ({total} submitted tickets)")
 
 
 # ─── Helpers ────────────────────────────────────────────────────────
@@ -6529,7 +7598,10 @@ async def cmd_resolve_ticket(message: types.Message):
         await message.answer(f"❌ **Error:** {str(e)}", parse_mode=ParseMode.MARKDOWN)
         logger.error(f"Error resolving ticket: {e}")
 
-@dp.message(F.text == "🔙 BACK TO MENU")
+@dp.message(
+    F.text == "🔙 BACK TO MENU",
+    ~StateFilter(SearchCodeStates.waiting_for_code, SearchCodeStates.waiting_for_first_code)
+)
 @rate_limit(1.5)
 @anti_spam("back_menu")
 async def back_to_menu_handler(message: types.Message, state: FSMContext):
@@ -6552,6 +7624,10 @@ async def back_to_menu_handler(message: types.Message, state: FSMContext):
             reply_markup=get_banned_user_keyboard(ban_type),
             parse_mode=ParseMode.MARKDOWN
         )
+        return
+
+    # 🔒 STRICT VAULT GATE — Non-vault users cannot access the main menu
+    if await _require_vault_check(message):
         return
     
     first_name = message.from_user.first_name or "Member"
@@ -6838,20 +7914,21 @@ async def cmd_dead_users(message: types.Message):
 # ==========================================
 # �🗑️ RESET BOT DATA — OWNER ONLY (double-confirm)
 # Scope: All bot data lives in single MSANodeDB database.
-#         Bot 1  → user data collections only (no backups, no bot9 content)
-#         Bot 2 → bot10_user_tracking + bot10_broadcasts only
+#         Bot 1  → user data collections only (no backups, no bot3 content)
+#         Bot 2 → bot2_user_tracking + bot2_broadcasts only
 #                   (MSANodeDB reset must be done via Bot 2 admin panel)
 # ==========================================
 
 @dp.message(Command("resetdata"))
 @rate_limit(10.0)
 async def cmd_resetdata(message: types.Message, state: FSMContext):
-    """OWNER-ONLY: Full data reset for Bot 1 or Bot 2 — double-confirm required."""
+    """OWNER-ONLY: Full data reset for Bot 1, Bot 2 or Bot 3 — double-confirm required."""
     if message.from_user.id != OWNER_ID:
         return
     keyboard = ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="🤖 RESET BOT 1 DATA"), KeyboardButton(text="🤖 RESET BOT 2 DATA")],
+            [KeyboardButton(text="🤖 RESET BOT 3 DATA")],
             [KeyboardButton(text="❌ CANCEL RESET")]
         ],
         resize_keyboard=True
@@ -6865,7 +7942,6 @@ async def cmd_resetdata(message: types.Message, state: FSMContext):
         reply_markup=keyboard,
         parse_mode=ParseMode.MARKDOWN
     )
-
 
 @dp.message(ResetDataStates.selecting_reset_target)
 async def reset_select_target(message: types.Message, state: FSMContext):
@@ -6886,30 +7962,46 @@ async def reset_select_target(message: types.Message, state: FSMContext):
         return
 
     if text == "🤖 RESET BOT 1 DATA":
-        target = "bot8"
+        target = "bot1"
         label  = "Bot 1"
         scope  = (
-            "• `user_verification`\n"
-            "• `msa_ids`\n"
-            "• `support_tickets`\n"
-            "• `banned_users`\n"
-            "• `suspended_features`\n"
-            "• `bot8_settings`\n"
-            "• `live_terminal_logs`\n"
-            "• `bot3_user_activity`\n"
-            "• `bot8_state_persistence`\n"
+            "• `bot1_user_verification`\n"
+            "• `bot1_msa_ids`\n"
+            "• `bot1_support_tickets`\n"
+            "• `bot1_banned_users`\n"
+            "• `bot1_suspended_features`\n"
+            "• `bot1_settings`\n"
+            "• `bot1_permanently_banned_msa`\n"
+            "• `bot1_offline_log`\n"
+            "• `bot1_state_persistence`\n"
         )
     elif text == "🤖 RESET BOT 2 DATA":
-        target = "bot10"
+        target = "bot2"
         label  = "Bot 2"
         scope  = (
-            "• `bot10_user_tracking` (MSANodeDB)\n"
-            "• `bot10_broadcasts` (MSANodeDB)\n\n"
-            "_Note: Other Bot 2 internal data must be reset via Bot 2 admin panel._\n"
+            "• `bot2_user_tracking`\n"
+            "• `bot2_broadcasts`\n"
+            "• `bot2_cleanup_logs`\n"
+            "• `bot2_access_attempts`\n"
+            "• `bot2_live_terminal_logs`\n"
+            "• `bot2_admins`\n\n"
+        )
+    elif text == "🤖 RESET BOT 3 DATA":
+        target = "bot3"
+        label  = "Bot 3"
+        scope  = (
+            "• `bot3_pdfs`\n"
+            "• `bot3_ig_content`\n"
+            "• `bot3_logs`\n"
+            "• `bot3_settings`\n"
+            "• `bot3_admins`\n"
+            "• `bot3_banned_users`\n"
+            "• `bot3_user_activity`\n"
+            "• `bot3_state`\n\n"
         )
     else:
         await message.answer(
-            "❌ Invalid choice. Select **BOT 1**, **BOT 2**, or press **CANCEL RESET**.",
+            "❌ Invalid choice. Select **BOT 1**, **BOT 2**, **BOT 3** or press **CANCEL RESET**.",
             parse_mode=ParseMode.MARKDOWN
         )
         return
@@ -6930,7 +8022,6 @@ async def reset_select_target(message: types.Message, state: FSMContext):
         reply_markup=cancel_kb,
         parse_mode=ParseMode.MARKDOWN
     )
-
 
 @dp.message(ResetDataStates.waiting_for_confirm1)
 async def reset_confirm1(message: types.Message, state: FSMContext):
@@ -6957,7 +8048,8 @@ async def reset_confirm1(message: types.Message, state: FSMContext):
         return
 
     data  = await state.get_data()
-    label = "Bot 1" if data.get("reset_target") == "bot8" else "Bot 2"
+    target = data.get("reset_target")
+    label = "Bot 1" if target == "bot1" else ("Bot 2" if target == "bot2" else "Bot 3")
     cancel_kb = ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text="❌ CANCEL RESET")]],
         resize_keyboard=True
@@ -6973,7 +8065,6 @@ async def reset_confirm1(message: types.Message, state: FSMContext):
         reply_markup=cancel_kb,
         parse_mode=ParseMode.MARKDOWN
     )
-
 
 @dp.message(ResetDataStates.waiting_for_confirm2)
 async def reset_confirm2(message: types.Message, state: FSMContext):
@@ -7001,30 +8092,39 @@ async def reset_confirm2(message: types.Message, state: FSMContext):
 
     data   = await state.get_data()
     target = data.get("reset_target")
-    label  = "Bot 1" if target == "bot8" else "Bot 2"
+    label  = "Bot 1" if target == "bot1" else ("Bot 2" if target == "bot2" else "Bot 3")
 
     try:
         results: dict[str, int] = {}
 
-        if target == "bot8":
-            # ── Bot 1 user data in MSANodeDB ───────────────────────────────
-            # NEVER touches: bot3_pdfs, bot3_ig_content (content),
-            #                bot10_* (bot10 data), bot8_backups (backups)
-            results["user_verification"]  = col_user_verification.delete_many({}).deleted_count
-            results["msa_ids"]            = col_msa_ids.delete_many({}).deleted_count
-            results["support_tickets"]    = col_support_tickets.delete_many({}).deleted_count
-            results["banned_users"]       = col_banned_users.delete_many({}).deleted_count
-            results["suspended_features"] = col_suspended_features.delete_many({}).deleted_count
-            results["bot8_settings"]      = col_bot8_settings.delete_many({}).deleted_count
-            results["live_terminal_logs"] = col_live_logs.delete_many({}).deleted_count
-            results["bot3_user_activity"] = db["bot3_user_activity"].delete_many({}).deleted_count
-            results["bot8_state_persist"] = db["bot8_state_persistence"].delete_many({}).deleted_count
+        if target == "bot1":
+            results["bot1_user_verification"] = col_user_verification.delete_many({}).deleted_count
+            results["bot1_msa_ids"] = col_msa_ids.delete_many({}).deleted_count
+            results["bot1_support_tickets"] = col_support_tickets.delete_many({}).deleted_count
+            results["bot1_banned_users"] = col_banned_users.delete_many({}).deleted_count
+            results["bot1_suspended_features"] = col_suspended_features.delete_many({}).deleted_count
+            results["bot1_settings"] = col_bot1_settings.delete_many({}).deleted_count
+            results["bot1_permanently_banned_msa"] = db["bot1_permanently_banned_msa"].delete_many({}).deleted_count
+            results["bot1_offline_log"] = db["bot1_offline_log"].delete_many({}).deleted_count
+            results["bot1_state_persistence"] = db["bot1_state_persistence"].delete_many({}).deleted_count
 
-        else:  # bot10
-            # ── Bot 2 data in MSANodeDB ──────────────────────────────────────────
-            # NEVER touches: bot8_backups, bot3_* content, user data collections
-            results["bot10_user_tracking"] = db["bot10_user_tracking"].delete_many({}).deleted_count
-            results["bot10_broadcasts"]    = col_broadcasts.delete_many({}).deleted_count
+        elif target == "bot2":
+            results["bot2_user_tracking"] = db["bot2_user_tracking"].delete_many({}).deleted_count
+            results["bot2_broadcasts"] = col_broadcasts.delete_many({}).deleted_count
+            results["bot2_cleanup_logs"] = db["bot2_cleanup_logs"].delete_many({}).deleted_count
+            results["bot2_access_attempts"] = db["bot2_access_attempts"].delete_many({}).deleted_count
+            results["bot2_live_terminal_logs"] = db["bot2_live_terminal_logs"].delete_many({}).deleted_count
+            results["bot2_admins"] = db["bot2_admins"].delete_many({}).deleted_count
+
+        elif target == "bot3":
+            results["bot3_pdfs"] = db["bot3_pdfs"].delete_many({}).deleted_count
+            results["bot3_ig_content"] = db["bot3_ig_content"].delete_many({}).deleted_count
+            results["bot3_logs"] = db["bot3_logs"].delete_many({}).deleted_count
+            results["bot3_settings"] = db["bot3_settings"].delete_many({}).deleted_count
+            results["bot3_admins"] = db["bot3_admins"].delete_many({}).deleted_count
+            results["bot3_banned_users"] = db["bot3_banned_users"].delete_many({}).deleted_count
+            results["bot3_user_activity"] = db["bot3_user_activity"].delete_many({}).deleted_count
+            results["bot3_state"] = db["bot3_state"].delete_many({}).deleted_count
 
         total     = sum(results.values())
         breakdown = "\n".join(f"  • `{k}`: {v:,}" for k, v in results.items())
@@ -7039,9 +8139,7 @@ async def reset_confirm2(message: types.Message, state: FSMContext):
             reply_markup=get_user_menu(message.from_user.id),
             parse_mode=ParseMode.MARKDOWN
         )
-        logger.info(
-            f"OWNER {message.from_user.id} executed full {label} data reset — {total} records deleted."
-        )
+        logger.info(f"OWNER {message.from_user.id} executed full {label} data reset — {total} records deleted.")
 
     except Exception as e:
         await state.clear()
@@ -7050,7 +8148,6 @@ async def reset_confirm2(message: types.Message, state: FSMContext):
             reply_markup=get_user_menu(message.from_user.id),
             parse_mode=ParseMode.MARKDOWN
         )
-        logger.error(f"reset_confirm2 error: {e}")
 
 
 # ==========================================
@@ -7131,7 +8228,7 @@ async def notify_owner(error_type: str, error_msg: str, severity: str = "CRITICA
         logger.error(f"❌ Failed to notify owner: {e}")
 
 
-async def auto_heal(error_type: str, error: Exception, context: dict = None) -> bool:
+async def auto_heal(error_type: str, error: Exception, context: dict[str, object] | None = None) -> bool:
     """Attempt automatic healing with exponential backoff retry.
 
     Returns True if healing succeeded.
@@ -7155,7 +8252,7 @@ async def auto_heal(error_type: str, error: Exception, context: dict = None) -> 
 
             # ── Telegram FloodWait / RetryAfter ─────────────────────
             if isinstance(error, TelegramRetryAfter):
-                retry_after = error.retry_after + 1
+                retry_after = getattr(error, 'retry_after', 30) + 1
                 logger.info(f"⏳ Telegram FloodWait: sleeping {retry_after}s")
                 await asyncio.sleep(retry_after)
                 health_stats["auto_healed"] += 1
@@ -7233,7 +8330,7 @@ async def global_error_handler(update: types.Update, exception: Exception):
         error_msg = str(exception)
         tb = traceback.format_exc()
 
-        logger.error(f"❌ Unhandled {error_type}: {error_msg}\n{tb[:800]}")
+        logger.error(f"❌ Unhandled {error_type}: {error_msg}\n{str(tb)[:800]}")
 
         # Skip logging of harmless Telegram errors
         if isinstance(exception, TelegramAPIError):
@@ -7257,7 +8354,7 @@ async def global_error_handler(update: types.Update, exception: Exception):
 
         # Always alert owner (even for auto-healed errors) unless WARNING
         if severity != "WARNING" or not healed:
-            await notify_owner(error_type, f"{error_msg}\n\nTraceback:\n{tb[:400]}", severity, healed)
+            await notify_owner(error_type, f"{error_msg}\n\nTraceback:\n{str(tb)[:400]}", severity, healed)
 
         logger.info(f"🏥 Error handled — Auto-healed: {healed}")
         return True
@@ -7325,7 +8422,7 @@ async def _build_daily_report(period: str) -> str:
     # ── DB Stats (run in executor to avoid blocking) ─────────────
     loop = asyncio.get_running_loop()
 
-    def _get_stats():
+    def _get_stats(*args):
         total_users = col_user_verification.count_documents({})
         verified_users = col_user_verification.count_documents({"verified": True})
         total_msa_ids = col_msa_ids.count_documents({})
@@ -7352,12 +8449,39 @@ async def _build_daily_report(period: str) -> str:
         for c in total_clicks_today:
             clicks_sum = c.get("total", 0)
 
-        # DB ping
+        # DB ping + storage size
         try:
             client.admin.command('ping')
             db_status_str = "✅ ONLINE"
         except Exception:
             db_status_str = "❌ OFFLINE"
+
+        # Atlas M0 storage monitoring (512 MB free tier cap)
+        try:
+            db_stats = db.command("dbStats", scale=1024 * 1024)  # returns MB
+            db_size_mb = round(db_stats.get("dataSize", 0), 1)
+            storage_mb = round(db_stats.get("storageSize", 0), 1)
+            atlas_pct = round(db_size_mb / 512 * 100, 1)
+            db_size_str = f"{db_size_mb} MB data / {storage_mb} MB storage ({atlas_pct}% of 512 MB free tier)"
+            if atlas_pct >= 80:
+                db_size_str = "⚠️ " + db_size_str + " — NEARING LIMIT"
+        except Exception:
+            db_size_str = "N/A"
+
+        # 7-day churn: users who left vault in the last 7 days
+        seven_days_ago = now_tz - timedelta(days=7)
+        left_7d = col_user_verification.count_documents({
+            "vault_joined": False,
+            "vault_left_at": {"$gte": seven_days_ago}
+        })
+        # 7-day new verified: joined vault in last 7 days (ever_verified set in that window)
+        new_verified_7d = col_user_verification.count_documents({
+            "verified": True,
+            "vault_left_at": {"$exists": False},  # currently active
+        })
+        # Grace conversion
+        grace_consumed_total = col_user_verification.count_documents({"grace_consumed": True})
+        grace_converted_total = col_user_verification.count_documents({"grace_converted_to_vault": True})
 
         return {
             "total_users": total_users,
@@ -7372,6 +8496,10 @@ async def _build_daily_report(period: str) -> str:
             "new_today": new_today,
             "clicks_sum": clicks_sum,
             "db_status": db_status_str,
+            "db_size_str": db_size_str,
+            "left_7d": left_7d,
+            "grace_consumed_total": grace_consumed_total,
+            "grace_converted_total": grace_converted_total,
         }
 
     stats = await loop.run_in_executor(None, _get_stats)
@@ -7394,7 +8522,12 @@ async def _build_daily_report(period: str) -> str:
         f"• Verified (vault): `{stats['verified_users']}`\n"
         f"• MSA+ IDs assigned: `{stats['total_msa_ids']}`\n"
         f"• New today: `{stats['new_today']}`\n"
-        f"• Banned: `{stats['banned_users']}`\n\n"
+        f"• Banned: `{stats['banned_users']}`\n"
+        f"• Left vault (last 7d): `{stats['left_7d']}`\n\n"
+        f"━━ 🎁 GRACE PASS FUNNEL ━━\n"
+        f"• Grace consumed (all time): `{stats['grace_consumed_total']}`\n"
+        f"• Converted to vault: `{stats['grace_converted_total']}` "
+        f"({'%.1f' % (stats['grace_converted_total']/stats['grace_consumed_total']*100 if stats['grace_consumed_total'] else 0)}%)\n\n"
         f"━━ 📦 CONTENT ━━\n"
         f"• PDFs in DB: `{stats['total_pdfs']}`\n"
         f"• IG Content: `{stats['total_ig_content']}`\n"
@@ -7405,6 +8538,7 @@ async def _build_daily_report(period: str) -> str:
         f"• Archived: `{stats['archived_tickets']}`\n\n"
         f"━━ 🏥 HEALTH ━━\n"
         f"• Database: {stats['db_status']}\n"
+        f"• Atlas Storage: `{stats['db_size_str']}`\n"
         f"• Errors caught: `{total_errors}`\n"
         f"• Auto-healed: `{healed}`\n"
         f"• Heal success rate: `{success_rate:.1f}%`\n"
@@ -7443,8 +8577,8 @@ async def daily_report_scheduler():
         try:
             now = datetime.now(TZ)
             # Find next report time
-            next_fire = None
-            next_label = None
+            next_fire: datetime | None = None
+            next_label: str | None = None
             for hour, minute, label in report_times:
                 candidate = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
                 if candidate <= now:
@@ -7453,11 +8587,11 @@ async def daily_report_scheduler():
                     next_fire = candidate
                     next_label = label
 
-            wait_secs = (next_fire - datetime.now(TZ)).total_seconds()
+            wait_secs = (next_fire - datetime.now(TZ)).total_seconds() if next_fire is not None else 0.0
             logger.info(f"📅 Next report '{next_label}' in {int(wait_secs // 3600)}h {int((wait_secs % 3600) // 60)}m")
 
             await asyncio.sleep(max(wait_secs, 1))
-            await send_daily_report(next_label)
+            await send_daily_report(next_label if next_label is not None else "Daily")
 
         except asyncio.CancelledError:
             break
@@ -7473,7 +8607,7 @@ async def daily_report_scheduler():
 def save_bot_state(key: str, value: dict):
     """Persist a key-value state to MongoDB so it survives restarts."""
     try:
-        db["bot8_state_persistence"].update_one(
+        db["bot1_state_persistence"].update_one(
             {"key": key},
             {"$set": {"key": key, "value": value, "updated_at": now_local()}},
             upsert=True
@@ -7485,7 +8619,7 @@ def save_bot_state(key: str, value: dict):
 def load_bot_state(key: str) -> dict:
     """Load a persisted state from MongoDB. Returns {} if not found."""
     try:
-        doc = db["bot8_state_persistence"].find_one({"key": key})
+        doc = db["bot1_state_persistence"].find_one({"key": key})
         if doc:
             return doc.get("value", {})
     except Exception as e:
@@ -7509,10 +8643,10 @@ def restore_health_stats_from_db():
 # ==========================================
 # 💾 AUTO-BACKUP SYSTEM — Bot 1 (every 12 hours)
 # ==========================================
-_BOT8_LAST_BACKUP_KEY = "bot8_last_auto_backup"
+_BOT1_LAST_BACKUP_KEY = "bot1_last_auto_backup"
 
-async def auto_backup_bot8():
-    """Run a full Bot 1 data backup every 12 hours into bot8_backups collection."""
+async def auto_backup_bot1():
+    """Run a full Bot 1 data backup every 12 hours into bot1_backups collection."""
     while True:
         try:
             now = now_local()
@@ -7524,7 +8658,7 @@ async def auto_backup_bot8():
             window_key     = now.strftime("%Y-%m-%d_") + period             # e.g. "2026-02-19_AM"
 
             # ✅ Dedup: skip if a backup for this 12 h window already exists
-            if col_bot8_backups.count_documents({"window_key": window_key}) > 0:
+            if col_bot1_backups.count_documents({"window_key": window_key}) > 0:
                 logger.info(f"⚠️  Bot1 auto-backup SKIPPED — window {window_key} already stored")
                 await asyncio.sleep(12 * 3600)
                 continue
@@ -7533,16 +8667,16 @@ async def auto_backup_bot8():
 
             # ── User data collections only (content libraries excluded — static, huge) ──
             collections_to_backup = [
-                ("user_verification",  col_user_verification),
-                ("msa_ids",            col_msa_ids),
-                ("support_tickets",    col_support_tickets),
-                ("banned_users",       col_banned_users),
-                ("suspended_features", col_suspended_features),
+                ("bot1_user_verification",  col_user_verification),
+                ("bot1_msa_ids",            col_msa_ids),
+                ("bot1_support_tickets",    col_support_tickets),
+                ("bot1_banned_users",       col_banned_users),
+                ("bot1_suspended_features", col_suspended_features),
             ]
 
-            collection_counts = {}
+            collection_counts: dict[str, int] = {}
             collections_data  = {}
-            total_records = 0
+            total_records: int = 0
             BATCH_SIZE = 5000
 
             start_time = now_local()
@@ -7556,7 +8690,7 @@ async def auto_backup_bot8():
                         records.append(doc)
                     collection_counts[col_name] = len(records)
                     collections_data[col_name]  = records
-                    total_records += len(records)
+                    total_records = int(total_records) + len(records)
                 except Exception as ce:
                     logger.warning(f"⚠️ Bot1 backup — could not back up {col_name}: {ce}")
                     collection_counts[col_name] = 0
@@ -7565,12 +8699,12 @@ async def auto_backup_bot8():
             processing_time = (now_local() - start_time).total_seconds()
 
             backup_summary = {
-                "bot":              "bot8",
+                "bot":              "bot1",
                 "backup_date":     now,
                 "backup_type":     "automatic_12h",
                 "timestamp":       timestamp_key,
                 "timestamp_label": timestamp_label,
-                "window_key":      now.strftime("%Y-%m-%d_") + period,  # e.g. "2026-02-19_AM"
+                "window_key":      now.strftime("%Y-%m-%d_") + str(period),  # e.g. "2026-02-19_AM"
                 "period":          period,              # "AM" or "PM"
                 "year":            now.year,
                 "month":           now.strftime("%B"),  # e.g. "February"
@@ -7582,8 +8716,8 @@ async def auto_backup_bot8():
                 "processing_time": processing_time,
             }
 
-            upsert_res = col_bot8_backups.update_one(
-                {"bot": "bot8", "window_key": window_key},
+            upsert_res = col_bot1_backups.update_one(
+                {"bot": "bot1", "window_key": window_key},
                 {"$setOnInsert": backup_summary},
                 upsert=True,
             )
@@ -7591,12 +8725,12 @@ async def auto_backup_bot8():
                 logger.info(f"⚠️ Bot1 backup dedup hit — summary already exists for window {window_key}")
 
             # ── Save full restorable snapshot (single always-replaced doc) ──────────
-            # Full data in col_bot8_restore_data; backup history in col_bot8_backups (counts only)
+            # Full data in col_bot1_restore_data; backup history in col_bot1_backups (counts only)
             try:
-                col_bot8_restore_data.replace_one(
-                    {"_id": "bot8_latest"},
+                col_bot1_restore_data.replace_one(
+                    {"_id": "bot1_latest"},
                     {
-                        "_id":               "bot8_latest",
+                        "_id":               "bot1_latest",
                         "backup_date":       now,
                         "timestamp":         timestamp_key,
                         "timestamp_label":   timestamp_label,
@@ -7611,10 +8745,10 @@ async def auto_backup_bot8():
                 logger.warning(f"⚠️ Bot1 restore snapshot warning: {snap_err}")
 
             # Keep last 60 backup summaries (30 days × 2/day)
-            backup_count = col_bot8_backups.count_documents({})
+            backup_count = col_bot1_backups.count_documents({})
             if backup_count > 60:
-                old = list(col_bot8_backups.find({}).sort("backup_date", 1).limit(backup_count - 60))
-                col_bot8_backups.delete_many({"_id": {"$in": [b["_id"] for b in old]}})
+                old = list(col_bot1_backups.find({}).sort("backup_date", 1).limit(backup_count - 60))
+                col_bot1_backups.delete_many({"_id": {"$in": [b["_id"] for b in old]}})
 
             logger.info(
                 f"✅ Bot 1 auto-backup done — {total_records:,} records | "
@@ -7640,14 +8774,14 @@ async def auto_backup_bot8():
 
 _BOT1_MONTHLY_EXPORT = [
     # (collection_name,          restore_unique_key)
-    ("user_verification",        "user_id"),
-    ("msa_ids",                  "user_id"),
-    ("support_tickets",          "user_id"),
-    ("banned_users",             "user_id"),
-    ("suspended_features",       "user_id"),
-    ("permanently_banned_msa",   "msa_id"),
-    ("bot8_offline_log",         "_id"),
-    ("bot8_state_persistence",   "key"),
+    ("bot1_user_verification",        "user_id"),
+    ("bot1_msa_ids",                  "user_id"),
+    ("bot1_support_tickets",          "user_id"),
+    ("bot1_banned_users",             "user_id"),
+    ("bot1_suspended_features",       "user_id"),
+    ("bot1_permanently_banned_msa",   "msa_id"),
+    ("bot1_offline_log",         "_id"),
+    ("bot1_state_persistence",   "key"),
 ]
 
 
@@ -7667,7 +8801,7 @@ def _mongo_json_encoder(obj):
     return str(obj)
 
 
-async def _send_col_json(col_name: str, unique_key: str, now, dest_id: int) -> tuple:
+async def _send_col_json(col_name: str, unique_key: str, now, dest_id: int) -> tuple[int, float]:
     """Dump one collection to gzip JSON and send to dest_id. Returns (record_count, bytes_total)."""
     import json, gzip, io
     from aiogram.types import BufferedInputFile
@@ -7683,7 +8817,7 @@ async def _send_col_json(col_name: str, unique_key: str, now, dest_id: int) -> t
         records.append(doc)
 
     CHUNK  = 50_000  # split >50k records to stay within Telegram's 50 MB file limit
-    chunks = [records[i:i+CHUNK] for i in range(0, len(records), CHUNK)] if records else [[]]
+    chunks = [[records[j] for j in range(i, min(i+CHUNK, len(records)))] for i in range(0, len(records), CHUNK)] if records else [[]]
     total_bytes = 0
 
     for idx, chunk in enumerate(chunks, 1):
@@ -7713,7 +8847,7 @@ async def _send_col_json(col_name: str, unique_key: str, now, dest_id: int) -> t
         total_bytes += len(data)
         await asyncio.sleep(0.5)
 
-    return len(records), total_bytes
+    return int(len(records)), float(total_bytes)
 
 
 async def monthly_json_delivery_bot1():
@@ -7737,14 +8871,14 @@ async def monthly_json_delivery_bot1():
                         f"Each file is independently restorable \u2014 zero duplicates on re\u2011import.",
                         parse_mode="HTML",
                     )
-                    total_records = 0
-                    total_bytes   = 0
-                    errors: list  = []
+                    total_records: int = 0
+                    total_bytes: float = 0.0
+                    errors: list[str] = []
                     for col_name, unique_key in _BOT1_MONTHLY_EXPORT:
                         try:
-                            cnt, nb = await _send_col_json(col_name, unique_key, now, OWNER_ID)
-                            total_records += cnt
-                            total_bytes   += nb
+                            _result = await _send_col_json(col_name, unique_key, now, OWNER_ID)
+                            total_records = int(total_records) + int(_result[0])
+                            total_bytes = float(total_bytes) + float(_result[1])
                         except Exception as e:
                             errors.append(f"{col_name}: {e}")
                             logger.error(f"\u274c Monthly JSON bot1 \u2014 {col_name}: {e}")
@@ -7752,13 +8886,14 @@ async def monthly_json_delivery_bot1():
                         f"\u2705 <b>BOT 1 MONTHLY BACKUP COMPLETE</b>\n\n"
                         f"\U0001f5d3 {now.strftime('%B %Y')}\n"
                         f"\U0001f4ca Total records: <b>{total_records:,}</b>\n"
-                        f"\U0001f4be Compressed: <b>{total_bytes/1024:.1f} KB</b>\n"
+                        f"\U0001f4be Compressed: <b>{float(total_bytes) / 1024:.1f} KB</b>\n"
                         f"\U0001f4c1 Files: <b>{len(_BOT1_MONTHLY_EXPORT)-len(errors)}/{len(_BOT1_MONTHLY_EXPORT)}</b>"
                     )
                     if errors:
                         summary += "\n\n\u26a0\ufe0f Errors:\n" + "\n".join(f"\u2022 {e}" for e in errors)
                     await bot.send_message(OWNER_ID, summary, parse_mode="HTML")
-                    logger.info(f"\u2705 Bot 1 monthly JSON backup done \u2014 {total_records:,} records, {total_bytes/1024:.1f} KB")
+                    _tb_kb: float = float(total_bytes) / 1024
+                    logger.info(f"\u2705 Bot 1 monthly JSON backup done \u2014 {total_records:,} records, {_tb_kb:.1f} KB")
             await asyncio.sleep(1800)   # check every 30 minutes
         except asyncio.CancelledError:
             break
@@ -7776,80 +8911,165 @@ async def monthly_json_delivery_bot1():
 # If they rejoin at ANY point before deletion, all tracking is cleared.
 # ==========================================
 async def inactive_member_monitor():
-    """Check inactive users every 6 hours & send day-15 reminder, day-29 final warning,
-    then purge MSA ID at day-30+.  Only touches col_msa_ids — never other data."""
+    """
+    30/60/90-DAY ABANDONMENT LIFECYCLE MONITOR
+    
+    Tracks users who left vault and sends 3 reminders:
+    - Day 30: First reminder + ask to rejoin
+    - Day 60: Second reminder + final warning
+    - Day 90: Third reminder + auto-delete MSA ID + auto-delete user tracking + reset user_verification
+    
+    After day 90, if user returns, they are treated as brand-new member with new MSA ID.
+    If user returns before day 90 deadline, all reminders are cleared and they resume normal access.
+    """
     while True:
         try:
-            await asyncio.sleep(6 * 3600)   # run every 6 hours
-
+            await asyncio.sleep(6 * 3600)   # Run every 6 hours
+            
             now = now_local()
-            # Find all users who are currently OUT of vault and have a leave timestamp
-            candidates = list(col_user_verification.find(
-                {"vault_joined": False, "vault_left_at": {"$exists": True}}
-            ))
-
+            
+            # Find all users who left vault and have vault_left_at timestamp set
+            candidates = list(col_user_verification.find({
+                "vault_joined": False,
+                "vault_left_at": {"$exists": True, "$ne": None}
+            }))
+            
             for doc in candidates:
                 user_id = doc.get("user_id")
                 left_at = doc.get("vault_left_at")
                 if not user_id or not left_at:
                     continue
-
+                
                 days_out = (now - left_at).days
                 first_name = doc.get("first_name") or "Member"
-
-                # ── Day 30+: delete MSA ID and clean tracking ──────────
-                if days_out >= 30:
-                    # Confirm they are still not in vault (live check as safety guard)
+                
+                # ── SAFETY CHECK: Is user actually back in vault? ──────────────
+                try:
+                    live = await bot.get_chat_member(CHANNEL_ID, user_id)
+                    if live.status in ("member", "administrator", "creator"):
+                        # User rejoined! Clear abandonment tracking + restore any archived state
+                        logger.info(f"[30/60/90] User {user_id} rejoined vault — clearing abandonment tracking")
+                        col_user_verification.update_one(
+                            {"user_id": user_id},
+                            {
+                                "$set": {"vault_joined": True, "verified": True},
+                                "$unset": {
+                                    "vault_left_at": "",
+                                    "reminder1_sent": "",
+                                    "reminder2_sent": "",
+                                    "reminder3_sent": "",
+                                    "is_archived": "",
+                                    "archived_at": ""
+                                }
+                            }
+                        )
+                        # Restore retired MSA ID if it was soft-archived
+                        col_msa_ids.update_one(
+                            {"user_id": user_id},
+                            {"$unset": {"retired": "", "archived_at": "", "archived_reason": ""}}
+                        )
+                        # Clear archived flag in tracking
+                        db["bot2_user_tracking"].update_one(
+                            {"user_id": user_id},
+                            {"$unset": {"is_archived": ""}}
+                        )
+                        logger.info(f"[30/60/90] Restored archived user {user_id} — MSA ID un-retired, full access resumed")
+                        continue  # Skip to next user
+                except Exception as e:
+                    logger.warning(f"[30/60/90] Failed to check vault status for {user_id}: {e}")
+                    pass  # Continue with DB-based logic
+                
+                # ── DAY 90+: AUTO-DELETE & RESET ──────────────────────────────
+                if days_out >= 90:
+                    logger.info(f"[30/60/90] User {user_id} at day {days_out} — sending final notice + auto-delete")
+                    
                     try:
-                        live = await bot.get_chat_member(CHANNEL_ID, user_id)
-                        if live.status in ("member", "administrator", "creator"):
-                            # They somehow rejoined but event was missed — fix and skip
+                        # Send final notice BEFORE archiving
+                        if not doc.get("reminder3_sent"):
+                            await bot.send_message(
+                                user_id,
+                                f"📬 **A Note from MSA NODE, {first_name}**\n\n"
+                                f"It has been **90 days** since you left the MSA NODE Vault.\n\n"
+                                f"We’ve kept your access and records intact throughout this time — "
+                                f"because we believe in giving our members every opportunity to return.\n\n"
+                                f"As of today, your membership has been **moved to archive status**. "
+                                f"Your MSA\u002B ID and history are preserved internally.\n\n"
+                                f"🔐 **To restore full access instantly**, simply rejoin the MSA NODE Vault below. "
+                                f"Everything will resume exactly where it left off.\n\n"
+                                f"_The door is always open. We’d love to have you back._ ⚡",
+                                reply_markup=get_verification_keyboard(user_id, doc, show_all=False),
+                                parse_mode=ParseMode.MARKDOWN
+                            )
                             col_user_verification.update_one(
                                 {"user_id": user_id},
-                                {"$set": {"vault_joined": True, "verified": True},
-                                 "$unset": {"vault_left_at": "", "reminder1_sent": "", "reminder2_sent": ""}}
+                                {"$set": {"reminder3_sent": True}}
                             )
-                            logger.info(f"[inactive_monitor] User {user_id} actually in vault — fixed status, skipping deletion")
-                            continue
-                    except Exception:
-                        pass  # API error — proceed with deletion based on DB state
+                            logger.info(f"[30/60/90] Day-90 archive notice sent to user {user_id}")
+                    except Exception as e:
+                        logger.warning(f"[30/60/90] Could not send day-90 notice to {user_id}: {e}")
 
-                    # Delete their MSA ID record
-                    del_result = col_msa_ids.delete_one({"user_id": user_id})
-                    # Clear MSA-ID and reminder fields, but stamp msa_cleared_at so
-                    # the Phase-3 dead-user cleanup can still find this record later.
-                    col_user_verification.update_one(
-                        {"user_id": user_id},
-                        {
-                            "$set":  {"msa_cleared_at": now_local()},
-                            "$unset": {
-                                "msa_id": "",
-                                "vault_left_at": "",
-                                "reminder1_sent": "",
-                                "reminder2_sent": ""
-                            }
-                        }
-                    )
-                    logger.info(
-                        f"[inactive_monitor] MSA ID deleted for user {user_id} — "
-                        f"{days_out} days inactive. Deleted: {del_result.deleted_count} record(s)."
-                    )
-                    continue  # done with this user
-
-                # ── Day 29: final warning (send only once) ─────────────
-                if days_out >= 29 and not doc.get("reminder2_sent"):
+                    # Soft-archive instead of hard-delete — preserve MSA ID and history
                     try:
-                        msa_record = col_msa_ids.find_one({"user_id": user_id})
-                        msa_id_str = msa_record["msa_id"] if msa_record else "your MSA+ ID"
+                        # Mark MSA ID as retired (soft-archive) — NOT deleted
+                        # If user rejoins, this flag is cleared and they keep the same ID
+                        col_msa_ids.update_one(
+                            {"user_id": user_id},
+                            {"$set": {
+                                "retired": True,
+                                "archived_at": now,
+                                "archived_reason": "90_day_inactive"
+                            }}
+                        )
+                        logger.info(f"[30/60/90] Soft-archived MSA ID for user {user_id} (retired=True)")
+
+                        # Preserve tracking — keep source attribution, just unset active msa_id ref
+                        db["bot2_user_tracking"].update_one(
+                            {"user_id": user_id},
+                            {"$set": {"is_archived": True}}
+                        )
+                        logger.info(f"[30/60/90] Marked tracking as archived for user {user_id}")
+
+                        # Reset verification flags but KEEP the skeleton and msa_id reference
+                        col_user_verification.update_one(
+                            {"user_id": user_id},
+                            {
+                                "$set": {
+                                    "vault_joined": False,
+                                    "verified": False,
+                                    "is_archived": True,
+                                    "archived_at": now,
+                                },
+                                "$unset": {
+                                    "vault_left_at": "",
+                                    "reminder1_sent": "",
+                                    "reminder2_sent": "",
+                                    "reminder3_sent": ""
+                                }
+                            }
+                        )
+                        logger.info(
+                            f"[30/60/90] SOFT-ARCHIVED user {user_id} after {days_out}d inactive. "
+                            f"MSA ID preserved (retired=True). Skeleton kept. User resumes on rejoin."
+                        )
+                    except Exception as e:
+                        logger.error(f"[30/60/90] Failed to soft-archive data for user {user_id}: {e}")
+
+                    continue  # Move to next user
+                
+                # ── DAY 60: SECOND REMINDER ───────────────────────────────────
+                if days_out >= 60 and not doc.get("reminder2_sent"):
+                    logger.info(f"[30/60/90] User {user_id} at day {days_out} — sending 2nd reminder")
+                    try:
                         await bot.send_message(
                             user_id,
-                            f"⛔ **FINAL NOTICE — {first_name}**\n\n"
-                            f"Your MSA NODE vault membership has been inactive for **29 days**.\n\n"
-                            f"🔵 **Tomorrow**, your MSA+ ID `{msa_id_str}` will be **permanently released** "
-                            f"from the database to keep our community clean for active members.\n\n"
-                            f"⚠️ This is your **last chance** to reclaim your spot before the ID is reassigned.\n\n"
-                            f"Tap below to rejoin the Vault instantly and keep your membership:\n"
-                            f"_Your journey doesn't have to end here._ ✨",
+                            f"⚠️ **A Reminder from MSA NODE, {first_name}**\n\n"
+                            f"It’s been **60 days** since you stepped away from the MSA NODE Vault.\n\n"
+                            f"Your membership, MSA\u002B ID, and all access are still preserved. "
+                            f"However, inactive memberships are archived after **90 days** to keep the "
+                            f"community active and the data clean for all members.\n\n"
+                            f"🔓 **You have 30 days remaining.** Rejoin anytime before the deadline "
+                            f"to instantly restore your full agent access.\n\n"
+                            f"_We’re still holding your spot. Come back when you’re ready._ 🔐",
                             reply_markup=get_verification_keyboard(user_id, doc, show_all=False),
                             parse_mode=ParseMode.MARKDOWN
                         )
@@ -7857,23 +9077,24 @@ async def inactive_member_monitor():
                             {"user_id": user_id},
                             {"$set": {"reminder2_sent": True}}
                         )
-                        logger.info(f"[inactive_monitor] Day-29 final warning sent to user {user_id}")
+                        logger.info(f"[30/60/90] Day-60 reminder sent to user {user_id}")
                     except Exception as e:
-                        logger.warning(f"[inactive_monitor] Could not send day-29 warning to {user_id}: {e}")
+                        logger.warning(f"[30/60/90] Could not send day-60 reminder to {user_id}: {e}")
                     continue
-
-                # ── Day 15: first reminder (send only once) ────────────
-                if days_out >= 15 and not doc.get("reminder1_sent"):
+                
+                # ── DAY 30: FIRST REMINDER ────────────────────────────────────
+                if days_out >= 30 and not doc.get("reminder1_sent"):
+                    logger.info(f"[30/60/90] User {user_id} at day {days_out} — sending 1st reminder")
                     try:
                         await bot.send_message(
                             user_id,
-                            f"🔔 **We Miss You, {first_name}!**\n\n"
-                            f"It's been **15 days** since you left the MSA NODE Vault.\n\n"
-                            f"💪 **Your premium membership is still reserved** — everything is right where you left it.\n\n"
-                            f"💡 Just a heads-up: inactive memberships are released after **30 days** "
-                            f"to keep our community active and growing.\n\n"
-                            f"Tap below to instantly rejoin and lock in your spot:\n"
-                            f"_The vault is waiting._ ⚡",
+                            f"📬 **We Miss You, {first_name}!**\n\n"
+                            f"It’s been **30 days** since you stepped away from the MSA NODE Vault.\n\n"
+                            f"Your MSA\u002B ID, access, and full membership are all still intact. "
+                            f"Rejoining takes just one tap.\n\n"
+                            f"📌 **One thing to know:** Memberships that remain inactive for 90 days "
+                            f"are moved to archive status to keep the community active and healthy.\n\n"
+                            f"_We’re still holding your spot. Come back anytime._ 💙",
                             reply_markup=get_verification_keyboard(user_id, doc, show_all=False),
                             parse_mode=ParseMode.MARKDOWN
                         )
@@ -7881,87 +9102,148 @@ async def inactive_member_monitor():
                             {"user_id": user_id},
                             {"$set": {"reminder1_sent": True}}
                         )
-                        logger.info(f"[inactive_monitor] Day-15 reminder sent to user {user_id}")
+                        logger.info(f"[30/60/90] Day-30 reminder sent to user {user_id}")
                     except Exception as e:
-                        logger.warning(f"[inactive_monitor] Could not send day-15 reminder to {user_id}: {e}")
+                        logger.warning(f"[30/60/90] Could not send day-30 reminder to {user_id}: {e}")
+        
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error(f"❌ 30/60/90 abandonment monitor error: {e}")
 
-            # ── Phase 3: 90+ days after MSA-ID cleared → purge dead user record ──
-            # These are users whose MSA ID was already deleted at day-30.
-            # If they still haven't returned after DEAD_USER_CLEANUP_DAYS more days
-            # their user_verification document is removed entirely, keeping the DB clean.
-            dead_cutoff = now_local() - timedelta(days=DEAD_USER_CLEANUP_DAYS)
-            dead_candidates = list(col_user_verification.find(
-                {"msa_cleared_at": {"$exists": True, "$lt": dead_cutoff}}
-            ))
-            for dead_doc in dead_candidates:
-                dead_uid = dead_doc.get("user_id")
-                if not dead_uid:
-                    continue
-                # Final live safety check — if they actually rejoined, restore and skip
-                try:
-                    live = await bot.get_chat_member(CHANNEL_ID, dead_uid)
-                    if live.status in ("member", "administrator", "creator"):
-                        col_user_verification.update_one(
-                            {"user_id": dead_uid},
-                            {"$set": {"vault_joined": True, "verified": True},
-                             "$unset": {"msa_cleared_at": ""}}
+
+async def blueprint_link_checker():
+    """
+    Weekly background task: verify all blueprint and IG content links are alive.
+    Runs every 7 days. Flags dead links in DB and sends owner a single batched alert.
+    Skips Telegram file IDs (no URL to check). Safe to run — never modifies content.
+    """
+    # Wait 30 min after startup before first check (avoid hitting rate limits on cold start)
+    await asyncio.sleep(1800)
+    while True:
+        try:
+            broken_items = []
+
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=10),
+                headers={"User-Agent": "MSANode-LinkChecker/1.0"}
+            ) as session:
+
+                # ── Check PDF blueprints ──────────────────────────────────────
+                pdfs = list(col_pdfs.find({}, {
+                    "_id": 1, "msa_code": 1, "title": 1,
+                    "pdf_url": 1, "file_id": 1
+                }))
+                for pdf in pdfs:
+                    url = pdf.get("pdf_url") or pdf.get("url", "")
+                    if not url or not url.startswith("http"):
+                        continue  # Skip Telegram file IDs and empty fields
+                    try:
+                        async with session.head(url, allow_redirects=True) as r:
+                            if r.status >= 400:
+                                broken_items.append({
+                                    "type": "PDF",
+                                    "code": pdf.get("msa_code", "?"),
+                                    "title": pdf.get("title", "Untitled"),
+                                    "status": r.status
+                                })
+                                col_pdfs.update_one(
+                                    {"_id": pdf["_id"]},
+                                    {"$set": {
+                                        "link_status": "broken",
+                                        "link_last_checked": now_local(),
+                                        "link_http_status": r.status
+                                    }}
+                                )
+                            else:
+                                col_pdfs.update_one(
+                                    {"_id": pdf["_id"]},
+                                    {"$set": {
+                                        "link_status": "ok",
+                                        "link_last_checked": now_local()
+                                    }}
+                                )
+                    except Exception:
+                        broken_items.append({
+                            "type": "PDF",
+                            "code": pdf.get("msa_code", "?"),
+                            "title": pdf.get("title", "Untitled"),
+                            "status": "TIMEOUT"
+                        })
+                        col_pdfs.update_one(
+                            {"_id": pdf["_id"]},
+                            {"$set": {"link_status": "timeout", "link_last_checked": now_local()}}
                         )
-                        logger.info(f"[dead_cleanup] User {dead_uid} actually in vault — restored, skipping purge")
+                    await asyncio.sleep(0.5)  # gentle rate-limit between requests
+
+                # ── Check IG content ──────────────────────────────────────────
+                ig_items = list(col_ig_content.find({}, {
+                    "_id": 1, "cc_code": 1, "start_code": 1, "caption": 1,
+                    "content_url": 1, "link": 1
+                }))
+                for item in ig_items:
+                    url = item.get("content_url") or item.get("link", "")
+                    if not url or not url.startswith("http"):
                         continue
-                except Exception:
-                    pass  # API error — proceed with purge based on DB state
-
-                # Full wipe — user is completely gone, treated as new on re-entry.
-                col_user_verification.delete_one({"user_id": dead_uid})
-                db["bot10_user_tracking"].delete_one({"user_id": dead_uid})
-                db["support_tickets"].delete_many({"user_id": dead_uid})
-                logger.info(
-                    f"[dead_cleanup] Fully purged dead user {dead_uid} — "
-                    f"{(now_local() - dead_doc['msa_cleared_at']).days}d since MSA-ID release. "
-                    f"All records deleted. Will be new user on re-entry."
-                )
-
-            # ── Phase 4: Ghost users — /started but NEVER joined vault ──────────
-            # Registered but never vault-joined and idle for GHOST_USER_CLEANUP_DAYS.
-            ghost_cutoff = now_local() - timedelta(days=GHOST_USER_CLEANUP_DAYS)
-            ghost_candidates = list(col_user_verification.find({
-                "ever_verified": False,
-                "vault_joined":  False,
-                "first_start":   {"$lt": ghost_cutoff},
-                "msa_cleared_at": {"$exists": False},   # not already in phase-3 pipeline
-                "vault_left_at":  {"$exists": False},   # never had a leave timestamp
-            }))
-            for ghost in ghost_candidates:
-                ghost_uid = ghost.get("user_id")
-                if not ghost_uid:
-                    continue
-                # Safety check
-                try:
-                    live = await bot.get_chat_member(CHANNEL_ID, ghost_uid)
-                    if live.status in ("member", "administrator", "creator"):
-                        col_user_verification.update_one(
-                            {"user_id": ghost_uid},
-                            {"$set": {"vault_joined": True, "verified": True, "ever_verified": True}}
+                    try:
+                        async with session.head(url, allow_redirects=True) as r:
+                            if r.status >= 400:
+                                broken_items.append({
+                                    "type": "IG",
+                                    "code": item.get("cc_code") or item.get("start_code", "?"),
+                                    "title": str(item.get("caption", "IG Content"))[:40],
+                                    "status": r.status
+                                })
+                                col_ig_content.update_one(
+                                    {"_id": item["_id"]},
+                                    {"$set": {"link_status": "broken", "link_last_checked": now_local()}}
+                                )
+                            else:
+                                col_ig_content.update_one(
+                                    {"_id": item["_id"]},
+                                    {"$set": {"link_status": "ok", "link_last_checked": now_local()}}
+                                )
+                    except Exception:
+                        broken_items.append({
+                            "type": "IG",
+                            "code": item.get("cc_code") or item.get("start_code", "?"),
+                            "title": str(item.get("caption", "IG Content"))[:40],
+                            "status": "TIMEOUT"
+                        })
+                        col_ig_content.update_one(
+                            {"_id": item["_id"]},
+                            {"$set": {"link_status": "timeout", "link_last_checked": now_local()}}
                         )
-                        logger.info(f"[ghost_cleanup] Ghost {ghost_uid} found in vault — restored")
-                        continue
-                except Exception:
-                    pass
-                # Full wipe — ghost never joined, completely erased, new user on re-entry.
-                col_user_verification.delete_one({"user_id": ghost_uid})
-                db["bot10_user_tracking"].delete_one({"user_id": ghost_uid})
-                db["support_tickets"].delete_many({"user_id": ghost_uid})
-                logger.info(f"[ghost_cleanup] Fully purged ghost user {ghost_uid} — never joined vault, idle {GHOST_USER_CLEANUP_DAYS}+ days. All records deleted. Will be new user on re-entry.")
+                    await asyncio.sleep(0.5)
+
+            # ── Send owner alert if any broken links found ────────────────────
+            if broken_items:
+                alert_lines = [f"⚠️ **BLUEPRINT LINK HEALTH ALERT**\n{len(broken_items)} link(s) appear broken:\n"]
+                for b in broken_items[:20]:  # cap at 20 to avoid message overflow
+                    alert_lines.append(f"• [{b['type']}] `{b['code']}` — {b['title'][:35]} (HTTP {b['status']})")
+                if len(broken_items) > 20:
+                    alert_lines.append(f"_...and {len(broken_items) - 20} more. Check Atlas for full list._")
+                alert_lines.append("\n_Review and update the affected content in your content library._")
+                try:
+                    await bot.send_message(OWNER_ID, "\n".join(alert_lines), parse_mode=ParseMode.MARKDOWN)
+                    logger.info(f"[LinkChecker] Alert sent: {len(broken_items)} broken link(s)")
+                except Exception as e:
+                    logger.error(f"[LinkChecker] Could not send owner alert: {e}")
+            else:
+                logger.info(f"[LinkChecker] All blueprint links healthy ✅")
 
         except asyncio.CancelledError:
             break
         except Exception as e:
-            logger.error(f"❌ inactive_member_monitor error: {e}")
+            logger.error(f"[LinkChecker] Weekly check error: {e}")
+
+        # Run once per week
+        await asyncio.sleep(7 * 24 * 3600)
 
 
 async def broadcast_live_sync():
     """
-    Background task: poll bot10_broadcasts every 10 s for changes.
+    Background task: poll bot2_broadcasts every 10 s for changes.
     When a change is detected (broadcast added / edited / deleted via bot2),
     instantly refresh every open dashboard message in bot1 — no user action needed.
     """
@@ -8134,18 +9416,26 @@ async def main():
         dp.errors.register(global_error_handler)
         logger.info("🏥 Global error handler + auto-healer registered")
 
+        # ── Register permanent-ban gate (FIRST — outermost middleware) ──
+        # Drops ALL messages and callback queries from permanently banned users.
+        # Temp-banned users are passed through to their per-handler SUPPORT-only flow.
+        _ban_gate = BanGateMiddleware()
+        dp.message.middleware(_ban_gate)
+        dp.callback_query.middleware(_ban_gate)
+        logger.info("🚫 BanGateMiddleware registered (message + callback_query)")
+
         # ── Register live terminal middleware ────────────────────
         dp.message.middleware(Bot1TerminalMiddleware())
         log_to_terminal("STARTUP", 0, "Bot 1 online — live terminal active")
         logger.info("🖥️ Live terminal middleware registered (logs visible in Bot 2)")
 
-        # ── Fail fast if BOT_8_TOKEN is invalid/revoked ──────────
+        # ─── Fail fast if BOT_1_TOKEN is invalid/revoked ──────────
         try:
             me = await bot.get_me()
             logger.info(f"🤖 Telegram auth OK: @{me.username or me.id}")
         except TelegramUnauthorizedError:
             logger.critical(
-                "❌ BOT_8_TOKEN is unauthorized. Update BOT_8_TOKEN in bot8.env and restart."
+                "❌ BOT_1_TOKEN is unauthorized. Update BOT_1_TOKEN in bot1.env and restart."
             )
             raise
 
@@ -8160,9 +9450,14 @@ async def main():
             asyncio.create_task(periodic_state_saver(),    name="state_saver"),
             asyncio.create_task(inactive_member_monitor(),    name="inactive_member_monitor"),
             asyncio.create_task(broadcast_live_sync(),        name="broadcast_live_sync"),
+            asyncio.create_task(blueprint_link_checker(),     name="blueprint_link_checker"),
         ]
         
-        # ── NEW: Unified weekly backup (stores in DB, no delivery) ──
+        # ── NEW: Unified weekly backup (reads PROD → writes to BACKUP cluster) ──
+        _b1_backup_uri = BACKUP_MONGO_URI or MONGO_URI
+        _b1_backup_db  = BACKUP_MONGO_DB_NAME or "MSANodeBackups"
+        if not BACKUP_MONGO_URI:
+            logger.warning("⚠️ BACKUP_MONGO_URI not set — bot1 weekly backup falling back to PROD cluster!")
         if weekly_backup_scheduler:
             tasks.append(asyncio.create_task(
                 weekly_backup_scheduler(
@@ -8170,12 +9465,14 @@ async def main():
                     bot_name="bot1",
                     owner_id=OWNER_ID,
                     mongo_uri=MONGO_URI,
-                    db_name=MONGO_DB_NAME
+                    db_name=MONGO_DB_NAME,
+                    backup_mongo_uri=_b1_backup_uri,
+                    backup_db_name=_b1_backup_db
                 ),
                 name="weekly_backup_bot1"
             ))
         
-        # ── NEW: Month-end auto-export (sends ZIP to owner) ──
+        # ── NEW: Month-end auto-export (last day of month → GDrive upload) ──
         if monthly_export_scheduler:
             tasks.append(asyncio.create_task(
                 monthly_export_scheduler(
@@ -8183,12 +9480,14 @@ async def main():
                     bot_name="bot1",
                     owner_id=OWNER_ID,
                     mongo_uri=MONGO_URI,
-                    db_name=MONGO_DB_NAME
+                    db_name=MONGO_DB_NAME,
+                    backup_mongo_uri=_b1_backup_uri,
+                    backup_db_name=_b1_backup_db
                 ),
                 name="monthly_export_bot1"
             ))
         
-        # ⚠️ DEPRECATED: Old 12h backups (auto_backup_bot8, monthly_json_delivery_bot1) are disabled
+        # ⚠️ DEPRECATED: Old 12h backups (auto_backup_bot1, monthly_json_delivery_bot1) are disabled
         # They are replaced by the unified weekly+monthly-end system above
         
         logger.info(f"✅ {len(tasks)} background tasks started: {[t.get_name() for t in tasks]}")
@@ -8206,7 +9505,7 @@ async def main():
                 f"📊 Daily Reports: ✅ Scheduled (8:40 AM &amp; PM {REPORT_TIMEZONE})\n"
                 f"🗑️ Ticket Archiver: ✅ Active\n"
                 f"💾 State Persistence: ✅ Enabled\n"
-                f"🗄️ Auto-Backup: ✅ Every 12h — bot8_backups\n\n"
+                f"🗄️ Auto-Backup: ✅ Every 12h — bot1_backups\n\n"
                 f"<b>Started:</b> {now_tz.strftime('%B %d, %Y — %I:%M:%S %p %Z')}\n"
                 f"<b>Continued from save:</b> {continued_from}\n\n"
                 f"<i>All systems operational — Scaling ready</i>",
@@ -8237,7 +9536,7 @@ async def main():
     except Exception as e:
         logger.critical(f"💥 Fatal startup error: {e}\n{traceback.format_exc()}")
         try:
-            await notify_owner("Bot 1 Startup FATAL", f"{e}\n{traceback.format_exc()[:500]}", "CRITICAL", False)
+            await notify_owner("Bot 1 Startup FATAL", f"{e}\n{str(traceback.format_exc())[:500]}", "CRITICAL", False)
         except Exception:
             pass
         raise
@@ -8292,9 +9591,10 @@ async def main():
             pass
 
         # ── Stop health check web server ─────────────────────────
-        if health_runner:
+        if health_runner and hasattr(health_runner, "cleanup") and callable(getattr(health_runner, "cleanup", None)):
             try:
-                await health_runner.cleanup()
+                _cleanup = getattr(health_runner, "cleanup")
+                await _cleanup()
                 logger.info("🌐 Health check server stopped")
             except Exception:
                 pass
@@ -8323,7 +9623,7 @@ if __name__ == "__main__":
             break
         except TelegramUnauthorizedError:
             logger.critical(
-                "🛑 Restart disabled: Telegram Unauthorized. Fix BOT_8_TOKEN in bot8.env, then start again."
+                "🛑 Restart disabled: Telegram Unauthorized. Fix BOT_1_TOKEN in bot1.env, then start again."
             )
             break
         except Exception as e:
@@ -8333,3 +9633,4 @@ if __name__ == "__main__":
             _restart_delay = min(_restart_delay * 2, 60)
             # Replace the entire process to get a clean event loop
             os.execv(sys.executable, [sys.executable, _script_path])
+
