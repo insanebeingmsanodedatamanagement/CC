@@ -9,18 +9,12 @@ from zoneinfo import ZoneInfo
 from aiohttp import web as aiohttp_web
 
 # --- 🔧 NEW: UNIFIED BACKUP SYSTEM FINAL ARCHITECTURE ---
-try:
-    from backup_manager import BackupManager
-    bot_backup = BackupManager("bot2")
-except ImportError:
-    bot_backup = None
-    print("⚠️ backup_manager module not found — Automatic backups disabled")
+# All backup functions are now natively combined into this bot2.py script.
 from aiogram import Bot, Dispatcher, types, F, BaseMiddleware
 from aiogram.filters import Command
 from aiogram.types import ReplyKeyboardMarkup, ReplyKeyboardRemove, KeyboardButton, BufferedInputFile, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from dotenv import load_dotenv
 from pymongo import MongoClient
 from bson.objectid import ObjectId
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -58,13 +52,1288 @@ del _ultra_noisy
 # This ensures broadcasts appear to come from Bot 1
 # ==============================================
 
-# ── Unified weekly backup system ──
-try:
-    from backup_schedulers import weekly_backup_scheduler, monthly_export_scheduler
-except ImportError:
-    print("⚠️ backup_schedulers module not found — weekly backups disabled")
-    weekly_backup_scheduler = None
-    monthly_export_scheduler = None
+
+# ==========================================
+# 🧱 INJECTED BACKUP SCHEDULERS SYSTEM
+# ==========================================
+"""
+MSA Node — Unified Backup Scheduler System (v3 — Complete)
+
+Provides:
+  - _LOCAL_ROOT            : Base path for local JSON backup folders
+  - create_manual_zip      : Export bot collections from PROD → in-memory ZIP
+  - force_backup_to_cluster: Snapshot bot collections → MSANodeBackups cluster
+  - list_available_local_backups: List available month folders on disk
+  - monthly_gdrive_upload  : Upload a monthly local ZIP folder to Google Drive
+  - present_gdrive_upload  : Upload present MSANodeBackups records → GDrive, then delete
+  - weekly_backup_scheduler: Async task — weekly Sunday 23:59 UTC auto-backup
+  - monthly_export_scheduler: Async task — last day of month 23:59 UTC ZIP delivery
+
+Backup tiers:
+  1. Manual (instant) → create_manual_zip / force_backup_to_cluster
+  2. Weekly auto-scheduler (Sunday 23:59 UTC) → MSANodeBackups cluster
+  3. Monthly ZIP (last day 23:59 UTC) → Local folder
+  4. GDrive upload (manual or auto) → permanent remote storage
+"""
+
+import asyncio
+import io
+import json
+import logging
+import os
+import zipfile
+from calendar import monthrange
+from datetime import datetime, timezone, timedelta
+
+import certifi
+from pymongo import MongoClient, ASCENDING
+from pymongo.errors import ServerSelectionTimeoutError
+
+logger = _logging.getLogger(__name__)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONSTANTS
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Root folder for local JSON backups
+_LOCAL_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "MSANode_Local_Backups")
+
+# Render detection — on Render, disk is ephemeral so skip local file writes
+_IS_RENDER = os.environ.get("RENDER", "").lower() in ("true", "1", "yes")
+
+# Google Drive folder ID — Bot 1
+_BOT1_GDRIVE_FOLDER_ID = "1w__r_EeggAVISHE3In_cg2TeVgrE5_G5"
+
+# Google Drive folder ID — Bot 2
+_BOT2_GDRIVE_FOLDER_ID = "1VpM8rIcqzdVgb1Fc2cHBsoCnflurJCZS"
+
+# Google Drive folder ID — Bot 3 (separate, isolated folder)
+_BOT3_GDRIVE_FOLDER_ID = "10Pwa81s6OcSTayORP9jcZ2qTVLA0vild"
+
+# TTL for backup cluster docs: 90 days
+_TTL_SECONDS = 90 * 24 * 3600
+
+# Bot collection mappings — which mongo collections belong to which bot
+_BOT_COLLECTIONS = {
+    "bot1": [
+        "bot1_msa_ids",
+        "bot1_user_verification",
+        "bot1_support_tickets",
+        "bot1_banned_users",
+        "bot1_suspended_features",
+        "bot1_permanently_banned_msa",
+        "bot1_offline_log",
+        "bot1_settings",
+    ],
+    "bot2": [
+        "bot2_broadcasts",
+        "bot2_user_tracking",
+        "bot2_access_attempts",
+        "bot2_admins",
+        "bot2_live_terminal_logs",
+        "bot2_cleanup_logs",
+        "bot2_cleanup_backups",
+    ],
+    # ── Bot 3 — strictly isolated, never mixed with bot1/bot2 ──────────────
+    "bot3": [
+        "bot3_pdfs",
+        "bot3_ig_content",
+        "bot3_admins",
+        "bot3_settings",
+        "bot3_banned_users",
+        "bot3_logs",
+        "bot3_user_activity",
+        "bot3_backups",
+    ],
+}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# INTERNAL HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _ensure_ttl_index(col):
+    """Create 90-day TTL index on backup_date field (idempotent)."""
+    try:
+        col.create_index(
+            [("backup_date", ASCENDING)],
+            expireAfterSeconds=_TTL_SECONDS,
+            name="backup_ttl_90d",
+            background=True
+        )
+    except Exception as e:
+        # Non-fatal: backup cluster may have transient SSL/network issues.
+        # Silenced to DEBUG so it doesn't pollute startup logs.
+        logger.debug(f"[BACKUP] TTL index setup skipped (non-fatal): {type(e).__name__}")
+
+
+def _backup_mongo_client(uri: str, **kwargs) -> MongoClient:
+    """Create a MongoClient for the backup cluster using the certifi CA bundle.
+
+    Uses tlsCAFile=certifi.where() — identical to the production client —
+    to present a valid CA chain to Atlas and avoid TLSV1_ALERT_INTERNAL_ERROR.
+    The previous tlsInsecure=True bypass caused Atlas to reject the handshake
+    at the server side.
+    """
+    opts = {
+        "serverSelectionTimeoutMS": 10000,
+        "tlsCAFile": certifi.where(),  # Proper CA bundle — fixes TLSV1_ALERT_INTERNAL_ERROR
+    }
+    opts.update(kwargs)
+    return MongoClient(uri, **opts)
+
+
+def _get_gdrive_service():
+    """Build and return an authenticated Google Drive service object."""
+    from google.oauth2.credentials import Credentials
+    from google.auth.transport.requests import Request
+    from googleapiclient.discovery import build
+
+    token_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "token.json")
+    creds_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "credentials.json")
+
+    SCOPES = ["https://www.googleapis.com/auth/drive"]
+    creds = None
+
+    if os.path.exists(token_path):
+        creds = Credentials.from_authorized_user_file(token_path, SCOPES)
+
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            raise RuntimeError(
+                "Google Drive token.json missing or invalid. "
+                "Re-run the OAuth flow to generate a fresh token."
+            )
+        with open(token_path, "w") as f:
+            f.write(creds.to_json())
+
+    return build("drive", "v3", credentials=creds, cache_discovery=False)
+
+
+def _gdrive_file_exists(service, filename: str, folder_id: str) -> bool:
+    """Return True if a file with this exact name already exists in the GDrive folder."""
+    query = (
+        f"name='{filename}' and "
+        f"'{folder_id}' in parents and "
+        "trashed=false"
+    )
+    results = service.files().list(q=query, fields="files(id, name)").execute()
+    return len(results.get("files", [])) > 0
+
+
+def _gdrive_upload_bytes(service, zip_bytes: bytes, filename: str, folder_id: str) -> str:
+    """Upload bytes as a file to GDrive, return the file ID."""
+    from googleapiclient.http import MediaIoBaseUpload
+    meta = {"name": filename, "parents": [folder_id]}
+    media = MediaIoBaseUpload(io.BytesIO(zip_bytes), mimetype="application/zip", resumable=True)
+    f = service.files().create(body=meta, media_body=media, fields="id").execute()
+    return f.get("id", "")
+
+
+def _export_bot_collections(prod_db, bot_name: str) -> dict:
+    """
+    Export all collections for a bot from PROD DB.
+    Returns: { col_name: { count, documents:[...] } }
+    """
+    result = {}
+    cols = _BOT_COLLECTIONS.get(bot_name, [])
+    # Also try any extra collections that match the prefix but aren't hardcoded
+    all_db_cols = prod_db.list_collection_names()
+    prefix = f"{bot_name}_"
+    extra = [c for c in all_db_cols if c.startswith(prefix) and c not in cols]
+    all_cols = list(cols) + extra
+
+    for col_name in all_cols:
+        try:
+            docs = []
+            for d in prod_db[col_name].find({}):
+                d["_id"] = str(d["_id"])
+                docs.append(d)
+            result[col_name] = {"count": len(docs), "documents": docs}
+        except Exception as e:
+            result[col_name] = {"count": 0, "error": str(e)}
+    return result
+
+
+def _build_zip_from_collections(bot_name: str, collections: dict) -> io.BytesIO:
+    """Package collections dict into an in-memory ZIP of JSON files."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for col_name, col_data in collections.items():
+            docs = col_data.get("documents", [])
+            payload = json.dumps(docs, default=str, indent=2, ensure_ascii=False)
+            zf.writestr(f"{col_name}.json", payload)
+        meta = {
+            "bot": bot_name,
+            "exported_at": datetime.now(timezone.utc).isoformat(),
+            "collections": {k: v.get("count", 0) for k, v in collections.items()},
+        }
+        zf.writestr("_metadata.json", json.dumps(meta, indent=2))
+    buf.seek(0)
+    return buf
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PUBLIC API — Synchronous (called via run_in_executor from bot2)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def create_manual_zip(bot_name: str, mongo_uri: str, db_name: str) -> io.BytesIO:
+    """
+    Export all of a bot's live collections from PROD → in-memory BytesIO ZIP.
+    Called as: await loop.run_in_executor(None, create_manual_zip, "bot1", MONGO_URI, MONGO_DB_NAME)
+    Returns a seeked BytesIO ready for .read().
+    """
+    client = MongoClient(mongo_uri, serverSelectionTimeoutMS=10000)
+    try:
+        db = client[db_name]
+        collections = _export_bot_collections(db, bot_name)
+        return _build_zip_from_collections(bot_name, collections)
+    finally:
+        client.close()
+
+
+def force_backup_to_cluster(
+    bot_name: str,
+    mongo_uri: str,
+    db_name: str,
+    backup_mongo_uri: str = None,
+    backup_db_name: str = "MSANodeBackups",
+) -> dict:
+    """
+    Snapshot all of a bot's live collections → MSANodeBackups cluster.
+    Returns: { status: "ok"|"error", collections: int, docs: int, error: str }
+    Called as: await loop.run_in_executor(None, force_backup_to_cluster, "bot1", ...)
+    """
+    _write_uri = backup_mongo_uri or mongo_uri
+    _write_db  = backup_db_name if backup_mongo_uri else db_name
+
+    try:
+        prod_client = MongoClient(mongo_uri, serverSelectionTimeoutMS=10000)
+        bkp_client  = _backup_mongo_client(_write_uri)
+        prod_db = prod_client[db_name]
+        bkp_db  = bkp_client[_write_db]
+
+        collections = _export_bot_collections(prod_db, bot_name)
+        prod_client.close()
+
+        col_count = len(collections)
+        doc_count = sum(v.get("count", 0) for v in collections.values())
+        now = datetime.now(timezone.utc)
+        ts  = now.strftime("%Y%m%d_%H%M%S")
+
+        # Store full snapshot in MSANodeBackups
+        bkp_col = bkp_db[f"bot{bot_name[-1]}_backups"] if bot_name.startswith("bot") else bkp_db["bot_backups"]
+        _ensure_ttl_index(bkp_col)
+
+        snap = {
+            "bot":         bot_name,
+            "backup_date": now,
+            "backup_type": "force",
+            "window_key":  ts,
+            "collections": col_count,
+            "docs":        doc_count,
+            "data":        collections,
+        }
+        bkp_col.insert_one(snap)
+        bkp_client.close()
+
+        return {"status": "ok", "collections": col_count, "docs": doc_count}
+
+    except Exception as e:
+        logger.error(f"[BACKUP] force_backup_to_cluster failed for {bot_name}: {e}")
+        return {"status": "error", "error": str(e), "collections": 0, "docs": 0}
+
+
+def list_available_local_backups(bot_name: str) -> list:
+    """
+    Scan _LOCAL_ROOT/<bot_name>/ and return a sorted list of month folder names.
+    E.g. ["January 2026", "February 2026"]
+    """
+    bot_dir = os.path.join(_LOCAL_ROOT, bot_name)
+    if not os.path.isdir(bot_dir):
+        return []
+
+    months = []
+    for year_folder in sorted(os.listdir(bot_dir)):
+        year_path = os.path.join(bot_dir, year_folder)
+        if not os.path.isdir(year_path):
+            continue
+        for month_folder in sorted(os.listdir(year_path)):
+            month_path = os.path.join(year_path, month_folder)
+            if os.path.isdir(month_path):
+                months.append(month_folder)
+
+    return months
+
+
+def monthly_gdrive_upload(
+    bot_name: str,
+    month_label: str,
+    mongo_uri: str,
+    backup_mongo_uri: str = None,
+    backup_db_name: str = "MSANodeBackups",
+    cutoff_date: datetime = None,
+) -> dict:
+    """
+    Package the local monthly backup folder into a ZIP and upload to Google Drive.
+
+    IMPORTANT: This function DOES NOT apply any TTL/auto-deletion flags and does
+    NOT delete any local or cluster data. Call apply_gdrive_ttl_flag() separately
+    ONLY after the user explicitly confirms they want to enable auto-deletion.
+
+    Args:
+        bot_name:        "bot1" or "bot2"
+        month_label:     e.g. "March 2026" (matches folder name in _LOCAL_ROOT)
+        mongo_uri:       production URI (not used for data — only kept for signature compat)
+        backup_mongo_uri: backup cluster URI (not used here — see apply_gdrive_ttl_flag)
+        backup_db_name:  backup DB name
+        cutoff_date:     optional UTC datetime upper bound — only files on/before this
+                         date are included in the ZIP (default = now UTC).
+                         Handles partial months (e.g. April when today is April 15).
+
+    Returns:
+        {
+          status:    "success" | "error",
+          zip_name:  filename,
+          size_mb:   float,
+          file_id:   GDrive file ID,
+          weeks_included: list[str],   # e.g. ["Week 1", "Week 2"]
+          days_count: int,             # number of day folders included
+          cutoff_str: "2026-04-15",
+          message:   str,
+        }
+    """
+    if cutoff_date is None:
+        cutoff_date = datetime.now(timezone.utc)
+
+    try:
+        # ── Find the local month folder ─────────────────────────────────────
+        year      = month_label.split()[-1]
+        month_dir = os.path.join(_LOCAL_ROOT, bot_name, year, month_label)
+
+        if not os.path.isdir(month_dir):
+            return {"status": "error", "message": f"Local folder not found: {month_dir}"}
+
+        cutoff_str = cutoff_date.strftime("%Y-%m-%d")
+
+        # ── Collect files respecting cutoff ────────────────────────────────
+        # Structure: month_dir / Week N / YYYY-MM-DD / *.json
+        # Include a day folder only if its name (YYYY-MM-DD) <= cutoff_str.
+        included_weeks: set = set()
+        days_count = 0
+        file_list: list = []  # list of (abs_path, zip_arcname)
+
+        for week_name in sorted(os.listdir(month_dir)):
+            week_path = os.path.join(month_dir, week_name)
+            if not os.path.isdir(week_path):
+                continue
+            for day_name in sorted(os.listdir(week_path)):
+                if day_name > cutoff_str:
+                    continue  # future date — skip
+                day_path = os.path.join(week_path, day_name)
+                if not os.path.isdir(day_path):
+                    continue
+                for fname in os.listdir(day_path):
+                    fpath = os.path.join(day_path, fname)
+                    arcname = os.path.join(month_label, week_name, day_name, fname)
+                    file_list.append((fpath, arcname))
+                included_weeks.add(week_name)
+                days_count += 1
+
+        if not file_list:
+            return {
+                "status":  "error",
+                "message": f"No backup files found on or before {cutoff_str} in {month_dir}",
+            }
+
+        # ── Build ZIP in-memory ─────────────────────────────────────────────
+        ts_str   = cutoff_date.strftime("%Y%m%d_%H%M%S")
+        zip_name = f"monthly_{bot_name}_{month_label.replace(' ', '_')}_till_{cutoff_str}_{ts_str}.zip"
+
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for fpath, arcname in file_list:
+                zf.write(fpath, arcname)
+        zip_bytes = buf.getvalue()
+        size_mb   = len(zip_bytes) / (1024 * 1024)
+
+        # ── Upload to GDrive (duplicate guard) ─────────────────────────────
+        service = _get_gdrive_service()
+        if bot_name == "bot1":   target_folder = _BOT1_GDRIVE_FOLDER_ID
+        elif bot_name == "bot2": target_folder = _BOT2_GDRIVE_FOLDER_ID
+        else:                    target_folder = _BOT3_GDRIVE_FOLDER_ID
+
+        if _gdrive_file_exists(service, zip_name, target_folder):
+            return {"status": "error", "message": f"File '{zip_name}' already exists in GDrive."}
+
+        file_id = _gdrive_upload_bytes(service, zip_bytes, zip_name, target_folder)
+
+        return {
+            "status":          "success",
+            "zip_name":        zip_name,
+            "size_mb":         size_mb,
+            "file_id":         file_id,
+            "weeks_included":  sorted(included_weeks),
+            "days_count":      days_count,
+            "cutoff_str":      cutoff_str,
+            "message":         "Upload successful",
+        }
+
+    except Exception as e:
+        logger.error(f"[BACKUP] monthly_gdrive_upload failed: {e}")
+        return {"status": "error", "message": str(e)}
+
+
+def apply_gdrive_ttl_flag(
+    bot_name: str,
+    file_id: str,
+    backup_mongo_uri: str,
+    backup_db_name: str = "MSANodeBackups",
+    month_label: str = "",
+    cutoff_str: str = "",
+) -> dict:
+    """
+    Mark MSANodeBackups records as gdrive_uploaded=True for the given bot_name.
+    Only records with backup_date on/before cutoff_str are flagged.
+
+    IMPORTANT:
+    - Only call this AFTER explicit user confirmation in the Telegram UI.
+    - Does NOT delete any data. The 90-day TTL index on backup_date handles
+      actual expiry automatically within MongoDB (not triggered here).
+    - Main DB (MSANodeDB) NEVER touched.
+
+    Returns: { status, updated_count, message }
+    """
+    try:
+        bkp_client = _backup_mongo_client(backup_mongo_uri, serverSelectionTimeoutMS=10000)
+        bkp_db     = bkp_client[backup_db_name]
+        bkp_col    = bkp_db[f"bot{bot_name[-1]}_backups"]
+
+        filter_q: dict = {"bot": bot_name}
+        if cutoff_str:
+            # Only flag records whose window_key (YYYY-MM-DD) is <= cutoff_str
+            filter_q["window_key"] = {"$lte": cutoff_str}
+
+        result = bkp_col.update_many(
+            filter_q,
+            {"$set": {
+                "gdrive_uploaded":    True,
+                "gdrive_file_id":     file_id,
+                "gdrive_uploaded_at": datetime.now(timezone.utc),
+            }}
+        )
+        updated_count = result.modified_count
+        bkp_client.close()
+
+        logger.info(f"[BACKUP] GDrive TTL flag applied: {updated_count} records for {bot_name} ≤ {cutoff_str}")
+
+        return {
+            "status":        "ok",
+            "updated_count": updated_count,
+            "message":       f"auto-deletion flag set on {updated_count} record(s) in MSANodeBackups",
+        }
+
+    except Exception as e:
+        logger.error(f"[BACKUP] apply_gdrive_ttl_flag failed for {bot_name}: {e}")
+        return {"status": "error", "updated_count": 0, "message": str(e)}
+
+
+
+
+def present_gdrive_upload(
+    bot_name: str,
+    prod_mongo_uri: str,
+    prod_db_name: str = "MSANodeDB",
+    backup_mongo_uri: str = None,
+    backup_db_name: str = "MSANodeBackups",
+) -> dict:
+    """
+    Snapshot the bot's LIVE collections from the production cluster (MSANodeDB),
+    package them as a ZIP, and upload to Google Drive.
+
+    NOTE: Production data is NEVER deleted — this is a read-only snapshot upload.
+    The backup cluster (MSANodeBackups) is not used here due to SSL issues.
+
+    Args:
+        bot_name:      "bot1" or "bot2"
+        prod_mongo_uri: production cluster URI
+        prod_db_name:  production DB name  (default: MSANodeDB)
+
+    Returns:
+        { status: "success"|"error", zip_name, size_mb, file_id, doc_count, message }
+    """
+    try:
+        # ── Read from production DB ──────────────────────────────────────────
+        prod_client = MongoClient(prod_mongo_uri, serverSelectionTimeoutMS=10000)
+        prod_db     = prod_client[prod_db_name]
+
+        collections = _export_bot_collections(prod_db, bot_name)
+        prod_client.close()
+
+        doc_count = sum(v.get("count", 0) for v in collections.values())
+
+        if doc_count == 0:
+            return {"status": "error", "message": f"No data found in production DB for {bot_name} — skipping upload."}
+
+        # ── Build ZIP in-memory ──────────────────────────────────────────────
+        ts_str   = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        zip_name = f"present_gdrive_{bot_name}_{ts_str}.zip"
+
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            meta = {
+                "bot":         bot_name,
+                "exported_at": datetime.now(timezone.utc).isoformat(),
+                "total_docs":  doc_count,
+                "source":      prod_db_name,
+                "note":        "Snapshot of live production data — nothing deleted",
+            }
+            zf.writestr("_metadata.json", json.dumps(meta, default=str, indent=2))
+            for col_name, col_data in collections.items():
+                docs    = col_data.get("documents", [])
+                payload = json.dumps(docs, default=str, indent=2, ensure_ascii=False)
+                zf.writestr(f"{col_name}.json", payload)
+
+        zip_bytes = buf.getvalue()
+        size_mb   = len(zip_bytes) / (1024 * 1024)
+
+        # ── Upload to GDrive (no duplicates) ───────────────────────────────
+        service = _get_gdrive_service()
+        if bot_name == "bot1": target_folder = _BOT1_GDRIVE_FOLDER_ID
+        elif bot_name == "bot2": target_folder = _BOT2_GDRIVE_FOLDER_ID
+        else: target_folder = _BOT3_GDRIVE_FOLDER_ID
+        if _gdrive_file_exists(service, zip_name, target_folder):
+            return {"status": "error", "message": f"File '{zip_name}' already exists in GDrive."}
+
+        file_id = _gdrive_upload_bytes(service, zip_bytes, zip_name, target_folder)
+
+        # ── Log to production DB history ─────────────────────────────────────
+        try:
+            _log_present_gdrive_prod(bot_name, zip_name, doc_count, prod_mongo_uri, prod_db_name)
+        except Exception:
+            pass
+
+        return {
+            "status":    "success",
+            "zip_name":  zip_name,
+            "size_mb":   size_mb,
+            "file_id":   file_id,
+            "doc_count": doc_count,
+            "message":   f"Uploaded {zip_name} to GDrive ({doc_count:,} docs). Production data untouched.",
+        }
+
+    except Exception as e:
+        logger.error(f"[BACKUP] present_gdrive_upload failed for {bot_name}: {e}")
+        return {"status": "error", "message": str(e)}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BOT 2 CLUSTER DOWNLOAD HELPERS
+# Strictly scoped to one bot — reads only from MSANodeBackups, never from
+# production. Never writes or deletes anything.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def list_cluster_backup_months(
+    bot_name: str,
+    backup_mongo_uri: str,
+    backup_db_name: str = "MSANodeBackups",
+) -> list:
+    """
+    Return a deduplicated, sorted list of month+year groups available in the
+    MSANodeBackups cluster for bot_name.
+
+    Each entry is a dict:
+      {
+        "label":   "April 2026",   # human-readable month label
+        "year":    2026,
+        "month":   4,              # integer 1–12
+        "count":   15,             # number of daily snapshots stored
+        "earliest": "2026-04-01",  # first backup_date in that month (YYYY-MM-DD)
+        "latest":   "2026-04-15",  # last  backup_date in that month (YYYY-MM-DD)
+      }
+
+    Results are returned newest-month-first.  Only entries with backup_date ≤
+    now (UTC) are included — no future-dated records are ever shown.
+    """
+    try:
+        bkp_client = _backup_mongo_client(backup_mongo_uri, serverSelectionTimeoutMS=10000)
+        bkp_db     = bkp_client[backup_db_name]
+        col_name   = f"bot{bot_name[-1]}_backups" if bot_name.startswith("bot") else "bot_backups"
+        bkp_col    = bkp_db[col_name]
+
+        now = datetime.now(timezone.utc)
+
+        # Pull only the backup_date + window_key — exclude heavy 'data' field
+        cursor = bkp_col.find(
+            {"bot": bot_name, "backup_date": {"$lte": now}},
+            {"backup_date": 1, "window_key": 1, "_id": 0}
+        )
+
+        # Group by (year, month)
+        month_map: dict = {}  # key = (year, month)  →  {count, min_date, max_date}
+        for rec in cursor:
+            bd = rec.get("backup_date")
+            if not bd:
+                continue
+            # Ensure timezone-aware datetime
+            if bd.tzinfo is None:
+                bd = bd.replace(tzinfo=timezone.utc)
+            key = (bd.year, bd.month)
+            if key not in month_map:
+                month_map[key] = {"count": 0, "min_date": bd, "max_date": bd}
+            month_map[key]["count"]   += 1
+            if bd < month_map[key]["min_date"]:
+                month_map[key]["min_date"] = bd
+            if bd > month_map[key]["max_date"]:
+                month_map[key]["max_date"] = bd
+
+        bkp_client.close()
+
+        # Build result list, sorted newest first
+        result = []
+        for (year, month), info in sorted(month_map.items(), key=lambda x: x[0], reverse=True):
+            label = datetime(year, month, 1).strftime("%B %Y")  # e.g. "April 2026"
+            result.append({
+                "label":    label,
+                "year":     year,
+                "month":    month,
+                "count":    info["count"],
+                "earliest": info["min_date"].strftime("%Y-%m-%d"),
+                "latest":   info["max_date"].strftime("%Y-%m-%d"),
+            })
+
+        return result
+
+    except Exception as e:
+        logger.error(f"[BACKUP] list_cluster_backup_months failed for {bot_name}: {e}")
+        return []
+
+
+def download_cluster_backup_for_month(
+    bot_name: str,
+    year: int,
+    month: int,
+    backup_mongo_uri: str,
+    backup_db_name: str = "MSANodeBackups",
+    cutoff_date: datetime = None,
+) -> tuple:
+    """
+    Download all backup records for bot_name in the given (year, month) from
+    MSANodeBackups, merging and deduplicating them into a single in-memory ZIP.
+
+    - cutoff_date: timezone-aware UTC datetime upper bound (default = now).
+      Only records with backup_date <= cutoff_date are included.
+    - Records are merged collection-by-collection. Documents with the same
+      '_id' are deduplicated — the latest snapshot's version is kept.
+    - Does NOT modify or delete any records. Read-only.
+    - Strictly scoped to bot_name — no other bot's data is touched.
+
+    Returns: (zip_bytes: bytes, filename: str)  or  (None, None) on error.
+    """
+    try:
+        bkp_client = _backup_mongo_client(backup_mongo_uri, serverSelectionTimeoutMS=10000)
+        bkp_db     = bkp_client[backup_db_name]
+        col_name   = f"bot{bot_name[-1]}_backups" if bot_name.startswith("bot") else "bot_backups"
+        bkp_col    = bkp_db[col_name]
+
+        if cutoff_date is None:
+            cutoff_date = datetime.now(timezone.utc)
+
+        # Month boundaries (inclusive start, inclusive end clipped to cutoff)
+        month_start = datetime(year, month, 1, 0, 0, 0, tzinfo=timezone.utc)
+        # Last second of the month or cutoff_date — whichever is earlier
+        if month + 1 > 12:
+            month_end_naive = datetime(year + 1, 1, 1) - timedelta(seconds=1)
+        else:
+            month_end_naive = datetime(year, month + 1, 1) - timedelta(seconds=1)
+        month_end = month_end_naive.replace(tzinfo=timezone.utc)
+        effective_end = min(month_end, cutoff_date)
+
+        # Fetch all records for this bot in the date range, oldest first
+        records = list(
+            bkp_col.find(
+                {
+                    "bot": bot_name,
+                    "backup_date": {"$gte": month_start, "$lte": effective_end},
+                }
+            ).sort("backup_date", 1)  # oldest first → newest overwrites
+        )
+        bkp_client.close()
+
+        if not records:
+            return None, None
+
+        # ── Merge all records, deduplicate by _id per collection ──────────────
+        # We iterate oldest→newest so the newest record's version of each doc wins.
+        merged: dict = {}  # col_name → {str(_id): doc}
+
+        for rec in records:
+            collections_data = rec.get("data", {})
+            for col_name_in_rec, col_data in collections_data.items():
+                docs = col_data.get("documents", [])
+                if col_name_in_rec not in merged:
+                    merged[col_name_in_rec] = {}
+                for doc in docs:
+                    if not isinstance(doc, dict):
+                        continue
+                    doc_id = str(doc.get("_id", id(doc)))
+                    merged[col_name_in_rec][doc_id] = doc
+
+        # ── Package into ZIP ───────────────────────────────────────────────────
+        ts_str    = effective_end.strftime("%Y%m%d")
+        month_lbl = datetime(year, month, 1).strftime("%B_%Y")
+        filename  = f"{bot_name}_cluster_backup_{month_lbl}_till_{ts_str}.zip"
+
+        buf = io.BytesIO()
+        total_docs = 0
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for col_name_out, id_map in merged.items():
+                docs_list = list(id_map.values())
+                total_docs += len(docs_list)
+                payload = json.dumps(docs_list, default=str, indent=2, ensure_ascii=False)
+                zf.writestr(f"{col_name_out}.json", payload)
+
+            meta = {
+                "bot":            bot_name,
+                "month":          f"{year}-{month:02d}",
+                "records_merged": len(records),
+                "total_docs":     total_docs,
+                "cutoff_date":    effective_end.isoformat(),
+                "exported_at":    datetime.now(timezone.utc).isoformat(),
+                "note":           "Deduplicated merge of all daily snapshots in this month range.",
+            }
+            zf.writestr("_metadata.json", json.dumps(meta, indent=2))
+
+        buf.seek(0)
+        return buf.read(), filename
+
+    except Exception as e:
+        logger.error(f"[BACKUP] download_cluster_backup_for_month failed for {bot_name} {year}-{month}: {e}")
+        return None, None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BOT 3 CLUSTER BACKUP HELPERS
+# Strictly scoped: only read/write bot3_backups in MSANodeBackups.
+# Never touches bot1 or bot2 data.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def list_cluster_backups(
+    bot_name: str,
+    backup_mongo_uri: str,
+    backup_db_name: str = "MSANodeBackups",
+) -> list:
+    """
+    List all backup records for bot_name from MSANodeBackups cluster.
+    Returns sorted list (newest first) of metadata dicts:
+      {_id, backup_date, backup_type, window_key, docs, collections, gdrive_uploaded}
+    The heavy 'data' field is excluded for performance.
+    """
+    try:
+        bkp_client = _backup_mongo_client(backup_mongo_uri, serverSelectionTimeoutMS=10000)
+        bkp_db     = bkp_client[backup_db_name]
+        col_name   = f"bot{bot_name[-1]}_backups" if bot_name.startswith("bot") else "bot_backups"
+        bkp_col    = bkp_db[col_name]
+
+        records = list(
+            bkp_col.find(
+                {"bot": bot_name},
+                {"data": 0}   # exclude the heavy payload for listing
+            ).sort("backup_date", -1)
+        )
+        bkp_client.close()
+
+        # Convert ObjectId → str so it can be serialised / passed via FSM state
+        for r in records:
+            r["_id"] = str(r["_id"])
+
+        return records
+    except Exception as e:
+        logger.error(f"[BACKUP] list_cluster_backups failed for {bot_name}: {e}")
+        return []
+
+
+def download_cluster_backup(
+    backup_id: str,
+    bot_name: str,
+    backup_mongo_uri: str,
+    backup_db_name: str = "MSANodeBackups",
+) -> tuple:
+    """
+    Fetch one backup record by _id from MSANodeBackups, build an in-memory ZIP.
+    Returns: (zip_bytes: bytes, filename: str) or (None, None) on error.
+    Bot 3 data only — strictly isolated.
+    """
+    from bson import ObjectId
+    try:
+        bkp_client = _backup_mongo_client(backup_mongo_uri, serverSelectionTimeoutMS=10000)
+        bkp_db     = bkp_client[backup_db_name]
+        col_name   = f"bot{bot_name[-1]}_backups" if bot_name.startswith("bot") else "bot_backups"
+        bkp_col    = bkp_db[col_name]
+
+        record = bkp_col.find_one({"_id": ObjectId(backup_id), "bot": bot_name})
+        bkp_client.close()
+
+        if not record:
+            return None, None
+
+        collections = record.get("data", {})
+        ts_str      = record.get("window_key", datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S"))
+        filename    = f"bot3_backup_{ts_str}.zip"
+
+        buf = _build_zip_from_collections(bot_name, collections)
+        return buf.read(), filename
+
+    except Exception as e:
+        logger.error(f"[BACKUP] download_cluster_backup failed for {bot_name}/{backup_id}: {e}")
+        return None, None
+
+
+def gdrive_upload_cluster_backup(
+    backup_id: str,
+    bot_name: str,
+    backup_mongo_uri: str,
+    backup_db_name: str = "MSANodeBackups",
+    gdrive_folder_id: str = None,
+) -> dict:
+    """
+    Upload one MSANodeBackups record to Google Drive.
+    - On SUCCESS: marks gdrive_uploaded=True in the record. The existing 90-day TTL
+      index will naturally expire the record 90 days from backup_date.
+    - On FAILURE: leaves the record untouched. NEVER deletes on failure.
+    Returns: {status, zip_name, size_mb, file_id, message}
+    """
+    from bson import ObjectId
+    if gdrive_folder_id:
+        _folder = gdrive_folder_id
+    elif bot_name == "bot1":
+        _folder = _BOT1_GDRIVE_FOLDER_ID
+    elif bot_name == "bot2":
+        _folder = _BOT2_GDRIVE_FOLDER_ID
+    else:
+        _folder = _BOT3_GDRIVE_FOLDER_ID
+
+    try:
+        bkp_client = _backup_mongo_client(backup_mongo_uri, serverSelectionTimeoutMS=10000)
+        bkp_db     = bkp_client[backup_db_name]
+        col_name   = f"bot{bot_name[-1]}_backups" if bot_name.startswith("bot") else "bot_backups"
+        bkp_col    = bkp_db[col_name]
+
+        record = bkp_col.find_one({"_id": ObjectId(backup_id), "bot": bot_name})
+        if not record:
+            bkp_client.close()
+            return {"status": "error", "message": f"Backup record {backup_id} not found."}
+
+        collections = record.get("data", {})
+        ts_str      = record.get("window_key", datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S"))
+        zip_name    = f"gdrive_{bot_name}_{ts_str}.zip"
+
+        buf       = _build_zip_from_collections(bot_name, collections)
+        zip_bytes = buf.read()
+        size_mb   = len(zip_bytes) / (1024 * 1024)
+
+        # ── Upload to GDrive (duplicate guard) ────────────────────────────────
+        service = _get_gdrive_service()
+        if _gdrive_file_exists(service, zip_name, _folder):
+            bkp_client.close()
+            return {"status": "error", "message": f"File '{zip_name}' already exists in GDrive — skipped duplicate."}
+
+        file_id = _gdrive_upload_bytes(service, zip_bytes, zip_name, _folder)
+
+        # ── Mark uploaded in the record (TTL index handles 90-day cleanup) ───
+        bkp_col.update_one(
+            {"_id": ObjectId(backup_id)},
+            {"$set": {"gdrive_uploaded": True, "gdrive_file_id": file_id, "gdrive_uploaded_at": datetime.now(timezone.utc)}}
+        )
+        bkp_client.close()
+
+        return {
+            "status":   "success",
+            "zip_name": zip_name,
+            "size_mb":  size_mb,
+            "file_id":  file_id,
+            "message":  f"Uploaded {zip_name} ({size_mb:.2f} MB) — record marked for 90-day TTL cleanup.",
+        }
+
+    except Exception as e:
+        logger.error(f"[BACKUP] gdrive_upload_cluster_backup failed for {bot_name}/{backup_id}: {e}")
+        return {"status": "error", "message": str(e)}
+
+
+def _log_present_gdrive(bot_name: str, zip_name: str, deleted_count: int, backup_mongo_uri: str, backup_db_name: str):
+    """Write a history entry for the present GDrive upload (legacy — backup cluster)."""
+    try:
+        bkp_client = _backup_mongo_client(backup_mongo_uri, serverSelectionTimeoutMS=6000)
+        bkp_db     = bkp_client[backup_db_name]
+        history_col = bkp_db["bot_backup_history"]
+        history_col.insert_one({
+            "bot":         bot_name,
+            "action":      "Gdrive Upload Present",
+            "status":      "success",
+            "message":     f"Uploaded {zip_name} to GDrive. Deleted {deleted_count} records from {backup_db_name}.",
+            "backup_date": datetime.now(timezone.utc),
+        })
+        bkp_client.close()
+    except Exception:
+        pass
+
+
+def _log_present_gdrive_prod(bot_name: str, zip_name: str, doc_count: int, prod_mongo_uri: str, prod_db_name: str):
+    """Write a history entry for the present GDrive upload (production DB path)."""
+    try:
+        prod_client = MongoClient(prod_mongo_uri, serverSelectionTimeoutMS=6000)
+        prod_db     = prod_client[prod_db_name]
+        history_col = prod_db["bot_backup_history"]
+        history_col.insert_one({
+            "bot":         bot_name,
+            "action":      "Gdrive Upload Present",
+            "status":      "success",
+            "message":     f"Uploaded {zip_name} to GDrive ({doc_count:,} docs from production). Data untouched.",
+            "backup_date": datetime.now(timezone.utc),
+        })
+        prod_client.close()
+    except Exception:
+        pass
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# AUTO-SCHEDULERS — Async background tasks registered at bot startup
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _save_local_daily_backup(bot_name: str, prod_db, now: datetime):
+    """
+    Save daily JSON export to local folder hierarchy:
+    _LOCAL_ROOT/<bot>/<year>/<Month Year>/Week <1-5>/<YYYY-MM-DD>/
+
+    Weeks are week-of-month (not ISO year-week):
+      Week 1 = days  1–7
+      Week 2 = days  8–14
+      Week 3 = days 15–21
+      Week 4 = days 22–28
+      Week 5 = days 29–31  (months with 29/30/31 days)
+    """
+    try:
+        year     = str(now.year)
+        month    = now.strftime("%B %Y")          # e.g. "March 2026"
+        week_num = (now.day - 1) // 7 + 1        # week-of-month: 1..5
+        day      = now.strftime("%Y-%m-%d")
+
+        day_dir = os.path.join(_LOCAL_ROOT, bot_name, year, month, f"Week {week_num}", day)
+        os.makedirs(day_dir, exist_ok=True)
+
+        collections = _export_bot_collections(prod_db, bot_name)
+        for col_name, col_data in collections.items():
+            docs = col_data.get("documents", [])
+            if docs:
+                fpath = os.path.join(day_dir, f"{col_name}.json")
+                with open(fpath, "w", encoding="utf-8") as f:
+                    json.dump(docs, f, default=str, indent=2, ensure_ascii=False)
+
+        logger.info(f"[BACKUP] Daily local export saved: {day_dir}")
+    except Exception as e:
+        logger.error(f"[BACKUP] _save_local_daily_backup failed for {bot_name}: {e}")
+
+
+def _upsert_cluster_snapshot(bot_name: str, prod_db, bkp_db, now: datetime):
+    """Upsert today's snapshot into the MSANodeBackups cluster (single doc per day per bot)."""
+    try:
+        bot_num  = bot_name[-1]
+        bkp_col  = bkp_db[f"bot{bot_num}_backups"]
+        _ensure_ttl_index(bkp_col)
+
+        day_key     = now.strftime("%Y-%m-%d")
+        collections = _export_bot_collections(prod_db, bot_name)
+        doc_count   = sum(v.get("count", 0) for v in collections.values())
+
+        bkp_col.update_one(
+            {"bot": bot_name, "window_key": day_key},
+            {
+                "$set": {
+                    "bot":         bot_name,
+                    "window_key":  day_key,
+                    "backup_date": now,
+                    "backup_type": "daily",
+                    "docs":        doc_count,
+                    "data":        collections,
+                }
+            },
+            upsert=True
+        )
+        logger.info(f"[BACKUP] Cluster snapshot upserted: {bot_name} {day_key} ({doc_count} docs)")
+    except Exception as e:
+        logger.error(f"[BACKUP] _upsert_cluster_snapshot failed for {bot_name}: {e}")
+
+
+async def weekly_backup_scheduler(
+    bot_instance,
+    bot_name: str,
+    owner_id: int,
+    mongo_uri: str,
+    db_name: str,
+    backup_mongo_uri: str = None,
+    backup_db_name: str = "MSANodeBackups",
+):
+    """
+    Weekly backup — runs every Sunday at 23:59 UTC (and a lightweight daily at 23:59 every night).
+    Reads from PROD (mongo_uri/db_name), writes to BACKUP cluster.
+    Also saves local JSON hierarchy daily.
+    Auto-restarts on crash with owner Telegram alert.
+    """
+    _write_uri = backup_mongo_uri or mongo_uri
+    _write_db  = backup_db_name if backup_mongo_uri else db_name
+
+    while True:
+        try:
+            while True:
+                now = datetime.now(timezone.utc)
+
+                # ── Next 23:59 UTC (daily for local export + cluster upsert) ──
+                next_run = now.replace(hour=23, minute=59, second=0, microsecond=0)
+                if next_run <= now:
+                    next_run += timedelta(days=1)
+
+                wait_seconds = (next_run - now).total_seconds()
+                if wait_seconds > 0:
+                    await asyncio.sleep(wait_seconds)
+
+                # ── RUN DAILY BACKUP ──────────────────────────────────────────
+                try:
+                    run_now    = datetime.now(timezone.utc)
+                    prod_client = MongoClient(mongo_uri, serverSelectionTimeoutMS=10000)
+                    bkp_client  = _backup_mongo_client(_write_uri)
+                    prod_db     = prod_client[db_name]
+                    bkp_db      = bkp_client[_write_db]
+
+                    # Save to local folder (skipped on Render — ephemeral disk)
+                    if not _IS_RENDER:
+                        _save_local_daily_backup(bot_name, prod_db, run_now)
+                    else:
+                        logger.info(f"[BACKUP] Render detected — skipping local disk write for {bot_name}")
+
+                    # Upsert to cluster (every day)
+                    _upsert_cluster_snapshot(bot_name, prod_db, bkp_db, run_now)
+
+                    prod_client.close()
+
+                    # ── Monthly: last day of month → also build month ZIP ─────
+                    _, last_day = monthrange(run_now.year, run_now.month)
+                    if run_now.day == last_day:
+                        await _auto_monthly_zip_and_gdrive(
+                            bot_name         = bot_name,
+                            now              = run_now,
+                            bot_instance     = bot_instance,
+                            owner_id         = owner_id,
+                            backup_mongo_uri = backup_mongo_uri,
+                            backup_db_name   = backup_db_name,
+                        )
+
+                    is_sunday = run_now.weekday() == 6  # 6 = Sunday
+                    period    = "weekly" if is_sunday else "daily"
+                    col_count = len(_BOT_COLLECTIONS.get(bot_name, []))
+                    bkp_client.close()
+
+                    await bot_instance.send_message(
+                        chat_id=owner_id,
+                        text=(
+                            f"✅ <b>{'Weekly' if is_sunday else 'Daily'} Backup</b> — <code>{bot_name}</code>\n"
+                            f"📅 {run_now.strftime('%B %d, %Y — %I:%M %p UTC')}\n"
+                            f"📂 Local folder saved\n"
+                            f"🗄️ Cluster snapshot upserted\n"
+                            f"🕐 TTL: 90 days on cluster"
+                        ),
+                        parse_mode="HTML"
+                    )
+
+                except Exception as e:
+                    logger.error(f"[BACKUP] Daily run failed for {bot_name}: {e}")
+                    try:
+                        await bot_instance.send_message(
+                            chat_id=owner_id,
+                            text=f"❌ <b>Daily backup FAILED</b> — <code>{bot_name}</code>\n<code>{str(e)[:300]}</code>",
+                            parse_mode="HTML"
+                        )
+                    except Exception:
+                        pass
+
+                await asyncio.sleep(60)  # avoid double-run
+
+        except asyncio.CancelledError:
+            logger.info(f"[BACKUP] weekly_backup_scheduler cancelled for {bot_name}")
+            return
+        except Exception as crash_err:
+            logger.error(f"[BACKUP] weekly_backup_scheduler CRASHED for {bot_name}: {crash_err}")
+            try:
+                await bot_instance.send_message(
+                    chat_id=owner_id,
+                    text=f"⚠️ <b>Backup scheduler CRASHED</b> — <code>{bot_name}</code>\nAuto-restarting in 5 min.\n<code>{str(crash_err)[:200]}</code>",
+                    parse_mode="HTML"
+                )
+            except Exception:
+                pass
+            await asyncio.sleep(300)
+
+
+async def _auto_monthly_zip_and_gdrive(
+    bot_name: str,
+    now: datetime,
+    bot_instance,
+    owner_id: int,
+    backup_mongo_uri: str = None,
+    backup_db_name: str = "MSANodeBackups",
+):
+    """
+    Called automatically on the last day of the month at 23:59 UTC.
+
+    AUTO SUCCESS path:
+      - Uploads local month folder to GDrive (cutoff = now = last day of month = full month)
+      - Immediately auto-applies 90-day TTL flag on MSANodeBackups records
+      - Sends a full success report to owner
+
+    AUTO FAILURE path:
+      - Sends a failure report with error details
+      - Instructs owner to retry manually via ☁️ GDRIVE SYSTEM
+      - In the manual retry, the TTL confirm button will appear (user decides)
+      - Local data is NEVER deleted on failure
+    """
+    month_label = now.strftime("%B %Y")   # e.g. "March 2026"
+    year        = str(now.year)
+    month_dir   = os.path.join(_LOCAL_ROOT, bot_name, year, month_label)
+
+    if not os.path.isdir(month_dir):
+        logger.warning(f"[BACKUP] Auto monthly GDrive: folder not found for {bot_name} {month_label}")
+        try:
+            await bot_instance.send_message(
+                chat_id=owner_id,
+                text=(
+                    f"⚠️ <b>Auto Monthly GDrive — {bot_name}</b>\n\n"
+                    f"📅 {month_label}\n"
+                    f"❌ <b>Local folder not found.</b>\n"
+                    f"Path: <code>{month_dir}</code>\n\n"
+                    f"Possible cause: no daily backups ran this month."
+                ),
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass
+        return
+
+    try:
+        # ── Upload via the shared monthly_gdrive_upload (cutoff = now = full month) ──
+        res = monthly_gdrive_upload(
+            bot_name         = bot_name,
+            month_label      = month_label,
+            mongo_uri        = "",          # not used in upload-only path
+            backup_mongo_uri = backup_mongo_uri,
+            backup_db_name   = backup_db_name,
+            cutoff_date      = now,         # last day of month = complete month upload
+        )
+
+        if res.get("status") != "success":
+            raise RuntimeError(res.get("message", "Unknown upload error"))
+
+        file_id    = res["file_id"]
+        zip_name   = res["zip_name"]
+        size_mb    = res.get("size_mb", 0)
+        weeks      = ", ".join(res.get("weeks_included", [])) or "—"
+        days       = res.get("days_count", 0)
+        cutoff_str = res.get("cutoff_str", now.strftime("%Y-%m-%d"))
+
+        # ── AUTO-APPLY 90-day TTL flag on MSANodeBackups (no user confirmation needed) ──
+        ttl_updated = 0
+        ttl_status  = "⚠️ TTL flag skipped (no backup_mongo_uri)"
+        if backup_mongo_uri:
+            ttl_res = apply_gdrive_ttl_flag(
+                bot_name         = bot_name,
+                file_id          = file_id,
+                backup_mongo_uri = backup_mongo_uri,
+                backup_db_name   = backup_db_name,
+                cutoff_str       = cutoff_str,
+            )
+            if ttl_res.get("status") == "ok":
+                ttl_updated = ttl_res.get("updated_count", 0)
+                ttl_status  = f"✅ {ttl_updated} record(s) flagged (auto-expire in 90 days)"
+            else:
+                ttl_status  = f"⚠️ TTL flag failed: {ttl_res.get('message', 'unknown')}"
+
+        logger.info(f"[BACKUP] Auto monthly GDrive SUCCESS: {bot_name} {month_label} — {size_mb:.2f}MB | TTL: {ttl_updated}")
+
+        # ── Send full success report ───────────────────────────────────────
+        await bot_instance.send_message(
+            chat_id=owner_id,
+            text=(
+                f"☁️ <b>Auto Monthly GDrive — SUCCESS</b>\n\n"
+                f"🤖 <b>Bot:</b> {bot_name.upper()}\n"
+                f"📅 <b>Month:</b> {month_label}\n"
+                f"📆 <b>Data up to:</b> {cutoff_str}\n"
+                f"📊 <b>Weeks:</b> {weeks}\n"
+                f"🗂 <b>Days:</b> {days}\n"
+                f"📦 <b>File:</b> <code>{zip_name}</code>\n"
+                f"💾 <b>Size:</b> {size_mb:.2f} MB\n"
+                f"🗂️ <b>GDrive ID:</b> <code>{file_id}</code>\n\n"
+                f"🗑️ <b>Auto-deletion:</b> {ttl_status}\n"
+                f"🔒 Main DB untouched."
+            ),
+            parse_mode="HTML"
+        )
+
+    except Exception as gdrive_err:
+        logger.error(f"[BACKUP] Auto monthly GDrive FAILED for {bot_name}: {gdrive_err}")
+
+        # ── Send failure report — guide user to manual retry ───────────────
+        try:
+            await bot_instance.send_message(
+                chat_id=owner_id,
+                text=(
+                    f"❌ <b>Auto Monthly GDrive — FAILED</b>\n\n"
+                    f"🤖 <b>Bot:</b> {bot_name.upper()}\n"
+                    f"📅 <b>Month:</b> {month_label}\n\n"
+                    f"<b>Error:</b>\n<code>{str(gdrive_err)[:300]}</code>\n\n"
+                    f"─────────────────────────────\n"
+                    f"✅ <b>Your local backup data is safe.</b>\n"
+                    f"⚠️ <b>90-day auto-deletion was NOT applied</b> (upload failed).\n\n"
+                    f"📋 <b>To retry manually:</b>\n"
+                    f"  1. Open the bot → <b>Backup Menu</b>\n"
+                    f"  2. Tap <b>☁️ GDRIVE SYSTEM</b>\n"
+                    f"  3. Select <b>{bot_name.upper()}</b> → pick <b>{month_label}</b>\n"
+                    f"  4. After upload succeeds, you'll be asked whether to apply\n"
+                    f"     auto-deletion for the uploaded records.\n\n"
+                    f"🔒 Main DB untouched."
+                ),
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass
+
+
+
+
+async def monthly_export_scheduler(
+    bot_instance,
+    bot_name: str,
+    owner_id: int,
+    mongo_uri: str,
+    db_name: str,
+    backup_mongo_uri: str = None,
+    backup_db_name: str = "MSANodeBackups",
+):
+    """
+    Monthly export scheduler — kept for compatibility.
+    The actual monthly export logic is now embedded in weekly_backup_scheduler
+    (triggered on the last day of month).
+    This function is a no-op loop to prevent ImportError.
+    """
+    logger.info(f"[BACKUP] monthly_export_scheduler started for {bot_name} (handled by weekly_backup_scheduler)")
+    while True:
+        try:
+            await asyncio.sleep(86400)  # sleep 24h, do nothing (handled by weekly_backup_scheduler)
+        except asyncio.CancelledError:
+            logger.info(f"[BACKUP] monthly_export_scheduler cancelled for {bot_name}")
+            return
+        except Exception:
+            await asyncio.sleep(3600)
+
 
 # Helper function for retry logic with exponential backoff
 async def retry_operation(operation, max_retries=3, base_delay=1.0, operation_name="operation"):
@@ -91,8 +1360,6 @@ async def retry_operation(operation, max_retries=3, base_delay=1.0, operation_na
     # If we get here, all retries failed
     raise last_exception
 
-# Load environment variables
-load_dotenv("bot2.env", override=True)
 BOT_TOKEN = os.getenv("BOT_2_TOKEN")
 BOT_1_TOKEN = os.getenv("BOT_1_TOKEN")  # Bot 1 for delivery
 MASTER_ADMIN_ID = int(os.getenv("MASTER_ADMIN_ID", "0"))
@@ -118,7 +1385,8 @@ if not BACKUP_MONGO_URI:
 # ==========================================
 _WEBHOOK_BASE_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
 _WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
-_WEBHOOK_URL = f"{_WEBHOOK_BASE_URL}{_WEBHOOK_PATH}" if _WEBHOOK_BASE_URL else ""
+# Only set Webhook URL if we are actually running on Render, preventing local polling clash
+_WEBHOOK_URL = f"{_WEBHOOK_BASE_URL}{_WEBHOOK_PATH}" if (_WEBHOOK_BASE_URL and _IS_RENDER) else ""
 
 # Validate critical config at startup
 if not BOT_TOKEN:
@@ -8802,7 +10070,7 @@ async def backup_handler(message: types.Message, state: FSMContext):
     b1_months: list = []
     b2_months: list = []
     try:
-        from backup_schedulers import list_available_local_backups
+
         b1_months = list_available_local_backups("bot1")
         b2_months = list_available_local_backups("bot2")
     except Exception:
@@ -9100,7 +10368,7 @@ async def force_backup_now(message: types.Message, state: FSMContext):
         parse_mode="HTML", reply_markup=get_backup_menu()
     )
     try:
-        from backup_schedulers import force_backup_to_cluster
+
         loop = asyncio.get_event_loop()
 
         # Run Bot 1 and Bot 2 backups sequentially (sync functions in executor)
@@ -9123,7 +10391,7 @@ async def force_backup_now(message: types.Message, state: FSMContext):
         # Also write restore snapshots so RESTORE DATA works immediately
         def _write_restore_snapshots():
             from pymongo import MongoClient
-            from backup_schedulers import _export_bot_collections, _backup_mongo_client
+
             import certifi
             prod_client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=10000)
             bkp_client  = _backup_mongo_client(BACKUP_MONGO_URI or MONGO_URI)
@@ -9234,7 +10502,7 @@ async def download_backup_bot_selected(message: types.Message, state: FSMContext
 
     # ── BOT 1: existing present/local flow (unchanged) ─────────────────────
     if bot_id == "bot1":
-        from backup_schedulers import list_available_local_backups
+
         months = list_available_local_backups(bot_id)
         dataset_map = {"1": "present"}
         lines = f"💾 <b>SELECT DATASET — BOT 1</b>\n\n"
@@ -9342,7 +10610,7 @@ async def download_backup_execute(message: types.Message, state: FSMContext):
     format_name = 'ZIP' if is_zip else 'JSON'
     status = await message.answer(f"⏳ <b>Generating {bot_id.upper()} {format_name} backup...</b>\n\nDataset: <code>{target}</code>", parse_mode="HTML", reply_markup=get_backup_menu())
     
-    from backup_schedulers import create_manual_zip, _export_bot_collections, _LOCAL_ROOT
+
     from aiogram.types import BufferedInputFile
     import json, os, io, zipfile
     from datetime import timezone, datetime
@@ -9426,7 +10694,7 @@ async def download_backup_execute(message: types.Message, state: FSMContext):
         if target == "present":
             col_to_update = col_bot1_backups if bot_id == "bot1" else col_bot2_backups
             try:
-                from backup_schedulers import _ensure_ttl_index
+
                 _ensure_ttl_index(col_to_update)
                 col_to_update.update_one(
                     {"window_key": ts, "bot": bot_id},
@@ -9474,7 +10742,7 @@ async def _send_cluster_month_page(
     page: int,
 ):
     """Fetch available months from MSANodeBackups and show page N (0-indexed)."""
-    from backup_schedulers import list_cluster_backup_months
+
 
     loading = await message.answer(
         f"⏳ <b>Loading available backups for {bot_id.upper()}...</b>",
@@ -9636,7 +10904,7 @@ async def cluster_dl_execute(message: types.Message, state: FSMContext):
         parse_mode="HTML", reply_markup=get_backup_menu()
     )
 
-    from backup_schedulers import download_cluster_backup_for_month
+
     from aiogram.types import BufferedInputFile
     loop = asyncio.get_event_loop()
 
@@ -9737,7 +11005,7 @@ async def monthly_status_display(message: types.Message, state: FSMContext):
         await message.answer("Please choose Bot 1 or Bot 2.")
         return
 
-    from backup_schedulers import list_available_local_backups
+
     months = list_available_local_backups(bot_key)
 
     def months_list(m_list):
@@ -10211,7 +11479,7 @@ async def upload_data_process_file(message: types.Message, state: FSMContext):
             db_label      = "MSANodeDB (Production)"
         else:
             # Use certifi-backed client to avoid Atlas TLS handshake failures
-            from backup_schedulers import _backup_mongo_client
+
             target_client = _backup_mongo_client(
                 BACKUP_MONGO_URI or MONGO_URI,
                 serverSelectionTimeoutMS=10000
@@ -10551,24 +11819,8 @@ async def gdrive_bot_select_handler(message: types.Message, state: FSMContext):
 
     # Now get monthly groups
     try:
-        from backup_manager import BackupManager
-        bm = BackupManager(bot_key)
-        
-        # Get unique months across DB collections for the chosen bot
-        colls = backup_db.list_collection_names()
-        prefix = f"data_{bot_key}_"
-        bot_colls = sorted([c for c in colls if c.startswith(prefix)])
-        
-        months_set = set()
-        for c in bot_colls:
-            parts = c.split('_')
-            # format: data_bot1_2026_March_users
-            if len(parts) >= 4:
-                year = parts[2]
-                month = parts[3]
-                months_set.add(f"{year}_{month}")
-                
-        months = sorted(list(months_set), reverse=True)
+        months = list_available_local_backups(bot_key)
+        months.sort(reverse=True)
         
         if not months:
             await message.answer(f"No structured monthly backups found for {bot_key.upper()} in MSANodeBackups.", reply_markup=get_backup_menu())
@@ -10627,7 +11879,7 @@ async def gdrive_monthly_execute(message: types.Message, state: FSMContext):
         parse_mode="HTML"
     )
 
-    from backup_schedulers import monthly_gdrive_upload
+
     from datetime import datetime, timezone as _tz2
     loop = asyncio.get_event_loop()
     now_utc = datetime.now(_tz2.utc)
@@ -10750,7 +12002,7 @@ async def gdrive_ttl_confirm_handler(message: types.Message, state: FSMContext):
             parse_mode="HTML"
         )
 
-        from backup_schedulers import apply_gdrive_ttl_flag
+
         loop = asyncio.get_event_loop()
 
         def _apply():
@@ -15595,7 +16847,7 @@ async def _check_gdrive_token_startup():
     try:
         loop = asyncio.get_event_loop()
         def _check():
-            from backup_schedulers import _get_gdrive_service
+
             _get_gdrive_service()
         await loop.run_in_executor(None, _check)
         print("✅ GDrive token valid — ☁️ GDRIVE SYSTEM ready")
@@ -15804,7 +17056,8 @@ async def main():
             await asyncio.Event().wait()
         else:
             # ── POLLING MODE (local dev fallback) ───────────────────────────
-            print("ℹ️ No RENDER_EXTERNAL_URL — using polling (local dev mode)")
+            print("ℹ️ Using polling (local dev mode)")
+            await bot.delete_webhook(drop_pending_updates=True)
             await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
     except Exception as e:
