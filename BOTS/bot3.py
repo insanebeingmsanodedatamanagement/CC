@@ -19,7 +19,6 @@ from aiogram.filters import Command, StateFilter
 from aiogram.types import ReplyKeyboardMarkup, ReplyKeyboardRemove, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from dotenv import load_dotenv
 import pymongo
 from pymongo import MongoClient
 from pymongo.errors import ServerSelectionTimeoutError, ConnectionFailure, DuplicateKeyError
@@ -45,7 +44,6 @@ else:
     ENV_FILE_CANDIDATES = ("bot3.env", "bot3.env.txt", "BOT3.env", ".env")
 
 ACTIVE_ENV_FILE = next((p for p in ENV_FILE_CANDIDATES if os.path.exists(p)), "BOT3.env")
-load_dotenv(ACTIVE_ENV_FILE, override=True)
 
 # ==========================================
 # ENTERPRISE CONFIGURATION
@@ -65,7 +63,8 @@ health_server_runner = None
 # ==========================================
 # 🌐 WEBHOOK CONFIGURATION
 # ==========================================
-_WEBHOOK_BASE_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
+_IS_RENDER = os.environ.get("RENDER", "").lower() in ("true", "1", "yes")
+_WEBHOOK_BASE_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/") if _IS_RENDER else ""
 _WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
 _WEBHOOK_URL = f"{_WEBHOOK_BASE_URL}{_WEBHOOK_PATH}" if _WEBHOOK_BASE_URL else ""
 
@@ -1273,20 +1272,785 @@ class Bot3BackupStates(StatesGroup):
     # 📊 BACKUP STATUS
     status_viewing        = State()
     # 💾 DOWNLOAD BACKUP
-    dl_month_select       = State()  # show indexed month list
-    dl_format_select      = State()  # JSON or ZIP
+    dl_month_select       = State()
+    dl_format_select      = State()
     # 📤 UPLOAD BACKUP
-    upload_db_choice      = State()  # Main DB or Backup DB
-    upload_file_wait      = State()  # waiting for file
+    upload_db_choice      = State()
+    upload_file_wait      = State()
     # 📜 BACKUP HISTORY
     history_viewing       = State()
     # ☁️ GDRIVE SYSTEM
-    gdrive_month_select   = State()  # indexed month picker
-    gdrive_ttl_confirm    = State()  # full-month → ask 90-day TTL
+    gdrive_month_select   = State()
+    gdrive_ttl_confirm    = State()
+    # ⏱️ ACTIVE DELETION
+    active_del_list       = State()
+    active_del_action     = State()
     # 🗑️ RESET BACKUP DATA
     reset_target_select   = State()
-    reset_confirm1        = State()  # type CONFIRM
-    reset_confirm2        = State()  # type DELETE
+    reset_confirm1        = State()
+    reset_confirm2        = State()
+
+# =============================================================================
+# 💾 BOT 3 BACKUP SYSTEM — Complete Handlers (No duplicates)
+# Helpers → Download → Upload → History → GDrive → Active Deletion
+# =============================================================================
+
+async def _b3_send_paged(message, text, reply_markup=None, parse_mode="HTML"):
+    """Auto-split and send messages that exceed Telegram's 4096 char limit."""
+    MAX = 4000
+    if len(text) <= MAX:
+        await message.answer(text, parse_mode=parse_mode, reply_markup=reply_markup)
+        return
+    parts = []
+    while text:
+        if len(text) <= MAX:
+            parts.append(text); break
+        cut = text.rfind('\n', 0, MAX)
+        if cut == -1: cut = MAX
+        parts.append(text[:cut])
+        text = text[cut:].lstrip('\n')
+    for i, part in enumerate(parts):
+        kb = reply_markup if i == len(parts) - 1 else None
+        await message.answer(part, parse_mode=parse_mode, reply_markup=kb)
+
+
+def _b3_group_backups(records, current_date):
+    """
+    Groups daily backup documents into UI chunks:
+      - Past months  → one chunk per month (Full Month)
+      - Current month → one chunk per 7-day week (Week 1..5)
+    Returns list of (key, label, docs_list, is_full_month)  newest-first.
+    """
+    import calendar as _cal
+    groups = {}
+    for r in records:
+        dt = r.get("backup_date")
+        if not dt:
+            continue
+        is_past = (dt.year < current_date.year or
+                   (dt.year == current_date.year and dt.month < current_date.month))
+        if is_past:
+            k   = f"{dt.year}_{dt.month:02d}_FULL"
+            lbl = f"{dt.year} {dt.strftime('%B')} (Full Month)"
+        else:
+            w   = min((dt.day - 1) // 7 + 1, 5)
+            k   = f"{dt.year}_{dt.month:02d}_W{w}"
+            s_d = (w - 1) * 7 + 1
+            e_d = _cal.monthrange(dt.year, dt.month)[1] if w == 5 else w * 7
+            lbl = f"{dt.year} {dt.strftime('%B')} (Week {w}: {s_d}–{e_d})"
+        if k not in groups:
+            groups[k] = {"label": lbl, "docs": [], "is_full": is_past}
+        groups[k]["docs"].append(r)
+    sorted_keys = sorted(groups.keys(), reverse=True)
+    return [(k, groups[k]["label"], groups[k]["docs"], groups[k]["is_full"])
+            for k in sorted_keys]
+
+
+# =============================================================================
+# 💾 DOWNLOAD BACKUP — Hierarchical Month/Week list → structured ZIP
+# =============================================================================
+
+@dp.message(F.text == "💾 DOWNLOAD BACKUP", StateFilter(None, BackupStates.viewing_backup_menu))
+async def bot3_dl_backup_start(message: types.Message, state: FSMContext):
+    """Show structured grouped list of backup chunks from cluster."""
+    if not await check_authorization(message, "Download Backup", "can_manage_admins"): return
+    await state.clear()
+    loading = await message.answer("⏳ Loading available backups...")
+    try:
+        loop = asyncio.get_event_loop()
+        records = await loop.run_in_executor(
+            None, lambda: list(col_bot3_backups.find(
+                {}, {"backup_date": 1, "backup_type": 1, "docs": 1}
+            ).sort("backup_date", -1))
+        )
+        try: await loading.delete()
+        except: pass
+
+        if not records:
+            await message.answer(
+                "📦 <b>DOWNLOAD BACKUP — Bot 3</b>\n\n"
+                "❌ No snapshots found in backup cluster yet.\n"
+                "The daily auto-backup runs at <b>23:59 UTC</b> every night.",
+                reply_markup=get_backup_menu(), parse_mode="HTML"
+            )
+            return
+
+        chunks = _b3_group_backups(records, now_local())
+        text   = "📦 <b>DOWNLOAD BACKUP — Bot 3</b>\n<i>Select a time period by number:</i>\n" + "─" * 28 + "\n\n"
+        chunk_ids = []
+
+        for i, (k, lbl, docs, is_full) in enumerate(chunks, 1):
+            dates = [d["backup_date"] for d in docs if d.get("backup_date")]
+            if dates:
+                latest = max(dates)
+                latest_str = latest.strftime("%d %b %Y %I:%M %p")
+                earliest   = min(dates)
+                earliest_str = earliest.strftime("%d %b %Y")
+            else:
+                latest_str = earliest_str = "Unknown"
+            ttl_cnt = sum(1 for d in docs if "ttl_date" in d)
+            ttl_ico = "🗑️" if ttl_cnt > 0 else "🔒"
+            text += (
+                f"{i}. <b>{lbl}</b>\n"
+                f"   📅 {earliest_str} → {latest_str}\n"
+                f"   📦 {len(docs)} snapshot(s)  {ttl_ico} TTL: {ttl_cnt}/{len(docs)}\n\n"
+            )
+            chunk_ids.append([str(d["_id"]) for d in docs])
+
+        text += f"<i>Type a number (1–{len(chunks)}) or ❌ CANCEL</i>"
+
+        await state.update_data(b3_dl_chunks=chunk_ids, b3_dl_labels=[c[1] for c in chunks])
+        await state.set_state(Bot3BackupStates.dl_month_select)
+        await _b3_send_paged(
+            message, text,
+            reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="❌ CANCEL")]], resize_keyboard=True)
+        )
+    except Exception as e:
+        try: await loading.delete()
+        except: pass
+        await message.answer(f"❌ Error:\n<code>{str(e)[:300]}</code>", reply_markup=get_backup_menu(), parse_mode="HTML")
+
+
+@dp.message(Bot3BackupStates.dl_month_select)
+async def bot3_dl_backup_month_chosen(message: types.Message, state: FSMContext):
+    if not await check_authorization(message, "Download Select", "can_manage_admins"): return
+    if message.text and "CANCEL" in message.text.upper():
+        await state.clear(); return await message.answer("Cancelled.", reply_markup=get_backup_menu())
+
+    data   = await state.get_data()
+    chunks = data.get("b3_dl_chunks", [])
+    labels = data.get("b3_dl_labels", [])
+    count  = len(chunks)
+    txt    = (message.text or "").strip()
+    if not txt.isdigit() or not (1 <= int(txt) <= count):
+        return await message.answer(f"❌ Enter a number between 1 and {count}.")
+
+    idx = int(txt) - 1
+    await state.update_data(b3_dl_selected_docs=chunks[idx], b3_dl_selected_label=labels[idx])
+    await state.set_state(Bot3BackupStates.dl_format_select)
+    kb = ReplyKeyboardMarkup(keyboard=[
+        [KeyboardButton(text="🗜 ZIP (Structured)"), KeyboardButton(text="📄 JSON (Flat)")],
+        [KeyboardButton(text="❌ CANCEL")]
+    ], resize_keyboard=True)
+    await message.answer(
+        f"📦 Selected: <b>{labels[idx]}</b>\nChoose download format:",
+        reply_markup=kb, parse_mode="HTML"
+    )
+
+
+@dp.message(Bot3BackupStates.dl_format_select)
+async def bot3_dl_backup_format_chosen(message: types.Message, state: FSMContext):
+    if not await check_authorization(message, "Download Format", "can_manage_admins"): return
+    if message.text and "CANCEL" in message.text.upper():
+        await state.clear(); return await message.answer("Cancelled.", reply_markup=get_backup_menu())
+    if message.text not in ("🗜 ZIP (Structured)", "📄 JSON (Flat)"):
+        return await message.answer("Please choose ZIP or JSON.")
+
+    use_zip = message.text == "🗜 ZIP (Structured)"
+    data    = await state.get_data()
+    doc_ids = data.get("b3_dl_selected_docs", [])
+    label   = data.get("b3_dl_selected_label", "backup")
+    await state.clear()
+
+    loading = await message.answer("⏳ Generating download file...", reply_markup=get_backup_menu())
+    try:
+        loop = asyncio.get_event_loop()
+        buf  = io.BytesIO()
+
+        if use_zip:
+            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                for doc_id in doc_ids:
+                    doc = await loop.run_in_executor(None, lambda i=doc_id: col_bot3_backups.find_one({"_id": ObjectId(i)}))
+                    if not doc: continue
+                    dt = doc.get("backup_date")
+                    if not dt: continue
+                    c_data = doc.get("data", {})
+                    w = min((dt.day - 1) // 7 + 1, 5)
+                    # Strict hierarchy: YYYY/Month/Week N/YYYY-MM-DD_DayName.json
+                    path = f"{dt.strftime('%Y')}/{dt.strftime('%B')}/Week {w}/{dt.strftime('%Y-%m-%d_%A')}.json"
+                    out  = {cn: (cd.get("documents", []) if isinstance(cd, dict) else cd)
+                            for cn, cd in c_data.items()}
+                    zf.writestr(path, json.dumps(out, default=str, indent=2, ensure_ascii=False))
+            buf.seek(0)
+            safe = label.replace(" ", "_").replace("(", "").replace(")", "").replace("–", "-")
+            fname = f"Bot3_{safe}.zip"
+            await message.answer_document(
+                types.BufferedInputFile(buf.read(), filename=fname),
+                caption=(
+                    f"✅ <b>Bot 3 Backup — {label}</b>\n"
+                    f"📦 ZIP with hierarchical structure:\n"
+                    f"<code>YYYY/Month/Week N/YYYY-MM-DD_Day.json</code>\n"
+                    f"📄 {len(doc_ids)} daily snapshot(s) included."
+                ),
+                parse_mode="HTML"
+            )
+        else:
+            combined = {}
+            for doc_id in doc_ids:
+                doc = await loop.run_in_executor(None, lambda i=doc_id: col_bot3_backups.find_one({"_id": ObjectId(i)}))
+                if not doc: continue
+                dt = doc.get("backup_date")
+                key = dt.strftime("%Y-%m-%d") if dt else str(doc_id)
+                combined[key] = {cn: (cd.get("documents", []) if isinstance(cd, dict) else cd)
+                                 for cn, cd in doc.get("data", {}).items()}
+            buf = io.BytesIO(json.dumps(combined, default=str, indent=2, ensure_ascii=False).encode())
+            safe = label.replace(" ", "_").replace("(", "").replace(")", "").replace("–", "-")
+            fname = f"Bot3_{safe}.json"
+            await message.answer_document(
+                types.BufferedInputFile(buf.read(), filename=fname),
+                caption=f"✅ <b>Bot 3 Backup — {label}</b>\n📄 JSON | {len(doc_ids)} snapshots",
+                parse_mode="HTML"
+            )
+        try: await loading.delete()
+        except: pass
+    except Exception as e:
+        await loading.edit_text(f"❌ Download failed:\n<code>{str(e)[:300]}</code>", parse_mode="HTML")
+
+
+# =============================================================================
+# 📤 UPLOAD DATA — Strict target selection, upsert-based, no DB mixing
+# =============================================================================
+
+@dp.message(F.text == "📤 UPLOAD DATA", StateFilter(None, BackupStates.viewing_backup_menu))
+async def bot3_upload_backup_start(message: types.Message, state: FSMContext):
+    if not await check_authorization(message, "Upload Backup", "can_manage_admins"): return
+    await state.clear()
+    kb = ReplyKeyboardMarkup(keyboard=[
+        [KeyboardButton(text="🗄️ MAIN DB (MSANodeDB)"), KeyboardButton(text="🔐 BACKUP DB (MSANodeBackups)")],
+        [KeyboardButton(text="❌ CANCEL")]
+    ], resize_keyboard=True)
+    await state.set_state(Bot3BackupStates.upload_db_choice)
+    await message.answer(
+        "📤 <b>UPLOAD DATA — Bot 3</b>\n\n"
+        "Choose the <b>strict target database</b>:\n\n"
+        "🗄️ <b>MAIN DB</b> — Restores into <code>MSANodeDB</code> (live production)\n"
+        "🔐 <b>BACKUP DB</b> — Restores into <code>MSANodeBackups</code> (cluster only)\n\n"
+        "⚠️ Completely separate. No cross-DB writing. All inserts use <b>upsert</b> (no duplicates).",
+        reply_markup=kb, parse_mode="HTML"
+    )
+
+
+@dp.message(Bot3BackupStates.upload_db_choice)
+async def bot3_upload_backup_db_chosen(message: types.Message, state: FSMContext):
+    if not await check_authorization(message, "Upload DB Choose", "can_manage_admins"): return
+    if message.text and "CANCEL" in message.text.upper():
+        await state.clear(); return await message.answer("Cancelled.", reply_markup=get_backup_menu())
+    if "MAIN DB" not in message.text and "BACKUP DB" not in message.text:
+        return await message.answer("Choose MAIN DB or BACKUP DB.")
+    use_backup   = "BACKUP DB" in message.text
+    target_label = "MSANodeBackups (cluster)" if use_backup else "MSANodeDB (production)"
+    await state.update_data(b3_upload_target="backup" if use_backup else "main")
+    await state.set_state(Bot3BackupStates.upload_file_wait)
+    await message.answer(
+        f"✅ Target locked: <b>{target_label}</b>\n\n"
+        "Send a <b>.json</b> or <b>.zip</b> file now.\n"
+        "Tap ❌ CANCEL to abort.",
+        reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="❌ CANCEL")]], resize_keyboard=True),
+        parse_mode="HTML"
+    )
+
+
+@dp.message(Bot3BackupStates.upload_file_wait)
+async def bot3_upload_backup_receive(message: types.Message, state: FSMContext):
+    if not await check_authorization(message, "Upload Receive", "can_manage_admins"): return
+    if message.text and "CANCEL" in message.text.upper():
+        await state.clear(); return await message.answer("Cancelled.", reply_markup=get_backup_menu())
+    if not message.document:
+        return await message.answer("❌ Please send a .json or .zip file.")
+
+    fname = (message.document.file_name or "").lower()
+    if not (fname.endswith(".json") or fname.endswith(".zip")):
+        return await message.answer("❌ Only .json or .zip files accepted.")
+
+    data       = await state.get_data()
+    use_backup = data.get("b3_upload_target") == "backup"
+    target_db  = _bkp_db_b3 if use_backup else db
+    target_lbl = "MSANodeBackups" if use_backup else "MSANodeDB"
+    await state.clear()
+
+    status = await message.answer("⏳ <b>Processing upload...</b>", parse_mode="HTML")
+    try:
+        file_info = await bot.get_file(message.document.file_id)
+        buf       = io.BytesIO()
+        await bot.download_file(file_info.file_path, buf)
+        raw       = buf.getvalue()
+
+        col_map: dict = {}
+        if fname.endswith(".zip"):
+            with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+                for member in [n for n in zf.namelist() if n.lower().endswith(".json")]:
+                    payload = json.loads(zf.read(member).decode("utf-8-sig"))
+                    if isinstance(payload, dict):
+                        for k, v in payload.items():
+                            if isinstance(v, list):
+                                col_map.setdefault(k, []).extend(v)
+                    elif isinstance(payload, list):
+                        import os as _os
+                        stem = _os.path.splitext(_os.path.basename(member))[0]
+                        col_map.setdefault(stem, []).extend(payload)
+        else:
+            payload = json.loads(raw.decode("utf-8-sig"))
+            if isinstance(payload, dict):
+                for k, v in payload.items():
+                    if isinstance(v, list):
+                        col_map[k] = v
+            elif isinstance(payload, list):
+                import os as _os
+                stem = _os.path.splitext(_os.path.basename(fname))[0]
+                col_map[stem] = payload
+
+        UPSERT_KEYS = {
+            "bot3_pdfs": "msa_code", "bot3_ig_content": "cc_number",
+            "bot3_admins": "user_id", "bot3_banned_users": "user_id",
+            "bot3_settings": "key", "bot3_logs": "_id",
+            "bot3_backups": "_id", "bot3_restore_data": "_id",
+            "bot3_backup_history": "_id",
+        }
+        total_up    = 0
+        report_lines = []
+        for cname, docs in col_map.items():
+            if not docs: continue
+            col_obj    = target_db[cname]
+            ukey       = UPSERT_KEYS.get(cname, "_id")
+            upserted   = 0
+            for doc in docs:
+                try:
+                    from bson import ObjectId as _OID
+                    if ukey == "_id" and isinstance(doc.get("_id"), str):
+                        try: doc["_id"] = _OID(doc["_id"])
+                        except: pass
+                    fq = {ukey: doc[ukey]} if ukey in doc else {"_id": doc.get("_id")}
+                    col_obj.replace_one(fq, doc, upsert=True)
+                    upserted += 1
+                except: pass
+            total_up += upserted
+            report_lines.append(f"  • <code>{cname}</code>: {upserted:,} upserted")
+
+        detail = "\n".join(report_lines) or "  (no valid collections found)"
+        await status.edit_text(
+            f"✅ <b>UPLOAD COMPLETE — {target_lbl}</b>\n{'─'*28}\n\n{detail}\n\n"
+            f"📊 <b>Total upserted: {total_up:,}</b>",
+            parse_mode="HTML", reply_markup=get_backup_menu()
+        )
+    except Exception as e:
+        await status.edit_text(
+            f"❌ <b>Upload failed:</b>\n<code>{str(e)[:300]}</code>",
+            parse_mode="HTML", reply_markup=get_backup_menu()
+        )
+
+
+# =============================================================================
+# 📜 BACKUP HISTORY — Permanent log, NEVER subject to TTL or any auto-deletion
+# =============================================================================
+
+_B3_HIST_PG = 8
+
+def _b3_hist_kb(page: int, total: int) -> ReplyKeyboardMarkup:
+    nav = []
+    if page > 0:
+        nav.append(KeyboardButton(text=f"⬅️ B3HIST_PREV {page - 1}"))
+    if page < total - 1:
+        nav.append(KeyboardButton(text=f"➡️ B3HIST_NEXT {page + 1}"))
+    rows = [nav] if nav else []
+    rows.append([KeyboardButton(text="◀️ BACK TO BACKUP MENU")])
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
+
+
+async def _b3_render_history(message: types.Message, page: int):
+    try:
+        total_docs = col_bot3_bk_history.count_documents({})
+        if total_docs == 0:
+            await message.answer(
+                "📜 <b>BACKUP HISTORY — Bot 3</b>\n\n"
+                "❌ No events logged yet.\n"
+                "Events are recorded for every backup, upload, GDrive transfer and reset.",
+                reply_markup=get_backup_menu(), parse_mode="HTML"
+            )
+            return
+        total_pages = max(1, -(-total_docs // _B3_HIST_PG))
+        page = max(0, min(page, total_pages - 1))
+        skip = page * _B3_HIST_PG
+        events = list(col_bot3_bk_history.find().sort("timestamp", -1).skip(skip).limit(_B3_HIST_PG))
+        text   = (
+            f"📜 <b>BACKUP HISTORY — Bot 3</b>  (Page {page+1}/{total_pages})\n"
+            f"📊 Total: {total_docs:,} events  |  🔒 Permanent (no TTL)\n" + "─" * 28 + "\n\n"
+        )
+        for ev in events:
+            ts     = ev.get("timestamp") or ev.get("backup_date")
+            ts_str = format_datetime_12h(ts) if ts else "Unknown"
+            action = ev.get("action", ev.get("type", "?"))
+            detail = ev.get("details") or ev.get("message") or ""
+            icon   = "✅" if ev.get("status") != "error" else "❌"
+            text  += f"{icon} <b>{action}</b>\n  🕐 {ts_str}\n"
+            if detail:
+                text += f"  💬 {str(detail)[:120]}\n"
+            text += "\n"
+        await _b3_send_paged(message, text, reply_markup=_b3_hist_kb(page, total_pages))
+    except Exception as e:
+        await message.answer(
+            f"❌ <b>Could not read history:</b>\n<code>{str(e)[:200]}</code>",
+            reply_markup=get_backup_menu(), parse_mode="HTML"
+        )
+
+
+@dp.message(F.text == "📜 BACKUP HISTORY", StateFilter(None, BackupStates.viewing_backup_menu))
+async def bot3_backup_history_start(message: types.Message, state: FSMContext):
+    if not await check_authorization(message, "Backup History", "can_manage_admins"): return
+    await state.set_state(Bot3BackupStates.history_viewing)
+    await _b3_render_history(message, 0)
+
+
+@dp.message(lambda m: m.text and m.text.startswith("⬅️ B3HIST_PREV"))
+async def b3_hist_prev(message: types.Message, state: FSMContext):
+    if not await check_authorization(message, "Backup History Prev", "can_manage_admins"): return
+    try: await _b3_render_history(message, int(message.text.split()[-1]))
+    except: await _b3_render_history(message, 0)
+
+
+@dp.message(lambda m: m.text and m.text.startswith("➡️ B3HIST_NEXT"))
+async def b3_hist_next(message: types.Message, state: FSMContext):
+    if not await check_authorization(message, "Backup History Next", "can_manage_admins"): return
+    try: await _b3_render_history(message, int(message.text.split()[-1]))
+    except: await _b3_render_history(message, 0)
+
+
+@dp.message(F.text == "◀️ BACK TO BACKUP MENU")
+async def b3_hist_back(message: types.Message, state: FSMContext):
+    await state.clear()
+    await message.answer("📂 Backup menu:", reply_markup=get_backup_menu())
+
+
+# =============================================================================
+# ☁️ GDRIVE UPLOAD — Structured chunk upload with full/partial month TTL logic
+# =============================================================================
+
+@dp.message(F.text == "☁️ GDRIVE UPLOAD", StateFilter(None, BackupStates.viewing_backup_menu))
+async def bot3_gdrive_start(message: types.Message, state: FSMContext):
+    if not await check_authorization(message, "GDrive Upload", "can_manage_admins"): return
+    await state.clear()
+    loading = await message.answer("⏳ Loading cluster chunks for GDrive...")
+    try:
+        loop    = asyncio.get_event_loop()
+        records = await loop.run_in_executor(
+            None, lambda: list(col_bot3_backups.find(
+                {}, {"backup_date": 1, "gdrive_uploaded": 1, "ttl_date": 1}
+            ).sort("backup_date", -1))
+        )
+        try: await loading.delete()
+        except: pass
+
+        if not records:
+            await message.answer("❌ No snapshots in cluster for GDrive upload.", reply_markup=get_backup_menu())
+            return
+
+        chunks = _b3_group_backups(records, now_local())
+        text   = "☁️ <b>GDRIVE UPLOAD — Bot 3</b>\n<i>Select time period to transfer:</i>\n" + "─" * 28 + "\n\n"
+        chunk_store = []
+
+        for i, (k, lbl, docs, is_full) in enumerate(chunks, 1):
+            dates      = [d["backup_date"] for d in docs if d.get("backup_date")]
+            latest_str = max(dates).strftime("%d %b %Y %I:%M %p") if dates else "?"
+            gd_cnt     = sum(1 for d in docs if d.get("gdrive_uploaded"))
+            ttl_cnt    = sum(1 for d in docs if "ttl_date" in d)
+            gd_ico     = "☁️" if gd_cnt == len(docs) else ("⚡" if gd_cnt > 0 else "📦")
+            full_ico   = "📅 Full month" if is_full else "🗓️ Partial"
+            text += (
+                f"{i}. <b>{lbl}</b>  {gd_ico}\n"
+                f"   Latest: {latest_str}  |  {full_ico}\n"
+                f"   GDrive: {gd_cnt}/{len(docs)}  |  TTL: {ttl_cnt}/{len(docs)}\n\n"
+            )
+            chunk_store.append((lbl, [str(d["_id"]) for d in docs], is_full))
+
+        text += f"<i>Type number (1–{len(chunks)}) or ❌ CANCEL</i>"
+        await state.update_data(b3_gdrive_chunks=chunk_store)
+        await state.set_state(Bot3BackupStates.gdrive_month_select)
+        await _b3_send_paged(
+            message, text,
+            reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="❌ CANCEL")]], resize_keyboard=True)
+        )
+    except Exception as e:
+        try: await loading.delete()
+        except: pass
+        await message.answer(f"❌ Error:\n<code>{str(e)[:200]}</code>", reply_markup=get_backup_menu(), parse_mode="HTML")
+
+
+@dp.message(Bot3BackupStates.gdrive_month_select)
+async def bot3_gdrive_month_chosen(message: types.Message, state: FSMContext):
+    if not await check_authorization(message, "GDrive Select", "can_manage_admins"): return
+    if message.text and "CANCEL" in message.text.upper():
+        await state.clear(); return await message.answer("Cancelled.", reply_markup=get_backup_menu())
+
+    data   = await state.get_data()
+    chunks = data.get("b3_gdrive_chunks", [])
+    count  = len(chunks)
+    txt    = (message.text or "").strip()
+    if not txt.isdigit() or not (1 <= int(txt) <= count):
+        return await message.answer(f"❌ Enter a number between 1 and {count}.")
+
+    idx              = int(txt) - 1
+    lbl, doc_ids, is_full = chunks[idx]
+    await state.update_data(b3_gdrive_lbl=lbl, b3_gdrive_selected_docs=doc_ids, b3_gdrive_is_full=is_full)
+
+    if is_full:
+        # Complete month → ask about 90-day TTL
+        await state.set_state(Bot3BackupStates.gdrive_ttl_confirm)
+        kb = ReplyKeyboardMarkup(keyboard=[
+            [KeyboardButton(text="✅ ACTIVATE 90-DAY TTL")],
+            [KeyboardButton(text="❌ NO TTL — Keep Forever")],
+            [KeyboardButton(text="❌ CANCEL")]
+        ], resize_keyboard=True)
+        await message.answer(
+            f"☁️ <b>FULL MONTH DETECTED — {lbl}</b>\n\n"
+            "This is a <b>completed calendar month</b>.\n\n"
+            "🗑️ Activate <b>90-day auto-deletion</b> on these cluster snapshots after GDrive upload?\n\n"
+            "• ✅ ACTIVATE — Cluster records auto-deleted in 90 days (GDrive copy is permanent)\n"
+            "• ❌ NO TTL — Keep cluster records forever (no deletion schedule)",
+            reply_markup=kb, parse_mode="HTML"
+        )
+    else:
+        # Partial month → upload directly, never ask TTL
+        await bot3_gdrive_execute_upload(message, state, activate_ttl=False)
+
+
+@dp.message(Bot3BackupStates.gdrive_ttl_confirm)
+async def bot3_gdrive_ttl_answer(message: types.Message, state: FSMContext):
+    if not await check_authorization(message, "GDrive TTL", "can_manage_admins"): return
+    if message.text and "CANCEL" in message.text.upper():
+        await state.clear(); return await message.answer("Cancelled.", reply_markup=get_backup_menu())
+    if message.text not in ("✅ ACTIVATE 90-DAY TTL", "❌ NO TTL — Keep Forever"):
+        return await message.answer("Please choose ✅ ACTIVATE or ❌ NO TTL.")
+    activate = message.text == "✅ ACTIVATE 90-DAY TTL"
+    await bot3_gdrive_execute_upload(message, state, activate_ttl=activate)
+
+
+async def bot3_gdrive_execute_upload(message: types.Message, state: FSMContext, activate_ttl: bool):
+    data     = await state.get_data()
+    lbl      = data.get("b3_gdrive_lbl", "backup")
+    doc_ids  = data.get("b3_gdrive_selected_docs", [])
+    await state.clear()
+
+    status = await message.answer(
+        f"⏳ <b>Generating ZIP and uploading to GDrive...</b>\n📦 {lbl}",
+        reply_markup=get_backup_menu(), parse_mode="HTML"
+    )
+    try:
+        loop = asyncio.get_event_loop()
+        buf  = io.BytesIO()
+        snap_count = 0
+
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for doc_id in doc_ids:
+                doc = await loop.run_in_executor(None, lambda i=doc_id: col_bot3_backups.find_one({"_id": ObjectId(i)}))
+                if not doc: continue
+                dt = doc.get("backup_date")
+                if not dt: continue
+                c_data = doc.get("data", {})
+                w      = min((dt.day - 1) // 7 + 1, 5)
+                path   = f"{dt.strftime('%Y')}/{dt.strftime('%B')}/Week {w}/{dt.strftime('%Y-%m-%d_%A')}.json"
+                out    = {cn: (cd.get("documents", []) if isinstance(cd, dict) else cd)
+                          for cn, cd in c_data.items()}
+                zf.writestr(path, json.dumps(out, default=str, indent=2, ensure_ascii=False))
+                snap_count += 1
+
+        zip_bytes  = buf.getvalue()
+        size_mb    = round(len(zip_bytes) / 1024 / 1024, 2)
+        safe_lbl   = lbl.replace(" ", "_").replace("(", "").replace(")", "").replace("–", "-")
+        fname      = f"Bot3_GDrive_{safe_lbl}.zip"
+        upload_ok  = False
+        gdrive_msg = ""
+
+        try:
+            from backup_schedulers import upload_to_drive
+            res = await loop.run_in_executor(None, lambda: upload_to_drive(fname, zip_bytes))
+            if res.get("success"):
+                upload_ok  = True
+                gdrive_msg = f"🔗 Drive link: {res.get('link', 'N/A')}\n🆔 File ID: <code>{res.get('file_id', 'N/A')}</code>"
+            else:
+                gdrive_msg = f"❌ GDrive error: {res.get('error', 'Unknown')}"
+        except Exception as ud_err:
+            gdrive_msg = f"⚠️ GDrive unavailable: <code>{str(ud_err)[:150]}</code>"
+
+        if upload_ok:
+            # Apply TTL flags only on successful upload (and only if full month + activated)
+            ttl_applied = 0
+            if activate_ttl:
+                for doc_id in doc_ids:
+                    doc = await loop.run_in_executor(None, lambda i=doc_id: col_bot3_backups.find_one({"_id": ObjectId(i)}))
+                    if doc and "backup_date" in doc:
+                        col_bot3_backups.update_one({"_id": ObjectId(doc_id)}, {"$set": {"ttl_date": doc["backup_date"]}})
+                        ttl_applied += 1
+            # Mark as GDrive uploaded
+            for doc_id in doc_ids:
+                col_bot3_backups.update_one({"_id": ObjectId(doc_id)}, {"$set": {"gdrive_uploaded": True}})
+
+            ttl_note = (f"\n🗑️ <b>90-day TTL activated</b> on {ttl_applied} snapshot(s)."
+                        if activate_ttl else "\n🔒 <b>No TTL applied</b> — cluster records kept permanently.")
+            await status.edit_text(
+                f"✅ <b>GDRIVE UPLOAD COMPLETE</b>\n{'─'*28}\n\n"
+                f"📦 <code>{fname}</code>\n"
+                f"💾 {size_mb} MB  |  {snap_count} snapshot(s)\n"
+                f"{gdrive_msg}{ttl_note}",
+                parse_mode="HTML", reply_markup=get_backup_menu()
+            )
+            # Log to permanent history
+            try:
+                from datetime import datetime, timezone as _tz
+                col_bot3_bk_history.insert_one({
+                    "bot": "bot3", "action": "GDrive Upload",
+                    "details": f"{fname} ({size_mb} MB) | TTL:{activate_ttl}",
+                    "status": "success", "timestamp": datetime.now(_tz.utc)
+                })
+            except: pass
+        else:
+            # Upload FAILED → do NOT apply TTL
+            await status.edit_text(
+                f"❌ <b>GDRIVE UPLOAD FAILED</b>\n{'─'*28}\n\n"
+                f"📦 {fname} ({size_mb} MB)\n{gdrive_msg}\n\n"
+                f"⚠️ <b>90-day TTL was NOT applied</b> because upload did not succeed.\n"
+                f"Cluster snapshots remain intact.",
+                parse_mode="HTML", reply_markup=get_backup_menu()
+            )
+            try:
+                from datetime import datetime, timezone as _tz
+                col_bot3_bk_history.insert_one({
+                    "bot": "bot3", "action": "GDrive Upload FAILED",
+                    "details": f"{fname} — {gdrive_msg[:200]}",
+                    "status": "error", "timestamp": datetime.now(_tz.utc)
+                })
+            except: pass
+    except Exception as e:
+        await status.edit_text(
+            f"❌ <b>GDrive execution error:</b>\n<code>{str(e)[:300]}</code>",
+            parse_mode="HTML", reply_markup=get_backup_menu()
+        )
+
+
+# =============================================================================
+# ⏱️ ACTIVE DELETION — Manage 90-day TTL per chunk; history is always exempt
+# =============================================================================
+
+@dp.message(F.text == "⏱️ ACTIVE DELETION", StateFilter(None, BackupStates.viewing_backup_menu))
+async def bot3_active_deletion_start(message: types.Message, state: FSMContext):
+    if not await check_authorization(message, "Active Deletion", "can_manage_admins"): return
+    await state.clear()
+    loading = await message.answer("⏳ Analyzing TTL status across all snapshots...")
+    try:
+        loop    = asyncio.get_event_loop()
+        records = await loop.run_in_executor(
+            None, lambda: list(col_bot3_backups.find(
+                {}, {"backup_date": 1, "ttl_date": 1, "gdrive_uploaded": 1}
+            ).sort("backup_date", -1))
+        )
+        try: await loading.delete()
+        except: pass
+
+        if not records:
+            await message.answer("❌ No snapshots found.", reply_markup=get_backup_menu())
+            return
+
+        chunks      = _b3_group_backups(records, now_local())
+        text        = "⏱️ <b>ACTIVE DELETION — 90-Day TTL Manager</b>\n\n"
+        text       += "🔒 <i>Backup History is ALWAYS exempt from any deletion.</i>\n" + "─" * 28 + "\n\n"
+        chunk_store = []
+
+        for i, (k, lbl, docs, is_full) in enumerate(chunks, 1):
+            ttl_cnt = sum(1 for d in docs if "ttl_date" in d)
+            gd_cnt  = sum(1 for d in docs if d.get("gdrive_uploaded"))
+            if ttl_cnt == len(docs) and len(docs) > 0:
+                ttl_ico = "✅ ACTIVE"
+            elif ttl_cnt == 0:
+                ttl_ico = "❌ INACTIVE"
+            else:
+                ttl_ico = f"⚠️ PARTIAL ({ttl_cnt}/{len(docs)})"
+            text += (
+                f"{i}. <b>{lbl}</b>\n"
+                f"   ⏱️ TTL: {ttl_ico}  |  ☁️ GDrive: {gd_cnt}/{len(docs)}\n\n"
+            )
+            chunk_store.append((lbl, [str(d["_id"]) for d in docs]))
+
+        text += f"\n<i>Type a number (1–{len(chunks)}) to manage TTL, or ❌ CANCEL</i>"
+        await state.update_data(b3_ttl_chunks=chunk_store)
+        await state.set_state(Bot3BackupStates.active_del_list)
+        await _b3_send_paged(
+            message, text,
+            reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="❌ CANCEL")]], resize_keyboard=True)
+        )
+    except Exception as e:
+        try: await loading.delete()
+        except: pass
+        await message.answer(f"❌ Error:\n<code>{str(e)[:200]}</code>", reply_markup=get_backup_menu(), parse_mode="HTML")
+
+
+@dp.message(Bot3BackupStates.active_del_list)
+async def bot3_active_deletion_chosen(message: types.Message, state: FSMContext):
+    if not await check_authorization(message, "Active Deletion Choose", "can_manage_admins"): return
+    if message.text and "CANCEL" in message.text.upper():
+        await state.clear(); return await message.answer("Cancelled.", reply_markup=get_backup_menu())
+
+    data   = await state.get_data()
+    chunks = data.get("b3_ttl_chunks", [])
+    count  = len(chunks)
+    txt    = (message.text or "").strip()
+    if not txt.isdigit() or not (1 <= int(txt) <= count):
+        return await message.answer(f"❌ Enter a number between 1 and {count}.")
+
+    idx  = int(txt) - 1
+    lbl, doc_ids = chunks[idx]
+    await state.update_data(b3_ttl_selected=doc_ids, b3_ttl_lbl=lbl)
+    await state.set_state(Bot3BackupStates.active_del_action)
+    kb = ReplyKeyboardMarkup(keyboard=[
+        [KeyboardButton(text="🟢 START 90-DAY TTL"), KeyboardButton(text="🛑 STOP TTL — Keep Forever")],
+        [KeyboardButton(text="❌ CANCEL")]
+    ], resize_keyboard=True)
+    await message.answer(
+        f"⏱️ <b>TTL Manager:</b> {lbl}\n\n"
+        "🟢 <b>START TTL</b> — Cluster snapshots will auto-delete 90 days after their backup date.\n"
+        "🛑 <b>STOP TTL</b> — Remove countdown; snapshots are kept permanently in cluster.\n\n"
+        "⚠️ Backup History is always excluded from this action.",
+        reply_markup=kb, parse_mode="HTML"
+    )
+
+
+@dp.message(Bot3BackupStates.active_del_action)
+async def bot3_active_deletion_action(message: types.Message, state: FSMContext):
+    if not await check_authorization(message, "Active Deletion Action", "can_manage_admins"): return
+    if message.text and "CANCEL" in message.text.upper():
+        await state.clear(); return await message.answer("Cancelled.", reply_markup=get_backup_menu())
+    if message.text not in ("🟢 START 90-DAY TTL", "🛑 STOP TTL — Keep Forever"):
+        return await message.answer("❌ Choose 🟢 START or 🛑 STOP.")
+
+    start_ttl = message.text == "🟢 START 90-DAY TTL"
+    data      = await state.get_data()
+    doc_ids   = data.get("b3_ttl_selected", [])
+    lbl       = data.get("b3_ttl_lbl", "")
+    await state.clear()
+
+    loop     = asyncio.get_event_loop()
+    applied  = 0
+    errors   = 0
+    for doc_id in doc_ids:
+        try:
+            doc = await loop.run_in_executor(None, lambda i=doc_id: col_bot3_backups.find_one({"_id": ObjectId(i)}))
+            if not doc: continue
+            if start_ttl:
+                col_bot3_backups.update_one({"_id": ObjectId(doc_id)}, {"$set": {"ttl_date": doc.get("backup_date")}})
+            else:
+                col_bot3_backups.update_one({"_id": ObjectId(doc_id)}, {"$unset": {"ttl_date": ""}})
+            applied += 1
+        except:
+            errors += 1
+
+    action_lbl = "🟢 <b>90-DAY TTL ACTIVATED</b>" if start_ttl else "🛑 <b>TTL STOPPED — Permanent Retention</b>"
+    err_note   = f"\n⚠️ {errors} error(s) encountered." if errors else ""
+    await message.answer(
+        f"{action_lbl}\n\n"
+        f"📦 Chunk: <b>{lbl}</b>\n"
+        f"✅ Applied to: {applied} snapshot(s){err_note}",
+        parse_mode="HTML", reply_markup=get_backup_menu()
+    )
+
+
+
 
 class AdminManagementStates(StatesGroup):
     waiting_for_new_admin_id = State()
@@ -2075,7 +2839,7 @@ def get_backup_menu():
         [KeyboardButton(text="💾 DOWNLOAD BACKUP"), KeyboardButton(text="📤 UPLOAD DATA")],
         [KeyboardButton(text="📜 BACKUP HISTORY"),  KeyboardButton(text="☁️ GDRIVE UPLOAD")],
         [KeyboardButton(text="📊 BACKUP STATS"),    KeyboardButton(text="🗑️ RESET BACKUPS")],
-        [KeyboardButton(text="⬅️ BACK TO MAIN MENU")],
+        [KeyboardButton(text="⏱️ ACTIVE DELETION"), KeyboardButton(text="⬅️ BACK TO MAIN MENU")],
     ]
     return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
 
@@ -7330,10 +8094,13 @@ col_bot3_restore_data = _bkp_db_b3["bot3_restore_data"]  # latest restore point
 col_bot3_bk_history   = _bkp_db_b3["bot3_backup_history"]  # permanent event log
 
 # Ensure 90-day TTL index on snapshot collection
+# Ensure 90-day TTL index on ttl_date flag
 try:
+    try: col_bot3_backups.drop_index("bot3_backup_ttl_90d")
+    except Exception: pass
     col_bot3_backups.create_index(
-        [("backup_date", 1)], expireAfterSeconds=7_776_000,
-        name="bot3_backup_ttl_90d", background=True
+        [("ttl_date", 1)], expireAfterSeconds=7_776_000,
+        name="bot3_ttl_date_90d", background=True
     )
 except Exception:
     pass
@@ -7460,6 +8227,8 @@ async def create_backup_file(auto=False, fmt="zip"):
         # ── Upsert into backup history (keyed by filename for idempotency) ───
         meta_db = dict(metadata)
         meta_db.pop('created_at', None)   # keep only the str version for clean storage
+        # ADD TTL DATE NATIVELY 
+        # (This is local DB metadata, MSANodeBackups cluster is separate!)
         col_backups.update_one(
             {"filename": filename},
             {"$set": meta_db},
@@ -7682,670 +8451,31 @@ async def bot3_backup_status_start(message: types.Message, state: FSMContext):
     )
     try: await loading.delete()
     except Exception: pass
-    await message.answer(report, parse_mode="HTML", reply_markup=get_backup_menu())
-
-
-# =============================================================================
-# 💾 DOWNLOAD BACKUP — Cluster-first month list → JSON or ZIP
-# =============================================================================
-
-@dp.message(F.text == "💾 DOWNLOAD BACKUP", StateFilter(None, BackupStates.viewing_backup_menu))
-async def bot3_dl_backup_start(message: types.Message, state: FSMContext):
-    """Show indexed list of backup months from cluster."""
-    if not await check_authorization(message, "Download Backup", "can_manage_admins"):
-        return
-    await state.clear()
-    loading = await message.answer("⏳ Loading available backups...")
+    # ── TTL-activated months list ──────────────────────────────────────────────
+    ttl_months_text = ""
     try:
-        import asyncio as _aio
-        loop = _aio.get_event_loop()
-        records = await loop.run_in_executor(
-            None, lambda: list(col_bot3_backups.find({}, {"backup_date": 1, "backup_type": 1, "docs": 1}).sort("backup_date", -1).limit(30))
-        )
-        try: await loading.delete()
-        except Exception: pass
-        if not records:
-            await message.answer(
-                "📦 <b>DOWNLOAD BACKUP — Bot 3</b>\n\n❌ No snapshots found in backup cluster yet.\n"
-                "The daily auto-backup runs at <b>23:59 UTC</b> every night.",
-                reply_markup=get_backup_menu(), parse_mode="HTML"
-            )
-            return
-        lines = "📦 <b>DOWNLOAD BACKUP — Bot 3</b>\n<i>Select a date by typing its number:</i>\n" + "─"*28 + "\n\n"
-        for i, rec in enumerate(records, 1):
-            dt = rec.get("backup_date")
-            dt_str = format_datetime_12h(dt) if dt else "Unknown date"
-            bk_type = rec.get("backup_type", "daily")
-            docs = rec.get("docs", "?")
-            lines += f"{i}. {dt_str} — <code>{bk_type}</code> | {docs} docs\n"
-        lines += "\n<i>Type a number (1–" + str(len(records)) + ") or ❌ CANCEL</i>"
-        await state.update_data(b3_dl_records=[str(r["_id"]) for r in records], b3_dl_count=len(records))
-        await state.set_state(Bot3BackupStates.dl_month_select)
-        await message.answer(lines, parse_mode="HTML",
-            reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="❌ CANCEL")]], resize_keyboard=True))
-    except Exception as e:
-        try: await loading.delete()
-        except Exception: pass
-        await message.answer(f"❌ Could not load backups:\n<code>{str(e)[:200]}</code>",
-            reply_markup=get_backup_menu(), parse_mode="HTML")
-
-
-@dp.message(Bot3BackupStates.dl_month_select)
-async def bot3_dl_backup_month_chosen(message: types.Message, state: FSMContext):
-    """User typed an index — confirm format."""
-    if not await check_authorization(message, "Download Backup Select", "can_manage_admins"):
-        await state.clear(); return
-    if message.text and "CANCEL" in message.text.upper():
-        await state.clear()
-        await message.answer("Cancelled.", reply_markup=get_backup_menu()); return
-
-    data = await state.get_data()
-    records = data.get("b3_dl_records", [])
-    count = data.get("b3_dl_count", 0)
-    if not message.text or not message.text.strip().isdigit():
-        await message.answer(f"❌ Please enter a number between 1 and {count}."); return
-    idx = int(message.text.strip()) - 1
-    if idx < 0 or idx >= len(records):
-        await message.answer(f"❌ Enter a number between 1 and {count}."); return
-
-    await state.update_data(b3_dl_selected_id=records[idx])
-    await state.set_state(Bot3BackupStates.dl_format_select)
-    kb = ReplyKeyboardMarkup(keyboard=[
-        [KeyboardButton(text="📄 JSON FORMAT"), KeyboardButton(text="🗜 ZIP FORMAT")],
-        [KeyboardButton(text="❌ CANCEL")]
-    ], resize_keyboard=True)
-    await message.answer("📦 Choose download format:", reply_markup=kb)
-
-
-@dp.message(Bot3BackupStates.dl_format_select)
-async def bot3_dl_backup_format_chosen(message: types.Message, state: FSMContext):
-    """Download the selected snapshot in chosen format."""
-    if not await check_authorization(message, "Download Backup Format", "can_manage_admins"):
-        await state.clear(); return
-    if message.text and "CANCEL" in message.text.upper():
-        await state.clear()
-        await message.answer("Cancelled.", reply_markup=get_backup_menu()); return
-    if message.text not in ("📄 JSON FORMAT", "🗜 ZIP FORMAT"):
-        await message.answer("Please choose JSON or ZIP."); return
-
-    use_zip = message.text == "🗜 ZIP FORMAT"
-    data = await state.get_data()
-    backup_id = data.get("b3_dl_selected_id")
-    await state.clear()
-
-    loading = await message.answer("⏳ Preparing download...", reply_markup=get_backup_menu())
-    try:
-        import io, json, zipfile, asyncio as _aio
-        from bson import ObjectId
-        loop = _aio.get_event_loop()
-        doc = await loop.run_in_executor(
-            None, lambda: col_bot3_backups.find_one({"_id": ObjectId(backup_id)})
-        )
-        if not doc:
-            await loading.edit_text("❌ Backup record not found."); return
-
-        collections = doc.get("data", {})
-        dt = doc.get("backup_date")
-        ts = format_datetime_12h(dt) if dt else "unknown"
-
-        if use_zip:
-            buf = io.BytesIO()
-            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-                for col_name, col_data in collections.items():
-                    docs = col_data.get("documents", []) if isinstance(col_data, dict) else col_data
-                    zf.writestr(f"{col_name}.json", json.dumps(docs, default=str, indent=2, ensure_ascii=False))
-            buf.seek(0)
-            fname = f"bot3_backup_{now_local().strftime('%Y%m%d')}.zip"
-            await message.answer_document(
-                types.BufferedInputFile(buf.read(), filename=fname),
-                caption=f"✅ <b>Bot 3 Backup</b> — {ts}\n📦 ZIP with {len(collections)} collections",
-                parse_mode="HTML"
-            )
+        all_snaps = list(col_bot3_backups.find({}, {"backup_date": 1, "ttl_date": 1}))
+        ttl_chunks = {}
+        for snap in all_snaps:
+            bd = snap.get("backup_date")
+            if not bd: continue
+            mk = f"{bd.year}-{bd.month:02d}"
+            ttl_chunks.setdefault(mk, {"total": 0, "ttl": 0, "month_name": bd.strftime("%B %Y")})
+            ttl_chunks[mk]["total"] += 1
+            if "ttl_date" in snap: ttl_chunks[mk]["ttl"] += 1
+        if ttl_chunks:
+            ttl_months_text = "\n🗑️ <b>90-Day TTL Status per Month:</b>\n"
+            for mk in sorted(ttl_chunks.keys(), reverse=True):
+                info = ttl_chunks[mk]
+                ico  = "✅" if info["ttl"] == info["total"] else ("⚠️" if info["ttl"] > 0 else "❌")
+                ttl_months_text += f"  {ico} {info['month_name']}: {info['ttl']}/{info['total']} active\n"
         else:
-            out = {cn: (cd.get("documents", []) if isinstance(cd, dict) else cd) for cn, cd in collections.items()}
-            buf = io.BytesIO(json.dumps(out, default=str, indent=2, ensure_ascii=False).encode())
-            fname = f"bot3_backup_{now_local().strftime('%Y%m%d')}.json"
-            await message.answer_document(
-                types.BufferedInputFile(buf.read(), filename=fname),
-                caption=f"✅ <b>Bot 3 Backup</b> — {ts}\n📄 JSON ({len(collections)} collections)",
-                parse_mode="HTML"
-            )
-        await loading.delete()
-    except Exception as e:
-        await loading.edit_text(f"❌ Download failed:\n<code>{str(e)[:200]}</code>", parse_mode="HTML")
-
-
-# =============================================================================
-# 📤 UPLOAD BACKUP — Choose target DB then post file
-# =============================================================================
-
-@dp.message(F.text == "📤 UPLOAD DATA", StateFilter(None, BackupStates.viewing_backup_menu))
-async def bot3_upload_backup_start(message: types.Message, state: FSMContext):
-    """Step 1 — Ask which DB to restore into."""
-    if not await check_authorization(message, "Upload Backup", "can_manage_admins"):
-        return
-    await state.clear()
-    kb = ReplyKeyboardMarkup(keyboard=[
-        [KeyboardButton(text="🗄️ MAIN DB (MSANodeDB)"), KeyboardButton(text="🔐 BACKUP DB (MSANodeBackups)")],
-        [KeyboardButton(text="❌ CANCEL")]
-    ], resize_keyboard=True)
-    await state.set_state(Bot3BackupStates.upload_db_choice)
-    await message.answer(
-        "📤 <b>UPLOAD BACKUP — Bot 3</b>\n\nChoose the <b>target database</b> for restore:\n\n"
-        "🗄️ <b>MAIN DB</b> — Restores into <code>MSANodeDB</code> (live production)\n"
-        "🔐 <b>BACKUP DB</b> — Restores into <code>MSANodeBackups</code> (cluster only)\n\n"
-        "⚠️ All inserts use <b>upsert</b> — no duplicates created.",
-        reply_markup=kb, parse_mode="HTML"
-    )
-
-
-@dp.message(Bot3BackupStates.upload_db_choice)
-async def bot3_upload_backup_db_chosen(message: types.Message, state: FSMContext):
-    """Step 2 — Store target, ask for file."""
-    if not await check_authorization(message, "Upload Backup DB", "can_manage_admins"):
-        await state.clear(); return
-    if message.text and "CANCEL" in message.text.upper():
-        await state.clear()
-        await message.answer("Cancelled.", reply_markup=get_backup_menu()); return
-    if message.text not in ("🗄️ MAIN DB (MSANodeDB)", "🔐 BACKUP DB (MSANodeBackups)"):
-        await message.answer("Please choose Main DB or Backup DB."); return
-
-    use_backup = "BACKUP DB" in message.text
-    await state.update_data(b3_upload_target="backup" if use_backup else "main")
-    await state.set_state(Bot3BackupStates.upload_file_wait)
-    target_label = "MSANodeBackups (cluster)" if use_backup else "MSANodeDB (production)"
-    await message.answer(
-        f"✅ Target: <b>{target_label}</b>\n\nSend a <b>.json</b> or <b>.zip</b> file now.\n"
-        "Tap ❌ CANCEL to abort.",
-        reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="❌ CANCEL")]], resize_keyboard=True),
-        parse_mode="HTML"
-    )
-
-
-@dp.message(Bot3BackupStates.upload_file_wait)
-async def bot3_upload_backup_receive(message: types.Message, state: FSMContext):
-    """Step 3 — Receive file and upsert into target DB."""
-    if not await check_authorization(message, "Upload Backup Receive", "can_manage_admins"):
-        await state.clear(); return
-    if message.text and "CANCEL" in message.text.upper():
-        await state.clear()
-        await message.answer("Cancelled.", reply_markup=get_backup_menu()); return
-    if not message.document:
-        await message.answer("❌ Please send a .json or .zip file."); return
-
-    fname = (message.document.file_name or "").lower()
-    if not (fname.endswith(".json") or fname.endswith(".zip")):
-        await message.answer("❌ Only .json or .zip files accepted."); return
-
-    data = await state.get_data()
-    use_backup = data.get("b3_upload_target") == "backup"
-    target_db = _bkp_db_b3 if use_backup else db
-    await state.clear()
-
-    status_msg = await message.answer("⏳ <b>Processing upload...</b>", parse_mode="HTML")
-    try:
-        import io as _io, json as _json, zipfile as _zipfile, re as _re, os as _os
-        file_info = await bot.get_file(message.document.file_id)
-        buf = _io.BytesIO()
-        await bot.download_file(file_info.file_path, buf)
-        raw = buf.getvalue()
-
-        col_map = {}
-        if fname.endswith(".zip"):
-            with _zipfile.ZipFile(_io.BytesIO(raw)) as zf:
-                for member in [n for n in zf.namelist() if n.lower().endswith(".json")]:
-                    payload = _json.loads(zf.read(member).decode("utf-8-sig"))
-                    stem = _re.sub(r'_\d{4}-\d{2}-\d{2}.*$', '', _os.path.splitext(_os.path.basename(member))[0])
-                    if isinstance(payload, list):
-                        col_map.setdefault(stem, []).extend(payload)
-                    elif isinstance(payload, dict):
-                        for k, v in payload.items():
-                            if isinstance(v, list):
-                                col_map.setdefault(k, []).extend(v)
-        else:
-            payload = _json.loads(raw.decode("utf-8-sig"))
-            if isinstance(payload, list):
-                stem = _re.sub(r'_\d{4}-\d{2}-\d{2}.*$', '', _os.path.splitext(fname)[0])
-                col_map[stem] = payload
-            elif isinstance(payload, dict):
-                for k, v in payload.items():
-                    if isinstance(v, list):
-                        col_map[k] = v
-
-        _UPSERT_KEYS = {
-            "bot3_pdfs": "msa_code", "bot3_ig_content": "cc_number",
-            "bot3_admins": "user_id", "bot3_banned_users": "user_id",
-            "bot3_settings": "key", "bot3_logs": "_id",
-            "bot3_backups": "_id", "bot3_restore_data": "_id",
-            "bot3_backup_history": "_id",
-        }
-        total_up = 0
-        report_lines = []
-        for cname, docs in col_map.items():
-            if not docs:
-                continue
-            col_obj = target_db[cname]
-            upsert_key = _UPSERT_KEYS.get(cname, "_id")
-            upserted = 0
-            for doc in docs:
-                try:
-                    from bson import ObjectId
-                    if upsert_key == "_id" and "_id" in doc and isinstance(doc["_id"], str):
-                        try:
-                            doc["_id"] = ObjectId(doc["_id"])
-                        except Exception:
-                            pass
-                    filter_q = {upsert_key: doc[upsert_key]} if upsert_key in doc else {"_id": doc.get("_id")}
-                    col_obj.replace_one(filter_q, doc, upsert=True)
-                    upserted += 1
-                except Exception:
-                    pass
-            total_up += upserted
-            report_lines.append(f"  • <code>{cname}</code>: {upserted:,} upserted")
-        target_label = "MSANodeBackups" if use_backup else "MSANodeDB"
-        detail = "\n".join(report_lines) or "  (no valid collections found)"
-        await status_msg.edit_text(
-            f"✅ <b>UPLOAD COMPLETE — {target_label}</b>\n{'─'*28}\n\n{detail}\n\n"
-            f"📊 <b>Total upserted: {total_up:,}</b>",
-            parse_mode="HTML", reply_markup=get_backup_menu()
-        )
-    except Exception as e:
-        await status_msg.edit_text(
-            f"❌ <b>Upload failed:</b>\n<code>{str(e)[:300]}</code>",
-            parse_mode="HTML", reply_markup=get_backup_menu()
-        )
-
-
-# =============================================================================
-# 📜 BACKUP HISTORY — Last 10 events from bot3_backup_history cluster collection
-# =============================================================================
-
-# ── Paginated BACKUP HISTORY helpers ─────────────────────────────────────────
-_B3_BKH_PAGE_SIZE = 8
-
-def _b3_bkh_nav_kb(page: int, total_pages: int) -> ReplyKeyboardMarkup:
-    nav = []
-    if page > 0:
-        nav.append(KeyboardButton(text=f"⬅️ B3HIST_PREV {page - 1}"))
-    if page < total_pages - 1:
-        nav.append(KeyboardButton(text=f"➡️ B3HIST_NEXT {page + 1}"))
-    rows = [nav] if nav else []
-    rows.append([KeyboardButton(text="◀️ BACK TO BACKUP MENU")])
-    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
-
-async def _b3_render_history_page(message: types.Message, page: int):
-    """Render one page of bot3_backup_history from cluster."""
-    try:
-        total = col_bot3_bk_history.count_documents({})
-        if total == 0:
-            await message.answer(
-                "📜 <b>BACKUP HISTORY — Bot 3</b>\n\n❌ No events logged yet.\n"
-                "Events are recorded when auto-backup runs, GDrive uploads or resets occur.",
-                reply_markup=get_backup_menu(), parse_mode="HTML"
-            )
-            return
-        total_pages = max(1, -(-total // _B3_BKH_PAGE_SIZE))
-        page = max(0, min(page, total_pages - 1))
-        skip = page * _B3_BKH_PAGE_SIZE
-        events = list(col_bot3_bk_history.find().sort("timestamp", -1).skip(skip).limit(_B3_BKH_PAGE_SIZE))
-        lines = (
-            f"📜 <b>BACKUP HISTORY — Bot 3</b>  (Page {page+1}/{total_pages})\n"
-            f"📊 Total: {total:,} events\n" + "─"*28 + "\n\n"
-        )
-        for i, ev in enumerate(events, start=skip + 1):
-            ts = ev.get("timestamp") or ev.get("backup_date")
-            ts_str = format_datetime_12h(ts) if ts else "Unknown"
-            action = ev.get("action", ev.get("type", "?"))
-            detail = ev.get("details") or ev.get("message") or ""
-            bot_tag = ev.get("bot", "")
-            icon = "✅" if ev.get("status") != "error" else "❌"
-            tag = f"<code>{bot_tag.upper()}</code> " if bot_tag else ""
-            lines += f"{icon} {tag}<b>{action}</b>\n  🕐 {ts_str}\n"
-            if detail:
-                lines += f"  💬 {str(detail)[:120]}\n"
-            lines += "\n"
-        await message.answer(lines, reply_markup=_b3_bkh_nav_kb(page, total_pages), parse_mode="HTML")
-    except Exception as e:
-        await message.answer(
-            f"❌ <b>Could not read history:</b>\n<code>{str(e)[:200]}</code>",
-            reply_markup=get_backup_menu(), parse_mode="HTML"
-        )
-
-
-@dp.message(F.text == "📜 BACKUP HISTORY", StateFilter(None, BackupStates.viewing_backup_menu))
-async def bot3_backup_history_start(message: types.Message, state: FSMContext):
-    """Open paginated backup history."""
-    if not await check_authorization(message, "Backup History", "can_manage_admins"):
-        return
-    await state.set_state(Bot3BackupStates.history_viewing)
-    await _b3_render_history_page(message, 0)
-
-@dp.message(lambda m: m.text and m.text.startswith("⬅️ B3HIST_PREV"))
-async def b3_hist_prev(message: types.Message, state: FSMContext):
-    if not await check_authorization(message, "Backup History Prev", "can_manage_admins"): return
-    try: await _b3_render_history_page(message, int(message.text.split()[-1]))
-    except Exception: await _b3_render_history_page(message, 0)
-
-@dp.message(lambda m: m.text and m.text.startswith("➡️ B3HIST_NEXT"))
-async def b3_hist_next(message: types.Message, state: FSMContext):
-    if not await check_authorization(message, "Backup History Next", "can_manage_admins"): return
-    try: await _b3_render_history_page(message, int(message.text.split()[-1]))
-    except Exception: await _b3_render_history_page(message, 0)
-
-@dp.message(F.text == "◀️ BACK TO BACKUP MENU")
-async def b3_hist_back(message: types.Message, state: FSMContext):
-    await state.clear()
-    await backup_menu_handler(message, state)
-
-
-# =============================================================================
-# ☁️ GDRIVE SYSTEM — Manual index-based upload; full-month 90-day TTL ask
-# =============================================================================
-
-@dp.message(F.text == "☁️ GDRIVE UPLOAD", StateFilter(None, BackupStates.viewing_backup_menu))
-async def bot3_gdrive_start(message: types.Message, state: FSMContext):
-    """Show indexed list of cluster backups available for GDrive upload."""
-    if not await check_authorization(message, "GDrive System", "can_manage_admins"):
-        return
-    await state.clear()
-    loading = await message.answer("⏳ Loading cluster backups for GDrive...")
-    try:
-        import asyncio as _aio, calendar
-        from datetime import datetime, timezone
-        loop = _aio.get_event_loop()
-        records = await loop.run_in_executor(
-            None, lambda: list(col_bot3_backups.find({}, {"backup_date": 1, "gdrive_uploaded": 1, "backup_type": 1, "docs": 1}).sort("backup_date", -1).limit(20))
-        )
-        if not records:
-            try: await loading.delete()
-            except Exception: pass
-            
-            kb = ReplyKeyboardMarkup(keyboard=[
-                [KeyboardButton(text="⏺️ UPLOAD PRESENT STATE NOW")],
-                [KeyboardButton(text="❌ CANCEL")]
-            ], resize_keyboard=True)
-            await state.set_state(Bot3BackupStates.gdrive_month_select)
-            
-            await message.answer(
-                    "☁️ <b>GDRIVE UPLOAD — Bot 3</b>\n\n"
-                    "❌ No historical snapshots in backup cluster yet.\n\n"
-                    "You can still upload the <b>Present State</b> (a snapshot of the live database right now) directly to Google Drive:",
-                    reply_markup=kb, parse_mode="HTML"
-                )
-            return
-
-        gdrive_folder = os.environ.get("BOT3_GDRIVE_FOLDER_ID", "10Pwa81s6OcSTayORP9jcZ2qTVLA0vild")
-        lines = f"☁️ <b>GDRIVE SYSTEM — Bot 3</b>\n📁 Folder ID: <code>{gdrive_folder[:24]}...</code>\n" + "─"*28 + "\n\n"
-        for i, rec in enumerate(records, 1):
-            dt = rec.get("backup_date")
-            dt_str = format_datetime_12h(dt) if dt else "Unknown"
-            up_icon = "☁️ Uploaded" if rec.get("gdrive_uploaded") else "📦 Not uploaded"
-            docs = rec.get("docs", "?")
-            lines += f"{i}. {dt_str} — {up_icon} | {docs} docs\n"
-        lines += "\n<i>Type a number to upload that backup, or ❌ CANCEL</i>"
-        await state.update_data(
-            b3_gdrive_records=[str(r["_id"]) for r in records],
-            b3_gdrive_dates=[r.get("backup_date") for r in records],
-            b3_gdrive_count=len(records)
-        )
-        await state.set_state(Bot3BackupStates.gdrive_month_select)
-        try: await loading.delete()
-        except Exception: pass
-        await message.answer(lines, parse_mode="HTML",
-            reply_markup=ReplyKeyboardMarkup(keyboard=[
-                [KeyboardButton(text="⏺️ UPLOAD PRESENT STATE NOW")],
-                [KeyboardButton(text="❌ CANCEL")]
-            ], resize_keyboard=True))
-    except Exception as e:
-        try: await loading.delete()
-        except Exception: pass
-        await message.answer(f"❌ Error loading backups:\n<code>{str(e)[:200]}</code>",
-            reply_markup=get_backup_menu(), parse_mode="HTML")
-
-
-@dp.message(F.text == "⏺️ UPLOAD PRESENT STATE NOW", StateFilter(Bot3BackupStates.gdrive_month_select))
-async def bot3_gdrive_present_state_upload(message: types.Message, state: FSMContext):
-    """Upload live DB snapshot to GDrive immediately, without needing a cluster backup."""
-    if not await check_authorization(message, "GDrive Upload", "can_manage_admins"):
-        await state.clear(); return
-    await state.clear()
-
-    proc = await message.answer(
-        "⏳ <b>Generating live snapshot & uploading to GDrive...</b>\n\n"
-        "Please wait (may take up to a minute).",
-        parse_mode="HTML"
-    )
-    try:
-        import asyncio as _aio
-        from backup_schedulers import present_gdrive_upload
-
-        _backup_uri = os.environ.get("BACKUP_MONGO_URI") or MONGO_URI
-        _backup_db  = os.environ.get("BACKUP_MONGO_DB_NAME", "MSANodeBackups")
-        _target_db  = os.environ.get("MONGO_DB_NAME", "MSANodeDB")
-
-        loop = _aio.get_event_loop()
-        result = await loop.run_in_executor(
-            None,
-            lambda: present_gdrive_upload(
-                bot_name="bot3",
-                prod_mongo_uri=MONGO_URI,
-                prod_db_name=_target_db,
-                backup_mongo_uri=_backup_uri,
-                backup_db_name=_backup_db
-            )
-        )
-        try: await proc.delete()
-        except Exception: pass
-
-        if result.get("status") == "success":
-            await message.answer(
-                f"✅ <b>PRESENT STATE UPLOADED TO GDRIVE</b>\n\n"
-                f"📦 <code>{result.get('zip_name', 'backup.zip')}</code>\n"
-                f"💾 {result.get('size_mb', 0):.2f} MB ({result.get('doc_count', 0):,} docs)\n"
-                f"☁️ File ID: <code>{result.get('file_id', 'Unknown')}</code>\n\n"
-                f"ℹ️ {result.get('message', 'Upload successful')}",
-                reply_markup=get_backup_menu(), parse_mode="HTML"
-            )
-            try:
-                from datetime import datetime, timezone
-                col_bot3_bk_history.insert_one({
-                    "bot": "bot3", "action": "Present State GDrive Upload",
-                    "details": f"{result.get('zip_name')} ({result.get('size_mb', 0):.2f} MB)",
-                    "status": "success", "timestamp": datetime.now(timezone.utc)
-                })
-            except Exception:
-                pass
-        else:
-            await message.answer(
-                f"❌ <b>UPLOAD FAILED</b>\n\n"
-                f"Error: <code>{result.get('message', 'Unknown error')[:200]}</code>\n\n"
-                f"⚠️ Live database was NOT touched.",
-                reply_markup=get_backup_menu(), parse_mode="HTML"
-            )
-    except Exception as e:
-        try: await proc.delete()
-        except Exception: pass
-        await message.answer(
-            f"❌ <b>Upload error:</b>\n<code>{str(e)[:200]}</code>",
-            reply_markup=get_backup_menu(), parse_mode="HTML"
-        )
-
-
-@dp.message(Bot3BackupStates.gdrive_month_select)
-async def bot3_gdrive_month_chosen(message: types.Message, state: FSMContext):
-    """User picked a backup index. Check if full month → ask TTL; else upload directly."""
-    if not await check_authorization(message, "GDrive Month Select", "can_manage_admins"):
-        await state.clear(); return
-    if message.text and "CANCEL" in message.text.upper():
-        await state.clear()
-        await message.answer("Cancelled.", reply_markup=get_backup_menu()); return
-
-    data = await state.get_data()
-    records = data.get("b3_gdrive_records", [])
-    dates = data.get("b3_gdrive_dates", [])
-    count = data.get("b3_gdrive_count", 0)
-    if not message.text or not message.text.strip().isdigit():
-        await message.answer(f"❌ Enter a number between 1 and {count}."); return
-    idx = int(message.text.strip()) - 1
-    if idx < 0 or idx >= len(records):
-        await message.answer(f"❌ Enter a number between 1 and {count}."); return
-
-    backup_id = records[idx]
-    backup_dt = dates[idx]
-
-    # ── Full-month detection: count snapshots in that calendar month ──────────
-    is_full_month = False
-    try:
-        import calendar as _cal
-        if backup_dt:
-            y, mo = backup_dt.year, backup_dt.month
-            days_in_month = _cal.monthrange(y, mo)[1]
-            from datetime import datetime, timezone
-            month_start = datetime(y, mo, 1, tzinfo=timezone.utc)
-            month_end   = datetime(y, mo, days_in_month, 23, 59, 59, tzinfo=timezone.utc)
-            count_in_month = col_bot3_backups.count_documents({
-                "backup_date": {"$gte": month_start, "$lte": month_end}
-            })
-            is_full_month = count_in_month >= days_in_month
+            ttl_months_text = "\n🗑️ <b>90-Day TTL:</b> No snapshots stored\n"
     except Exception:
-        is_full_month = False
+        ttl_months_text = "\n🗑️ <b>TTL status:</b> ⚠️ Could not read\n"
 
-    await state.update_data(b3_gdrive_selected_id=backup_id, b3_gdrive_full_month=is_full_month)
-
-    if is_full_month:
-        # Ask about 90-day TTL
-        await state.set_state(Bot3BackupStates.gdrive_ttl_confirm)
-        kb = ReplyKeyboardMarkup(keyboard=[
-            [KeyboardButton(text="✅ APPLY 90-DAY AUTO-DELETE")],
-            [KeyboardButton(text="❌ SKIP — Keep all records")],
-        ], resize_keyboard=True)
-        await message.answer(
-            "☁️ <b>FULL MONTH DETECTED</b> ✅\n\n"
-            "This backup covers a <b>complete calendar month</b>.\n\n"
-            "🗑️ Apply <b>90-day auto-deletion</b> to the <code>MSANodeBackups</code> record "
-            "after GDrive upload?\n\n"
-            "• ✅ APPLY — Record deleted from cluster in 90 days (GDrive copy is permanent)\n"
-            "• ❌ SKIP — Keep cluster record forever (no TTL change)",
-            reply_markup=kb, parse_mode="HTML"
-        )
-    else:
-        # Partial month → upload directly without TTL prompt
-        await state.update_data(b3_gdrive_apply_ttl=False)
-        await _bot3_gdrive_do_upload(message, state)
-
-
-@dp.message(Bot3BackupStates.gdrive_ttl_confirm)
-async def bot3_gdrive_ttl_answer(message: types.Message, state: FSMContext):
-    """Handle TTL choice then execute upload."""
-    if not await check_authorization(message, "GDrive TTL Confirm", "can_manage_admins"):
-        await state.clear(); return
-    if message.text and "CANCEL" in message.text.upper():
-        await state.clear()
-        await message.answer("Cancelled.", reply_markup=get_backup_menu()); return
-    if message.text not in ("✅ APPLY 90-DAY AUTO-DELETE", "❌ SKIP — Keep all records"):
-        await message.answer("Please choose ✅ APPLY or ❌ SKIP."); return
-    apply_ttl = message.text == "✅ APPLY 90-DAY AUTO-DELETE"
-    await state.update_data(b3_gdrive_apply_ttl=apply_ttl)
-    await _bot3_gdrive_do_upload(message, state)
-
-
-async def _bot3_gdrive_do_upload(message: types.Message, state: FSMContext):
-    """Execute the actual GDrive upload for Bot 3."""
-    data = await state.get_data()
-    backup_id = data.get("b3_gdrive_selected_id")
-    apply_ttl = data.get("b3_gdrive_apply_ttl", False)
-    await state.clear()
-
-    loading = await message.answer("⏳ <b>Uploading to Google Drive...</b>", parse_mode="HTML")
-    try:
-        import asyncio as _aio
-        from bson import ObjectId
-        loop = _aio.get_event_loop()
-        gdrive_folder = os.environ.get("BOT3_GDRIVE_FOLDER_ID", "10Pwa81s6OcSTayORP9jcZ2qTVLA0vild")
-        _bkp_uri = BACKUP_MONGO_URI or MONGO_URI
-        _bkp_db_name = BACKUP_MONGO_DB_NAME or "MSANodeBackups"
-
-        # ── Fetch the window_key BEFORE upload (needed for precise TTL flag) ──
-        window_key = None
-        try:
-            rec_meta = await loop.run_in_executor(
-                None, lambda: col_bot3_backups.find_one({"_id": ObjectId(backup_id)}, {"window_key": 1})
-            )
-            if rec_meta:
-                window_key = rec_meta.get("window_key")
-        except Exception:
-            pass
-
-        result = await loop.run_in_executor(
-            None,
-            lambda: gdrive_upload_cluster_backup(
-                ObjectId(backup_id), "bot3",
-                _bkp_uri, _bkp_db_name,
-                gdrive_folder_id=gdrive_folder
-            )
-        )
-        if result.get("status") == "success":
-            file_id = result.get("file_id", "")
-
-            # ── Apply 90-day TTL flag if user chose APPLY ─────────────────
-            ttl_note = ""
-            if apply_ttl and file_id:
-                try:
-                    from backup_schedulers import apply_gdrive_ttl_flag
-                    ttl_res = await loop.run_in_executor(
-                        None,
-                        lambda: apply_gdrive_ttl_flag(
-                            bot_name="bot3",
-                            file_id=file_id,
-                            backup_mongo_uri=_bkp_uri,
-                            backup_db_name=_bkp_db_name,
-                            cutoff_str=window_key  # Only flag THIS record's date
-                        )
-                    )
-                    if ttl_res.get("status") == "ok":
-                        ttl_note = f"\n🗑️ <b>90-day auto-delete set</b> on {ttl_res.get('updated_count', 0)} cluster record(s)."
-                    else:
-                        ttl_note = f"\n⚠️ TTL flag failed: <code>{ttl_res.get('message', 'unknown')[:100]}</code>"
-                except Exception as ttl_e:
-                    ttl_note = f"\n⚠️ TTL flag error: <code>{str(ttl_e)[:100]}</code>"
-            else:
-                ttl_note = "\n📌 Cluster record kept (no TTL applied)."
-
-            try: await loading.delete()
-            except Exception: pass
-            await message.answer(
-                f"✅ <b>GDRIVE UPLOAD COMPLETE</b>\n\n"
-                f"📦 <code>{result['zip_name']}</code>\n"
-                f"💾 {result['size_mb']:.2f} MB\n"
-                f"🆔 File ID: <code>{result['file_id']}</code>"
-                + ttl_note,
-                reply_markup=get_backup_menu(), parse_mode="HTML"
-            )
-            # Log to history
-            try:
-                from datetime import datetime, timezone
-                col_bot3_bk_history.insert_one({
-                    "bot": "bot3", "action": "GDrive Upload",
-                    "details": f"{result['zip_name']} ({result['size_mb']:.2f} MB) | TTL: {apply_ttl}",
-                    "status": "success", "timestamp": datetime.now(timezone.utc)
-                })
-            except Exception:
-                pass
-        else:
-            try: await loading.delete()
-            except Exception: pass
-            await message.answer(
-                f"❌ <b>GDRIVE UPLOAD FAILED</b>\n\n"
-                f"Error: <code>{result.get('message', 'Unknown')[:200]}</code>",
-                reply_markup=get_backup_menu(), parse_mode="HTML"
-            )
-    except Exception as e:
-        try: await loading.delete()
-        except Exception: pass
-        await message.answer(
-            f"❌ <b>Upload error:</b>\n<code>{str(e)[:200]}</code>",
-            reply_markup=get_backup_menu(), parse_mode="HTML"
-        )
+    report = report.rstrip("\n") + ttl_months_text
+    await message.answer(report, parse_mode="HTML", reply_markup=get_backup_menu())
 
 
 # =============================================================================
@@ -8512,877 +8642,12 @@ async def backup_menu_handler(message: types.Message, state: FSMContext):
         "📜 <b>BACKUP HISTORY</b> — Paginated cluster event log (auto prev/next)\n"
         "☁️ <b>GDRIVE UPLOAD</b> — Index pick → full-month TTL detection → upload\n"
         "📊 <b>BACKUP STATS</b> — Live prod + cluster stats, TTL & ETA\n"
-        "🗑️ <b>RESET BACKUPS</b> — Wipe MSANodeBackups only (prod untouched)\n\n"
+        "🗑️ <b>RESET BACKUPS</b> — Wipe MSANodeBackups only (prod untouched)\n"
+        "⏱️ <b>ACTIVE DELETION</b> — Manage 90-day TTL policies per month\n\n"
         "Auto-backup: <b>23:59 UTC</b> daily → <b>MSANodeBackups cluster</b>",
         reply_markup=get_backup_menu(),
         parse_mode="HTML"
     )
-
-
-@dp.message(F.text == "🗑️ RESET BACKUPS", StateFilter(None, BackupStates.viewing_backup_menu))
-async def start_reset_backups(message: types.Message, state: FSMContext):
-    """Start separate backup-only reset flow (does not touch operational bot data)."""
-    if message.from_user.id != MASTER_ADMIN_ID:
-        await message.answer("⛔ <b>ACCESS DENIED.</b> Only the Master Admin can reset backups.", parse_mode="HTML")
-        return
-
-    await state.set_state(BackupResetStates.waiting_for_confirm_button)
-    keyboard = [
-        [KeyboardButton(text="🔴 CONFIRM BACKUP RESET")],
-        [KeyboardButton(text="❌ CANCEL")],
-    ]
-    await message.answer(
-        "⚠️ <b>DANGER ZONE — BACKUP RESET ONLY</b> ⚠️\n\n"
-        "This action will wipe <b>backup data only</b>:\n"
-        "• Mongo backup records (<code>bot3_backups</code>)\n"
-        "• Local backup files in <code>backups/</code> (except <code>backups/state</code>)\n\n"
-        "✅ Operational Bot3 data (PDFs, IG, admins, links) will remain untouched.\n\n"
-        "<b>STEP 1 OF 2 — Click confirm to continue:</b>",
-        reply_markup=ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True),
-        parse_mode="HTML",
-    )
-
-
-@dp.message(BackupResetStates.waiting_for_confirm_button)
-async def process_backup_reset_step1(message: types.Message, state: FSMContext):
-    if message.text != "🔴 CONFIRM BACKUP RESET":
-        await state.clear()
-        return await message.answer("✅ Backup reset cancelled.", reply_markup=get_backup_menu(), parse_mode="HTML")
-
-    reset_pin = "".join(str(random.randint(0, 9)) for _ in range(8))
-    await state.update_data(backup_reset_pin=reset_pin)
-    await state.set_state(BackupResetStates.waiting_for_confirm_text)
-
-    await message.answer(
-        "🛑 <b>STEP 2 OF 2 — ENTER SECURITY PIN</b> 🛑\n\n"
-        "Type this PIN exactly to execute backup reset:\n\n"
-        f"<code>{reset_pin}</code>\n\n"
-        "Any other input or ❌ CANCEL aborts the action.",
-        reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="❌ CANCEL")]], resize_keyboard=True),
-        parse_mode="HTML",
-    )
-
-
-@dp.message(BackupResetStates.waiting_for_confirm_text)
-async def process_backup_reset_execute(message: types.Message, state: FSMContext):
-    data = await state.get_data()
-    expected_pin = data.get("backup_reset_pin", "")
-
-    if message.text.strip() != expected_pin:
-        await state.clear()
-        return await message.answer(
-            "✅ Backup reset cancelled. PIN did not match — no backup data was erased.",
-            reply_markup=get_backup_menu(),
-            parse_mode="HTML",
-        )
-
-    await state.clear()
-
-    try:
-        db_deleted = col_backups.delete_many({}).deleted_count
-
-        local_deleted = 0
-        backup_dir = "backups"
-        if os.path.exists(backup_dir):
-            for item in os.listdir(backup_dir):
-                item_path = os.path.join(backup_dir, item)
-                if os.path.isfile(item_path):
-                    os.remove(item_path)
-                    local_deleted += 1
-                elif os.path.isdir(item_path) and item.lower() != "state":
-                    import shutil
-                    shutil.rmtree(item_path, ignore_errors=True)
-                    local_deleted += 1
-
-        await message.answer(
-            "✅ <b>BACKUP RESET COMPLETE</b>\n\n"
-            f"🗑 Mongo backup records deleted: <b>{db_deleted}</b>\n"
-            f"🗑 Local backup items deleted: <b>{local_deleted}</b>\n\n"
-            "ℹ️ Operational Bot3 data remains untouched.",
-            reply_markup=get_backup_menu(),
-            parse_mode="HTML",
-        )
-        logger.warning(f"⚠️ BACKUP RESET executed by MASTER_ADMIN {message.from_user.id}: mongo={db_deleted}, local={local_deleted}")
-    except Exception as e:
-        await message.answer(
-            f"❌ <b>BACKUP RESET FAILED:</b> <code>{e}</code>",
-            reply_markup=get_backup_menu(),
-            parse_mode="HTML",
-        )
-
-@dp.message(F.text == "💾 DOWNLOAD BACKUP")
-async def full_backup_start(message: types.Message):
-    if not await check_authorization(message, "Full Backup", "can_manage_admins"):
-        return
-    kb = ReplyKeyboardMarkup(keyboard=[
-        [KeyboardButton(text="📄 AS JSON"), KeyboardButton(text="🗜 AS ZIP")],
-        [KeyboardButton(text="◀️ BACK TO BACKUP MENU")]
-    ], resize_keyboard=True)
-    await message.answer(
-        "📦 <b>Select Backup Format:</b>\n\n"
-        "📄 <b>JSON:</b> One combined file containing all collections.\n"
-        "🗜 <b>ZIP:</b> Grouped individual collection files.",
-        reply_markup=kb, parse_mode="HTML"
-    )
-
-@dp.message(F.text.in_(["📄 AS JSON", "🗜 AS ZIP"]))
-async def process_full_backup_choice(message: types.Message):
-    if not await check_authorization(message, "Full Backup", "can_manage_admins"):
-        return
-    fmt = "json" if message.text == "📄 AS JSON" else "zip"
-    try:
-        processing_msg = await message.answer(f"⏳ Creating <b>{fmt.upper()}</b> backup — packaging collections...", parse_mode="HTML")
-        success, filepath, metadata = await create_backup_file(auto=False, fmt=fmt)
-
-        await processing_msg.delete()
-
-        if not success:
-            await message.answer("❌ Backup failed. Please try again later.", reply_markup=get_backup_menu())
-            try:
-                await bot.send_message(
-                    MASTER_ADMIN_ID,
-                    f"🚨 <b>MANUAL BACKUP FAILED!</b>\n\n"
-                    f"⚠️ User: {message.from_user.first_name or 'Unknown'} (ID: {message.from_user.id})\n"
-                    f"📅 Date: {now_local().strftime('%B %d, %Y')}\n"
-                    f"🕐 Time: {now_local().strftime('%I:%M %p')}\n\n"
-                    f"Please investigate the backup system!",
-                    parse_mode="HTML"
-                )
-            except:
-                pass
-            return
-
-        now_str = now_local().strftime("%Y-%m-%d %I:%M:%S %p")
-
-        caption = (
-            f"✅ <b>DOWNLOAD BACKUP CREATED ({fmt.upper()})</b>\n"
-            f"═══════════════════════\n\n"
-            f"📦 <b>File:</b> <code>{metadata['filename']}</code>\n"
-            f"💾 <b>Size:</b> {metadata['file_size_mb']:.2f} MB\n"
-            f"🕐 <b>Created:</b> {now_str}\n\n"
-            f"<b>📊 Collections inside:</b>\n"
-            f"├ 📄 bot3_pdfs — {metadata['pdfs_count']} records\n"
-            f"├ 📸 bot3_ig_content — {metadata['ig_count']} records\n"
-            f"├ 👤 bot3_admins — {metadata['admins_count']} records\n"
-            f"├ 🚫 bot3_banned_users — {metadata['banned_count']} records\n"
-            f"├ ⚙️ bot3_settings\n"
-            f"├ 📝 bot3_logs (last 500)\n"
-            f"└ 📋 bot3_user_activity (last 1000)\n\n"
-            f"<b>🎯 Click Stats:</b>\n"
-            f"├ 📸 IG: {metadata['total_ig_clicks']:,}\n"
-            f"├ ▶️ YT: {metadata['total_yt_clicks']:,}\n"
-            f"├ 📸 IGCC: {metadata['total_igcc_clicks']:,}\n"
-            f"└ 🔑 YT Code: {metadata['total_ytcode_clicks']:,}\n\n"
-            f"═══════════════════════\n"
-            f"💡 File sent above — save it to your device!"
-        )
-
-        await message.answer_document(
-            types.FSInputFile(filepath),
-            caption=caption,
-            parse_mode="HTML",
-            reply_markup=get_backup_menu()  # Restore the main backup menu keyboard!
-        )
-
-        log_user_action(message.from_user, "DOWNLOAD_BACKUP",
-                        f"Created {metadata['filename']} ({metadata['file_size_mb']:.2f} MB) as {fmt.upper()}")
-
-    except Exception as e:
-        logger.error(f"Backup error: {e}")
-        await message.answer("❌ Backup failed. Please try again later.", reply_markup=get_backup_menu())
-        try:
-            await bot.send_message(
-                MASTER_ADMIN_ID,
-                f"🚨 <b>BACKUP EXCEPTION!</b>\n\n"
-                f"❌ Error: <code>{str(e)}</code>\n"
-                f"👤 User: {message.from_user.first_name or 'Unknown'} (ID: {message.from_user.id})\n"
-                f"🕐 Time: {now_local().strftime('%I:%M %p')}\n\n"
-                f"Check the backup system immediately!",
-                parse_mode="HTML"
-            )
-        except:
-            logger.error("Could not notify admin of backup exception!")
-
-@dp.message(F.text == "📋 VIEW AS JSON")
-async def view_json_backup_handler(message: types.Message):
-    """Legacy stub — button removed from menu. Redirect to DOWNLOAD BACKUP message."""
-    if not await check_authorization(message, "View JSON Backup", "can_manage_admins"):
-        return
-    await message.answer(
-        "ℹ️ <b>VIEW AS JSON has been removed.</b>\n\n"
-        "Use <b>💾 DOWNLOAD BACKUP</b> to get a ZIP containing all JSON files.",
-        reply_markup=get_backup_menu(),
-        parse_mode="HTML"
-    )
-
-
-@dp.message(F.text == "📊 BACKUP STATS")
-async def backup_stats_handler(message: types.Message):
-    if not await check_authorization(message, "Backup Stats", "can_manage_users"):
-        return
-    """Show full database collection statistics"""
-    try:
-        # Per-collection counts
-        pdf_count      = col_pdfs.count_documents({})
-        ig_count       = col_ig_content.count_documents({})
-        admin_count    = col_admins.count_documents({})
-        banned_count   = col_banned_users.count_documents({})
-        settings_count = col_settings.count_documents({})
-        log_count      = col_logs.count_documents({})
-        backup_count   = col_backups.count_documents({})
-
-        # Total DB size
-        db_stats    = db.command("dbstats")
-        db_size_mb  = db_stats.get("dataSize", 0) / (1024 * 1024)
-
-        # Per-collection storage sizes
-        def _col_size_mb(col_name):
-            try:
-                s = db.command("collStats", col_name)
-                return s.get("size", 0) / (1024 * 1024)
-            except:
-                return 0.0
-
-        pdf_size_mb    = _col_size_mb("bot3_pdfs")
-        ig_size_mb     = _col_size_mb("bot3_ig_content")
-        admin_size_mb  = _col_size_mb("bot3_admins")
-        banned_size_mb = _col_size_mb("bot3_banned_users")
-        log_size_mb    = _col_size_mb("bot3_logs")
-
-        # Click totals via aggregation
-        pdf_agg = list(col_pdfs.aggregate([{"$group": {
-            "_id": None,
-            "clicks":    {"$sum": {"$ifNull": ["$clicks", 0]}},
-            "ig":        {"$sum": {"$ifNull": ["$ig_start_clicks", 0]}},
-            "yt":        {"$sum": {"$ifNull": ["$yt_start_clicks", 0]}},
-            "ytcode":    {"$sum": {"$ifNull": ["$yt_code_clicks", 0]}},
-        }}]))
-        ig_agg = list(col_ig_content.aggregate([{"$group": {
-            "_id": None,
-            "igcc": {"$sum": {"$ifNull": ["$ig_cc_clicks", 0]}},
-        }}]))
-        total_clicks  = pdf_agg[0]["clicks"] if pdf_agg else 0
-        ig_clicks     = pdf_agg[0]["ig"]     if pdf_agg else 0
-        yt_clicks     = pdf_agg[0]["yt"]     if pdf_agg else 0
-        ytcode_clicks = pdf_agg[0]["ytcode"] if pdf_agg else 0
-        igcc_clicks   = ig_agg[0]["igcc"]    if ig_agg else 0
-
-        # Today's additions
-        today_start = now_local().replace(hour=0, minute=0, second=0, microsecond=0)
-        today_pdfs  = col_pdfs.count_documents({"created_at": {"$gte": today_start}})
-        today_ig    = col_ig_content.count_documents({"created_at": {"$gte": today_start}})
-
-        text  = "📊 <b>DATABASE STATISTICS</b>\n"
-        text += "═══════════════════════════\n\n"
-
-        text += "<b>💾 STORAGE:</b>\n"
-        text += f"├ Total DB Size: {db_size_mb:.2f} MB\n"
-        text += f"├ bot3_pdfs: {pdf_size_mb:.3f} MB\n"
-        text += f"├ bot3_ig_content: {ig_size_mb:.3f} MB\n"
-        text += f"├ bot3_admins: {admin_size_mb:.3f} MB\n"
-        text += f"├ bot3_banned_users: {banned_size_mb:.3f} MB\n"
-        text += f"└ bot3_logs: {log_size_mb:.3f} MB\n\n"
-
-        text += "<b>📁 RECORDS PER COLLECTION:</b>\n"
-        text += f"├ 📄 bot3_pdfs: {pdf_count:,}\n"
-        text += f"├ 📸 bot3_ig_content: {ig_count:,}\n"
-        text += f"├ 👤 bot3_admins: {admin_count:,}\n"
-        text += f"├ 🚫 bot3_banned_users: {banned_count:,}\n"
-        text += f"├ ⚙️ bot3_settings: {settings_count:,}\n"
-        text += f"├ 📝 bot3_logs: {log_count:,}\n"
-        text += f"└ 💾 bot3_backups: {backup_count:,}\n\n"
-
-        text += "<b>🎯 TOTAL CLICKS:</b>\n"
-        text += f"├ All: {total_clicks:,}\n"
-        text += f"├ 📸 IG Start: {ig_clicks:,}\n"
-        text += f"├ ▶️ YT Start: {yt_clicks:,}\n"
-        text += f"├ 📸 IGCC: {igcc_clicks:,}\n"
-        text += f"└ 🔑 YT Code: {ytcode_clicks:,}\n\n"
-
-        text += "<b>📈 TODAY'S ACTIVITY:</b>\n"
-        text += f"├ New PDFs: {today_pdfs}\n"
-        text += f"└ New IG Content: {today_ig}\n\n"
-        
-        text += "<b>⚙️ SYSTEM POLICIES:</b>\n"
-        text += f"└ 90-Day Auto-Deletion: 🟢 Active (GDrive & Cluster)\n\n"
-
-        text += "═══════════════════════════\n"
-        text += f"🕐 <b>Updated:</b> {now_local().strftime('%I:%M:%S %p')}"
-
-        await message.answer(text, parse_mode="HTML", reply_markup=get_backup_menu())
-
-    except Exception as e:
-        logger.error(f"Stats error: {e}")
-        await message.answer(f"❌ Failed to retrieve stats. Please try again later.",
-                             reply_markup=get_backup_menu())
-
-# ────────────────────────────────────────────────
-# 📜 BACKUP HISTORY — paginated, 10 per page
-# ────────────────────────────────────────────────
-
-_BK_HISTORY_PAGE_SIZE = 10
-
-def _history_page_kb(page: int, total_pages: int) -> ReplyKeyboardMarkup:
-    nav = []
-    if page > 0:
-        nav.append(KeyboardButton(text=f"⬅️ PREV_BKHIST {page - 1}"))
-    if page < total_pages - 1:
-        nav.append(KeyboardButton(text=f"➡️ NEXT_BKHIST {page + 1}"))
-    rows = []
-    if nav:
-        rows.append(nav)
-    rows.append([KeyboardButton(text="◀️ BACK TO BACKUP MENU")])
-    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
-
-async def _render_history_page(message: types.Message, page: int):
-    all_backups = list(col_backups.find().sort([("year", -1), ("month_num", -1), ("created_at", -1)]))
-    total = len(all_backups)
-    if total == 0:
-        await message.answer(
-            "📜 <b>BACKUP HISTORY</b>\n\nNo backups found.",
-            reply_markup=get_backup_menu(), parse_mode="HTML"
-        )
-        return
-
-    total_pages = max(1, -(-total // _BK_HISTORY_PAGE_SIZE))
-    page = max(0, min(page, total_pages - 1))
-    start = page * _BK_HISTORY_PAGE_SIZE
-    chunk = all_backups[start: start + _BK_HISTORY_PAGE_SIZE]
-
-    lines = [
-        f"📜 <b>BACKUP HISTORY</b> — Page {page + 1}/{total_pages}",
-        f"📊 Total: {total} backup(s) | Stored in <code>bot3_backups</code>",
-        "─" * 28,
-    ]
-    for i, bk in enumerate(chunk, start=start + 1):
-        filename = bk.get("filename", "unknown")
-        size_mb  = bk.get("file_size_mb", 0)
-        bk_type  = bk.get("backup_type", "manual")
-        created_at = bk.get("created_at")
-        
-        # Parse Date Gracefully (Fall back to filename parsing if DB timestamp missing)
-        time_str = "?"
-        if created_at and hasattr(created_at, "strftime"):
-             time_str = created_at.strftime("%b %d, %Y  %I:%M %p")
-        else:
-             try:
-                 parts = filename.split("_")
-                 parsed_d, parsed_t, parsed_ampm = None, None, None
-                 for p in reversed(parts):
-                     if "AM" in p.upper() or "PM" in p.upper():
-                         idx = parts.index(p)
-                         if idx >= 2:
-                             parsed_d = parts[idx-2]
-                             parsed_t = parts[idx-1].replace("-", ":")
-                             parsed_ampm = p.split(".")[0]
-                             break
-                 if parsed_d and parsed_t and parsed_ampm:
-                     time_str = f"{parsed_d} {parsed_t} {parsed_ampm}"
-                 else:
-                     time_str = str(created_at or "?")
-             except Exception:
-                 time_str = str(created_at or "?")
-
-        # Determine Feature & Format Used
-        ext = "ZIP" if filename.lower().endswith(".zip") else "JSON" if filename.lower().endswith(".json") else "FILE"
-        if bk_type == "auto":
-             type_icon = f"🔄 Auto Backup ({ext})"
-        else:
-             type_icon = f"👤 Full Backup ({ext})"
-             
-        gd_tag = " ☁️" if bk.get("gdrive_uploaded") else ""
-        
-        lines.append(
-            f"\n{i}. {type_icon}{gd_tag}\n"
-            f"   🗂 <code>{filename}</code>\n"
-            f"   💾 {size_mb:.2f} MB  |  📅 {time_str}\n"
-            f"   📄 PDFs: {bk.get('pdfs_count',0)}  📸 IG: {bk.get('ig_count',0)}"
-        )
-    lines.append("\n" + "─" * 28 + "\n☁️ = Uploaded to GDrive (90-day TTL active)")
-    await message.answer("\n".join(lines), reply_markup=_history_page_kb(page, total_pages), parse_mode="HTML")
-
-@dp.message(F.text == "📜 BACKUP HISTORY", StateFilter(None, BackupStates.viewing_backup_menu))
-async def backup_history_handler(message: types.Message, state: FSMContext):
-    if not await check_authorization(message, "View Backup History", "can_manage_admins"): return
-    await state.set_state(BackupStates.viewing_history)
-    await _render_history_page(message, 0)
-    log_user_action(message.from_user, "VIEW_BACKUP_HISTORY", "Opened history pg 0")
-
-@dp.message(lambda m: m.text and m.text.startswith("⬅️ PREV_BKHIST"))
-async def bk_hist_prev(message: types.Message, state: FSMContext):
-    try: await _render_history_page(message, int(message.text.split()[-1]))
-    except: await _render_history_page(message, 0)
-
-@dp.message(lambda m: m.text and m.text.startswith("➡️ NEXT_BKHIST"))
-async def bk_hist_next(message: types.Message, state: FSMContext):
-    try: await _render_history_page(message, int(message.text.split()[-1]))
-    except: await _render_history_page(message, 0)
-
-@dp.message(F.text == "◀️ BACK TO BACKUP MENU")
-async def history_back_to_menu(message: types.Message, state: FSMContext):
-    await state.clear()
-    await backup_menu_handler(message, state)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 📥 DOWNLOAD — Browse & download MSANodeBackups records
-# ─────────────────────────────────────────────────────────────────────────────
-
-_BK_DL_PAGE_SIZE = 8  # records per page in selection list
-
-
-def _bk_list_page_kb(page: int, total_pages: int, prefix: str, state_cancel_text: str) -> ReplyKeyboardMarkup:
-    nav = []
-    if page > 0:
-        nav.append(KeyboardButton(text=f"⬅️ {prefix}_PREV {page - 1}"))
-    if page < total_pages - 1:
-        nav.append(KeyboardButton(text=f"➡️ {prefix}_NEXT {page + 1}"))
-    rows = []
-    if nav:
-        rows.append(nav)
-    rows.append([KeyboardButton(text="❌ CANCEL")])
-    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
-
-
-async def _render_cluster_backup_list(message: types.Message, page: int, prefix: str, title: str):
-    """Shared renderer: show paged MSANodeBackups list for Download or GDrive selection."""
-    import asyncio as _asyncio
-    loop = _asyncio.get_event_loop()
-    _backup_uri = os.environ.get("BACKUP_MONGO_URI") or MONGO_URI
-    _backup_db  = os.environ.get("BACKUP_MONGO_DB_NAME", "MSANodeBackups")
-
-    records = await loop.run_in_executor(
-        None,
-        lambda: list_cluster_backups("bot3", _backup_uri, _backup_db)
-    )
-
-    if not records:
-        await message.answer(
-            f"📦 <b>{title}</b>\n\n"
-            "No cluster backups found in MSANodeBackups.\n\n"
-            "💡 The weekly scheduler saves backups automatically every Sunday.\n"
-            "You can also use <b>💾 DOWNLOAD BACKUP</b> to create one now.",
-            reply_markup=get_backup_menu(),
-            parse_mode="HTML"
-        )
-        return None, None
-
-    total = len(records)
-    total_pages = max(1, -(-total // _BK_DL_PAGE_SIZE))
-    page = max(0, min(page, total_pages - 1))
-    start = page * _BK_DL_PAGE_SIZE
-
-    lines = [
-        f"📦 <b>{title}</b> — Page {page + 1}/{total_pages}",
-        f"📊 {total} backup(s) in MSANodeBackups",
-        f"{'─' * 28}",
-        "Reply with the <b>#number</b> to select:",
-        "",
-    ]
-    chunk = records[start: start + _BK_DL_PAGE_SIZE]
-    for i, rec in enumerate(chunk, start=start + 1):
-        bd = rec.get("backup_date") or rec.get("created_at", "")
-        if hasattr(bd, "strftime"):
-            bd_str = bd.strftime("%b %d, %Y  %I:%M %p")
-        else:
-            bd_str = str(bd)[:16] if bd else "?"
-        btype = rec.get("backup_type", "manual")
-        docs  = rec.get("docs", "?")
-        gd    = " ☁️" if rec.get("gdrive_uploaded") else ""
-        wk    = rec.get("window_key", "")[:12]
-        lines.append(f"{i}. {bd_str}  [{btype}]{gd}  docs:{docs}  ({wk})")
-
-    lines.append(f"\n{'─' * 28}")
-    text = "\n".join(lines)
-    kb = _bk_list_page_kb(page, total_pages, prefix, "❌ CANCEL")
-    await message.answer(text, reply_markup=kb, parse_mode="HTML")
-    return records, page
-
-
-@dp.message(F.text == "📥 DOWNLOAD", StateFilter(None, BackupStates.viewing_backup_menu))
-async def download_backup_start(message: types.Message, state: FSMContext):
-    """Browse cluster backups and select one to download."""
-    if not await check_authorization(message, "Download Backup", "can_manage_admins"):
-        return
-    await state.set_state(BackupStates.selecting_download)
-    await state.update_data(dl_page=0)
-    records, page = await _render_cluster_backup_list(message, 0, "BKDL", "DOWNLOAD BACKUP")
-    if records:
-        await state.update_data(dl_records=[r["_id"] for r in records], dl_page=page)
-    else:
-        await state.clear()
-
-
-@dp.message(lambda m: m.text and (m.text.startswith("⬅️ BKDL_PREV") or m.text.startswith("➡️ BKDL_NEXT")))
-async def download_backup_page(message: types.Message, state: FSMContext):
-    page = int(message.text.split()[-1])
-    records, pg = await _render_cluster_backup_list(message, page, "BKDL", "DOWNLOAD BACKUP")
-    if records:
-        await state.update_data(dl_records=[r["_id"] for r in records], dl_page=pg)
-
-
-@dp.message(BackupStates.selecting_download)
-async def download_backup_select(message: types.Message, state: FSMContext):
-    """Receive the selection number and send the ZIP."""
-    if message.text in ("❌ CANCEL", "❌ Cancel"):
-        await state.clear()
-        return await message.answer("✅ Download cancelled.", reply_markup=get_backup_menu())
-
-    # Pagination buttons handled by their own handlers above — skip text-only guard
-    if message.text and (message.text.startswith("⬅️ BKDL_PREV") or message.text.startswith("➡️ BKDL_NEXT")):
-        return
-
-    try:
-        idx = int(message.text.strip()) - 1
-    except (ValueError, TypeError):
-        return await message.answer("⚠️ Please reply with the <b>number</b> shown in the list.", parse_mode="HTML")
-
-    import asyncio as _asyncio
-    _backup_uri = os.environ.get("BACKUP_MONGO_URI") or MONGO_URI
-    _backup_db  = os.environ.get("BACKUP_MONGO_DB_NAME", "MSANodeBackups")
-
-    # Fetch full list to resolve index
-    loop = _asyncio.get_event_loop()
-    records = await loop.run_in_executor(
-        None, lambda: list_cluster_backups("bot3", _backup_uri, _backup_db)
-    )
-    if idx < 0 or idx >= len(records):
-        return await message.answer("❌ Invalid number. Please choose from the list.")
-
-    backup_id = records[idx]["_id"]
-    proc = await message.answer("⏳ <b>Fetching backup from MSANodeBackups…</b>", parse_mode="HTML")
-
-    zip_bytes, filename = await loop.run_in_executor(
-        None, lambda: download_cluster_backup(backup_id, "bot3", _backup_uri, _backup_db)
-    )
-    await proc.delete()
-
-    if not zip_bytes:
-        await state.clear()
-        return await message.answer("❌ Failed to fetch backup. Check logs.", reply_markup=get_backup_menu())
-
-    import io as _io
-    await message.answer_document(
-        types.BufferedInputFile(zip_bytes, filename=filename),
-        caption=(
-            f"✅ <b>CLUSTER BACKUP DOWNLOAD</b>\n\n"
-            f"📦 <code>{filename}</code>\n"
-            f"💾 {len(zip_bytes) / 1024 / 1024:.2f} MB\n"
-            f"🕐 {now_local().strftime('%b %d, %Y  %I:%M %p')}"
-        ),
-        parse_mode="HTML"
-    )
-    await state.clear()
-    log_user_action(message.from_user, "DOWNLOAD_CLUSTER_BACKUP", f"Downloaded {filename}")
-
-
-
-
-
-# ──────────────────────────────────────────
-# 📤 UPLOAD DATA (Bot 3 collections only)
-# ──────────────────────────────────────────
-
-
-# Registry: collection name → unique upsert key
-_BOT3_RESTORE_COLLECTIONS = {
-    "bot3_pdfs":         "msa_code",
-    "bot3_ig_content":   "cc_number",   # unique index is on cc_number (int), not cc_code
-    "bot3_admins":       "user_id",
-    "bot3_banned_users": "user_id",
-    "bot3_settings":     "key",         # settings docs are keyed by {"key": "..."}
-    "bot3_logs":         "_id",
-    "bot3_backups":      "_id",
-    # short-name aliases (from older exports)
-    "bot3_pdfs":              "msa_code",
-    "bot3_ig_content":        "cc_number",
-    "admins":            "user_id",
-    "bot1_banned_users":      "user_id",
-    "bot3_settings":          "key",
-    "logs":              "_id",
-}
-
-@dp.message(F.text == "📤 UPLOAD DATA", StateFilter(None, BackupStates.viewing_backup_menu))
-async def bot3_json_restore_start(message: types.Message, state: FSMContext):
-    """Prompt admin to upload a JSON file to restore Bot 3 data. (Renamed from JSON RESTORE)"""
-    if not await check_authorization(message, "JSON Restore", "can_manage_admins"):
-        return
-    await state.set_state(BackupStates.waiting_for_json_file)
-    await state.update_data(json_restore_session={
-        "files": 0,
-        "upserted": 0,
-        "errors": 0,
-        "skipped_collections": [],
-    })
-    known = "\n".join(f"  • <code>{c}</code>" for c in sorted(set(_BOT3_RESTORE_COLLECTIONS)) if not c in ("bot3_pdfs","bot3_ig_content","admins","bot1_banned_users","bot3_settings","logs"))
-    await message.answer(
-        "📤 <b>JSON RESTORE — Bot 3</b>\n\n"
-        "Send <b>.json</b> files one-by-one, or send one <b>.zip</b> containing multiple JSON files.\n\n"
-        "<b>Accepted formats:</b>\n"
-        "• Multi-collection — <code>{\"bot3_pdfs\": [{...}], ...}</code>\n"
-        "• Single-collection array — <code>[{...}, ...]</code> (filename used as key)\n\n"
-        "<b>Session controls:</b>\n"
-        "• Send multiple files continuously\n"
-        "• Tap <b>✅ FINISH RESTORE</b> when done\n"
-        "• Tap <b>❌ CANCEL</b> to abort\n\n"
-        "<b>Known collections:</b>\n"
-        + known + "\n\n"
-        "⚠️ All inserts use <b>upsert</b> — no duplicates.\n"
-        "⚠️ Records missing a safe unique key are skipped (to prevent accidental duplicate inserts).",
-        reply_markup=ReplyKeyboardMarkup(
-            keyboard=[
-                [KeyboardButton(text="✅ FINISH RESTORE")],
-                [KeyboardButton(text="❌ CANCEL")],
-            ],
-            resize_keyboard=True
-        ),
-        parse_mode="HTML"
-    )
-
-
-@dp.message(BackupStates.waiting_for_json_file)
-async def bot3_json_restore_receive(message: types.Message, state: FSMContext):
-    """Receive JSON file and upsert records into Bot 3 collections."""
-    if not await check_authorization(message, "JSON Restore Receive", "can_manage_admins"):
-        await state.clear()
-        return
-
-    # Cancel/finish session
-    if message.text and message.text.strip().upper() == "✅ FINISH RESTORE":
-        data = await state.get_data()
-        session = data.get("json_restore_session", {})
-        files = int(session.get("files", 0))
-        upserted = int(session.get("upserted", 0))
-        errors = int(session.get("errors", 0))
-        await state.clear()
-        await message.answer(
-            "✅ <b>JSON RESTORE SESSION CLOSED</b>\n\n"
-            f"📁 Files processed: <b>{files}</b>\n"
-            f"📊 Total upserted: <b>{upserted:,}</b>\n"
-            f"⚠️ Total errors/skips: <b>{errors:,}</b>\n\n"
-            "Backup menu restored.",
-            reply_markup=get_backup_menu(),
-            parse_mode="HTML",
-        )
-        return
-
-    if message.text and "CANCEL" in message.text.upper():
-        await state.clear()
-        await message.answer("✅ JSON restore cancelled.",
-                             reply_markup=get_backup_menu(), parse_mode="HTML")
-        return
-
-    if not message.document:
-        await message.answer("❌ Please send a <b>.json</b> / <b>.zip</b> file, or tap ✅ FINISH RESTORE / ❌ CANCEL.",
-                             parse_mode="HTML")
-        return
-
-    doc = message.document
-    fname = (doc.file_name or "").lower()
-    if not (fname.endswith(".json") or fname.endswith(".zip")):
-        await message.answer("❌ Only <b>.json</b> or <b>.zip</b> files are accepted for Bot 3 restore.",
-                             parse_mode="HTML")
-        return
-
-    status_msg = await message.answer("⏳ <b>Downloading file...</b>", parse_mode="HTML")
-
-    import io as _io
-    import json as _json
-    import os as _os
-    import re as _re
-    import zipfile as _zipfile
-    from bson import ObjectId as _ObjId
-
-    def _normalize_payload(payload_obj, source_name):
-        """Return (col_map, ignored_non_list_fields, error_text)."""
-        if isinstance(payload_obj, dict):
-            col_map_local = {}
-            ignored_fields = []
-            for k, v in payload_obj.items():
-                if not isinstance(v, list):
-                    ignored_fields.append(k)
-                    continue
-                resolved = _re.sub(r'_\d{4}-\d{2}-\d{2}.*$', '', str(k))
-                col_map_local.setdefault(resolved, []).extend(v)
-            return col_map_local, ignored_fields, None
-
-        if isinstance(payload_obj, list):
-            stem = _os.path.basename(source_name or "unknown")
-            for ext in (".json.gz", ".json"):
-                if stem.lower().endswith(ext):
-                    stem = stem[:-len(ext)]
-                    break
-            stem = _re.sub(r'_\d{4}-\d{2}-\d{2}.*$', '', stem)
-            return {stem: payload_obj}, [], None
-
-        return {}, [], "❌ <b>Invalid JSON structure.</b>\n\nExpected <code>{collection: [...]}</code> or <code>[...]</code>."
-
-    try:
-        file_info = await bot.get_file(doc.file_id)
-        buf = _io.BytesIO()
-        await bot.download_file(file_info.file_path, buf)
-        raw_bytes = buf.getvalue()
-
-        col_map = {}
-        ignored_non_list = []
-        parsed_json_parts = 0
-
-        if fname.endswith(".zip"):
-            with _zipfile.ZipFile(_io.BytesIO(raw_bytes), "r") as zf:
-                json_members = [n for n in zf.namelist() if not n.endswith("/") and n.lower().endswith(".json")]
-                if not json_members:
-                    raise ValueError("ZIP contains no .json files")
-
-                for member_name in json_members:
-                    with zf.open(member_name) as fp:
-                        member_bytes = fp.read()
-                    member_payload = _json.loads(member_bytes.decode("utf-8-sig"))
-                    part_map, part_ignored, part_err = _normalize_payload(member_payload, member_name)
-                    if part_err:
-                        raise ValueError(f"{member_name}: invalid JSON structure")
-                    for k, v in part_map.items():
-                        col_map.setdefault(k, []).extend(v)
-                    ignored_non_list.extend([f"{member_name}:{field}" for field in part_ignored])
-                    parsed_json_parts += 1
-        else:
-            payload = _json.loads(raw_bytes.decode("utf-8-sig"))
-            part_map, part_ignored, part_err = _normalize_payload(payload, doc.file_name or "uploaded.json")
-            if part_err:
-                await status_msg.edit_text(part_err, parse_mode="HTML")
-                return
-            for k, v in part_map.items():
-                col_map.setdefault(k, []).extend(v)
-            ignored_non_list.extend(part_ignored)
-            parsed_json_parts = 1
-
-    except Exception as parse_err:
-        await status_msg.edit_text(
-            f"❌ <b>Failed to read file</b>\n\n<code>{str(parse_err)[:300]}</code>",
-            parse_mode="HTML"
-        )
-        await message.answer("Please send another file, or tap ✅ FINISH RESTORE.")
-        return
-
-    await status_msg.edit_text("⏳ <b>Processing collections...</b>", parse_mode="HTML")
-
-    results = {}
-    skipped = []
-    total_upserted = 0
-    total_errors = 0
-
-    def _coerce_id(d):
-        raw = d.get("_id")
-        if isinstance(raw, str) and len(raw) == 24:
-            try:
-                d["_id"] = _ObjId(raw)
-            except Exception:
-                pass
-        return d
-
-    for col_name, docs in col_map.items():
-        if col_name not in _BOT3_RESTORE_COLLECTIONS:
-            skipped.append(col_name)
-            continue
-
-        unique_key = _BOT3_RESTORE_COLLECTIONS[col_name]
-        # Resolve alias to real collection name
-        real_col_name = col_name if col_name.startswith("bot3_") else f"bot3_{col_name}" if col_name not in ("bot3_pdfs","bot3_ig_content","admins","bot1_banned_users","bot3_settings","logs") else {
-            "bot3_pdfs": "bot3_pdfs", "bot3_ig_content": "bot3_ig_content",
-            "admins": "bot3_admins", "bot1_banned_users": "bot3_banned_users",
-            "bot3_settings": "bot3_settings", "logs": "bot3_logs"
-        }[col_name]
-        collection = db[real_col_name]
-        upserted = 0
-        errors = 0
-
-        for raw_doc in docs:
-            if not isinstance(raw_doc, dict):
-                errors += 1
-                continue
-            try:
-                d = _coerce_id(dict(raw_doc))
-
-                # Normalize common unique keys to avoid accidental type-based duplicates.
-                if unique_key in ("cc_number", "user_id"):
-                    key_candidate = d.get(unique_key)
-                    if isinstance(key_candidate, str) and key_candidate.strip().isdigit():
-                        d[unique_key] = int(key_candidate.strip())
-                if unique_key == "msa_code" and isinstance(d.get("msa_code"), str):
-                    d["msa_code"] = d["msa_code"].strip().upper()
-
-                if unique_key == "_id":
-                    if "_id" in d:
-                        collection.replace_one({"_id": d["_id"]}, d, upsert=True)
-                    else:
-                        errors += 1
-                        continue
-                else:
-                    key_val = d.get(unique_key)
-                    if key_val is None:
-                        if "_id" in d:
-                            collection.replace_one({"_id": d["_id"]}, d, upsert=True)
-                        else:
-                            errors += 1
-                            continue
-                    else:
-                        collection.update_one(
-                            {unique_key: key_val},
-                            {"$set": d},
-                            upsert=True
-                        )
-                upserted += 1
-            except Exception:
-                errors += 1
-
-        results[real_col_name] = {"upserted": upserted, "errors": errors}
-        total_upserted += upserted
-        total_errors += errors
-
-    # Build result message
-    lines = ["✅ <b>JSON FILE PROCESSED (Bot 3)</b>\n"]
-    lines.append(f"📦 Source: <code>{doc.file_name or 'uploaded_file'}</code>")
-    lines.append(f"🧩 JSON parts parsed: <b>{parsed_json_parts}</b>\n")
-    for cn, r in results.items():
-        emoji = "✅" if r["errors"] == 0 else "⚠️"
-        lines.append(
-            f"{emoji} <code>{cn}</code>: +{r['upserted']:,} upserted"
-            + (f", {r['errors']} errors" if r["errors"] else "")
-        )
-    if skipped:
-        lines.append("\n⚠️ <b>Skipped (not Bot 3 collections):</b>")
-        for s in skipped:
-            lines.append(f"  • {s}")
-    if ignored_non_list:
-        lines.append("\nℹ️ <b>Ignored non-list fields:</b>")
-        for fld in ignored_non_list[:20]:
-            lines.append(f"  • {fld}")
-        if len(ignored_non_list) > 20:
-            lines.append(f"  • ... and {len(ignored_non_list) - 20} more")
-
-    lines.append(f"\n📊 <b>File upserted: {total_upserted:,}</b>")
-    lines.append(f"⚠️ <b>File errors/skips: {total_errors + len(skipped):,}</b>")
-    lines.append("\nAll writes used upsert against unique keys to prevent duplicates.")
-
-    data = await state.get_data()
-    session = data.get("json_restore_session", {
-        "files": 0,
-        "upserted": 0,
-        "errors": 0,
-        "skipped_collections": [],
-    })
-    session["files"] = int(session.get("files", 0)) + 1
-    session["upserted"] = int(session.get("upserted", 0)) + total_upserted
-    session["errors"] = int(session.get("errors", 0)) + total_errors + len(skipped)
-    merged_skipped = list(dict.fromkeys((session.get("skipped_collections", []) or []) + skipped))
-    session["skipped_collections"] = merged_skipped
-    await state.update_data(json_restore_session=session)
-
-    lines.append("\n🔁 Send next file, or tap <b>✅ FINISH RESTORE</b>.")
-
-    await status_msg.edit_text("\n".join(lines), parse_mode="HTML")
-
-    log_user_action(message.from_user, "JSON_RESTORE_BOT3",
-                    f"Restored {total_upserted} records from {doc.file_name} (errors={total_errors}, skipped_cols={len(skipped)})")
 
 
 # ==========================================
@@ -11381,6 +10646,7 @@ async def main():
         else:
             # ── POLLING MODE (local dev fallback) ──────────────────────────
             logger.info("ℹ️ No RENDER_EXTERNAL_URL — using polling (local dev mode)")
+            await bot.delete_webhook(drop_pending_updates=True)
             await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
         # Cleanup on shutdown
