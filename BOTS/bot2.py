@@ -1360,6 +1360,7 @@ async def retry_operation(operation, max_retries=3, base_delay=1.0, operation_na
     # If we get here, all retries failed
     raise last_exception
 
+
 BOT_TOKEN = os.getenv("BOT_2_TOKEN")
 BOT_1_TOKEN = os.getenv("BOT_1_TOKEN")  # Bot 1 for delivery
 MASTER_ADMIN_ID = int(os.getenv("MASTER_ADMIN_ID", "0"))
@@ -1442,13 +1443,15 @@ else:
         _backup_mongo_uri,
         maxPoolSize=10,
         minPoolSize=1,
+        maxIdleTimeMS=30000,
         serverSelectionTimeoutMS=8000,
         connectTimeoutMS=10000,
         socketTimeoutMS=30000,
         retryWrites=True,
         retryReads=True,
         w="majority",
-        tlsCAFile=certifi.where(),   # Use proper CA bundle — fixes TLSV1_ALERT_INTERNAL_ERROR
+        tlsCAFile=certifi.where(),
+        tlsAllowInvalidCertificates=True
     )
     # ── Startup connectivity ping — alert owner if backup cluster unreachable ──
     try:
@@ -16859,7 +16862,7 @@ async def _check_gdrive_token_startup():
                 "⚠️ <b>Google Drive Token Expired / Missing</b>\n\n"
                 "☁️ GDRIVE SYSTEM uploads will fail until this is fixed.\n\n"
                 "<b>Fix steps:</b>\n"
-                "1. Run <code>python bot4.py</code> locally\n"
+                "1. Run <code>python bot2.py</code> locally\n"
                 "2. Complete Google OAuth in browser\n"
                 "3. Fresh <code>token.json</code> is created\n"
                 "4. Restart Bot 2",
