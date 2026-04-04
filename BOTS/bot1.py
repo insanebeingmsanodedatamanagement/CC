@@ -18,7 +18,6 @@ if sys.platform == 'win32':
     sys.stdout.reconfigure(encoding='utf-8')
     sys.stderr.reconfigure(encoding='utf-8')
 from zoneinfo import ZoneInfo
-from dotenv import load_dotenv
 import aiohttp
 from aiohttp import web as aiohttp_web
 
@@ -48,8 +47,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter, TelegramNetworkError, TelegramUnauthorizedError
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
-# Load environment variables
-load_dotenv("bot1.env", override=True)
+
 
 # ==========================================
 # ⚡ CONFIGURATION  — all values from env vars
