@@ -27,14 +27,14 @@ try:
     bot_backup = BackupManager("bot1")
 except ImportError:
     bot_backup = None
-    print("⚠️ backup_manager module not found — Automatic backups disabled")
+    # backup_manager is an optional standalone module — not required for core bot operation
 from aiogram import Bot, Dispatcher, types, F
 
 # ── Unified weekly backup system ──
 try:
     from backup_schedulers import weekly_backup_scheduler, monthly_export_scheduler
 except ImportError:
-    print("⚠️ backup_schedulers module not found — weekly backups disabled")
+    # backup_schedulers is an optional standalone module — not required for core bot operation
     weekly_backup_scheduler = None
     monthly_export_scheduler = None
 from aiogram.filters import CommandStart, Command, StateFilter
@@ -46,7 +46,6 @@ from aiogram.enums import ParseMode
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter, TelegramNetworkError, TelegramUnauthorizedError
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
-
 
 
 # ==========================================
@@ -280,15 +279,16 @@ try:
     import certifi
     client = pymongo.MongoClient(
         MONGO_URI,
-        maxPoolSize=50,          # Up to 50 concurrent connections
-        minPoolSize=5,           # Keep 5 always alive
-        maxIdleTimeMS=30000,     # Close idle connections after 30 s
-        serverSelectionTimeoutMS=5000,  # Fail fast on unavailable
+        maxPoolSize=20,           # Reduced pool — fewer idle connections to expire
+        minPoolSize=1,            # Keep only 1 always alive (less load on Atlas)
+        maxIdleTimeMS=55000,      # Close idle after 55s (Atlas kills at 60s — stay under)
+        heartbeatFrequencyMS=10000,  # Ping every 10s — detects dead connections fast
+        serverSelectionTimeoutMS=10000,  # Allow 10s for server selection on reconnect
         connectTimeoutMS=10000,
         socketTimeoutMS=30000,
         retryWrites=True,
         retryReads=True,
-        w="majority",            # Write concern – durable
+        w="majority",             # Write concern – durable
         tlsCAFile=certifi.where()
     )
     db = client[MONGO_DB_NAME]
@@ -448,7 +448,6 @@ def _is_new_unique_click(user_id: int, item_id, click_type: str) -> bool:
     Returns True on the FIRST click, False on every subsequent click.
     """
     try:
-        from pymongo.errors import DuplicateKeyError
         col_dedup = db["bot3_user_activity"]
         key = {"user_id": user_id, "item_id": str(item_id), "click_type": click_type}
         result = col_dedup.update_one(
@@ -460,7 +459,6 @@ def _is_new_unique_click(user_id: int, item_id, click_type: str) -> bool:
         return result.upserted_id is not None
     except Exception as e:
         # DuplicateKeyError = race lost = already exists = not a new click
-        from pymongo.errors import DuplicateKeyError
         if isinstance(e, DuplicateKeyError):
             return False
         logger.warning(f"Dedup check failed ({click_type}): {e}; allowing increment")
@@ -1158,9 +1156,14 @@ def check_ticket_rate_limit(user_id: int, user_name: str = "You") -> tuple[bool,
     now = now_local()
     cutoff = now - timedelta(hours=TICKET_COOLDOWN_HOURS)
 
-    # Find the most recently submitted ticket by this user
+    # Find the most recently SUBMITTED ticket by this user
+    # (exclude security_lock records — they are not real ticket submissions)
     last_ticket = col_support_tickets.find_one(
-        {"user_id": user_id},
+        {
+            "user_id": user_id,
+            "status": {"$in": ["open", "resolved", "archived"]},
+            "type":   {"$ne": "security_lock"},
+        },
         sort=[("created_at", -1)]
     )
 
@@ -1355,19 +1358,19 @@ async def send_psychological_vault_lock_message(user_id: int):
         msg = (
             f"⚡ **YOUR FIRST BLUEPRINT WAS JUST DELIVERED.**\n\n"
             f"That was a preview. What the full system holds is on another level entirely.\n\n"
-            f"Join the Vault now — it's 100% free — and unlock everything:\n\n"
+            f"Join our platforms — **YouTube, Instagram, and finally the Vault** — it's 100% free and unlocks everything:\n\n"
             f"📂 **All Blueprints**: Every premium PDF delivered instantly.\n"
             f"🤖 **Elite AI Tools**: Private automation scripts the public never sees.\n"
             f"💎 **Insider Strategies**: Reserved strictly for Vault members.\n"
             f"🔓 **Full Agent Menu**: Dashboard, search, and live updates unlocked.\n\n"
             f"This is the one action that separates access from opportunity.\n"
             f"Join free. Stay informed. Scale faster.\n\n"
-            f"*The Vault is open. Your next move decides everything.*"
+            f"*The platforms are open. Your next move decides everything.*"
         )
         kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="💎 JOIN MSA VAULT (Free)", url=CHANNEL_LINK)],
-            [InlineKeyboardButton(text="📸 INSTAGRAM", url=INSTAGRAM_LINK),
-             InlineKeyboardButton(text="▶️ YOUTUBE", url=YOUTUBE_LINK)]
+            [InlineKeyboardButton(text="📸 INSTAGRAM", url=INSTAGRAM_LINK)],
+            [InlineKeyboardButton(text="▶️ YOUTUBE", url=YOUTUBE_LINK)],
+            [InlineKeyboardButton(text="💎 JOIN MSA VAULT (Free)", url=CHANNEL_LINK)]
         ])
         await bot.send_message(user_id, msg, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
@@ -2287,38 +2290,6 @@ async def _send_vault_rejoin_message(message_or_callback, user_id: int, user_nam
         )
     return True
 
-async def _require_vault_check(message) -> bool:
-    """Vault gate for Message handlers.
-    Sends rejoin message (respecting 60s cooldown) and returns True if user is NOT in vault.
-    Returns False if user IS in vault (allow the handler to continue)."""
-    user_id = message.from_user.id
-    user_name = message.from_user.first_name or "User"
-    is_in_vault = await check_channel_membership(user_id)
-    if not is_in_vault:
-        await _send_vault_rejoin_message(message, user_id, user_name)
-        return True   # blocked
-    return False      # allowed
-
-async def require_vault_access(handler_func):
-    """Decorator to ensure user is in vault before accessing any feature"""
-    async def wrapper(message_or_callback):
-        # Get user ID
-        if hasattr(message_or_callback, 'from_user'):
-            user_id = message_or_callback.from_user.id
-            user_name = message_or_callback.from_user.first_name or "User"
-        else:
-            return
-
-        # Check vault membership; send rejoin at most once per cooldown
-        is_in_vault = await check_channel_membership(user_id)
-        if not is_in_vault:
-            await _send_vault_rejoin_message(message_or_callback, user_id, user_name)
-            return   # blocked
-
-        # User is in vault — allow access
-        await handler_func(message_or_callback)
-
-    return wrapper
 
 async def check_if_banned(user_id: int) -> dict | None:
     """Check if user is banned. Returns ban doc if banned, None otherwise. Auto-unbans expired temporary bans."""
@@ -2517,24 +2488,6 @@ def generate_digits(length=8):
     """Generate random digit code"""
     return "".join(secrets.choice(string.digits) for _ in range(length))
 
-async def ensure_pdf_codes(pdf):
-    """Ensure PDF has all start codes - creates them if missing"""
-    from typing import Any
-    pdf_doc: dict[str, Any] = dict(pdf)
-    updates: dict[str, Any] = {}
-    if not pdf_doc.get("ig_start_code"):
-        updates["ig_start_code"] = generate_alphanumeric(8)
-    if not pdf_doc.get("yt_start_code"):
-        updates["yt_start_code"] = generate_digits(8)
-    if not pdf_doc.get("aff_start_code"):
-        updates["aff_start_code"] = generate_digits(8)
-    if not pdf_doc.get("orig_start_code"):
-        updates["orig_start_code"] = generate_digits(8)
-    
-    if updates:
-        col_pdfs.update_one({"_id": pdf_doc["_id"]}, {"$set": updates})
-        return {**pdf_doc, **updates}
-    return pdf_doc
 
 async def ensure_ig_cc_code(content) -> dict:
     """Ensure IG content has start_code"""
@@ -2578,9 +2531,6 @@ async def show_access_denied_animation(message: types.Message, user_id: int, pay
     else:
         logger.warning(f"SECURITY BREACH: User {user_id} tried invalid link")
 
-def get_pdf_content(index: int):
-    """Fetch PDF content by index from bot3_pdfs collection"""
-    return col_pdfs.find_one({"index": index})
 
 # ==========================================
 # 🎬 HANDLERS
@@ -2601,7 +2551,12 @@ async def cmd_start(message: types.Message, state: FSMContext):
     # ==========================================
     # 🚫 BAN CHECK - Highest Priority
     # ==========================================
-    ban_doc = await check_if_banned(user_id)
+    try:
+        ban_doc = await check_if_banned(user_id)
+    except Exception as ban_err:
+        logger.warning(f"⚠️ Ban check DB error for user {user_id}: {ban_err} — failing open")
+        ban_doc = None  # Fail open: never block legit users due to DB hiccup
+
     if ban_doc:
         banned_at = ban_doc.get("banned_at", now_local())
         ban_type = ban_doc.get("ban_type", "permanent")
@@ -3550,10 +3505,19 @@ async def cmd_start(message: types.Message, state: FSMContext):
     await asyncio.sleep(ANIM_PAUSE)
     
     # Now check verification status
-    user_data = get_user_verification_status(user_id)
+    try:
+        user_data = get_user_verification_status(user_id)
+    except Exception as _vd_err:
+        logger.warning(f"⚠️ get_user_verification_status DB error for {user_id}: {_vd_err} — using empty dict")
+        user_data = {}
     
     # ALWAYS check if user is in vault channel (real-time check)
-    is_in_vault = await check_channel_membership(user_id)
+    try:
+        is_in_vault = await check_channel_membership(user_id)
+    except Exception as _vault_err:
+        logger.warning(f"⚠️ check_channel_membership error for {user_id}: {_vault_err} — falling back")
+        # Fallback: use last known saved status if available, else treat as unknown
+        is_in_vault = user_data.get("vault_joined", False)
 
     # ── PRE-VAULT SYNC (idempotent) — runs only once, skips if already synced ──
     # Handles the special case: user was already in vault BEFORE ever starting bot1.
@@ -3604,8 +3568,8 @@ You have just activated the **MSA NODE Agent**. This isn't just a bot — it's y
 
 **🔑 How to Get Instant Access:**
 
-1️⃣ Tap **💎 JOIN MSA VAULT** below to enter our exclusive circle.
-2️⃣ Follow us on **YouTube & Instagram** for the latest MSA Codes.
+1️⃣ Follow us on **YouTube & Instagram** for the latest MSA Codes.
+2️⃣ Tap **💎 JOIN MSA VAULT** below to enter our exclusive circle.
 3️⃣ Return here → Your agent will automatically unlock all features.
 
 ━━━━━━━━━━━━━━━━━━━━
@@ -7391,7 +7355,12 @@ def _build_ticket_history_page(tickets: list, page: int, first_name: str) -> str
     char_count  = t.get("character_count", 0)
     support_num = t.get("support_count", page + 1)
     issue_text  = (t.get("issue_text") or "")
-    preview     = _esc_md(issue_text)
+    # Safe preview — hard-cap at 300 chars so card never exceeds Telegram's 4096-char limit
+    _MAX_PREVIEW = 300
+    if len(issue_text) > _MAX_PREVIEW:
+        preview = _esc_md(issue_text[:_MAX_PREVIEW]) + "…"
+    else:
+        preview = _esc_md(issue_text)
 
     date_str = created_at.strftime("%B %d, %Y at %I:%M %p")
     status_badge = {
@@ -7452,12 +7421,16 @@ async def ticket_history_page_callback(callback: types.CallbackQuery):
         page       = int(parts[2])
         first_name = callback.from_user.first_name or "Member"
 
-        # Always fetch only the 3 most recent — same limit as MY TICKET view
+        # Always fetch top 5 most recent real tickets — same filter as MY TICKET view
         all_tickets = list(
             col_support_tickets
-            .find({"user_id": uid})
+            .find({
+                "user_id": uid,
+                "status": {"$in": ["open", "resolved", "archived"]},
+                "type":   {"$ne": "security_lock"},
+            })
             .sort("created_at", -1)
-            .limit(3)
+            .limit(5)
         )
         if not all_tickets:
             await callback.answer("No tickets found.", show_alert=False)
@@ -9389,9 +9362,22 @@ async def start_health_server():
     runner = aiohttp_web.AppRunner(app)
     await runner.setup()
     site = aiohttp_web.TCPSite(runner, "0.0.0.0", PORT)
-    await site.start()
-    logger.info(f"🌐 Web server running on port {PORT}")
-    return runner
+    try:
+        await site.start()
+        logger.info(f"🌐 Web server running on port {PORT}")
+        return runner
+    except OSError as e:
+        # Port already in use — non-fatal on local dev, fatal on Render (PORT is unique there)
+        _is_render = bool(os.environ.get("RENDER") or os.environ.get("RENDER_EXTERNAL_URL"))
+        if _is_render:
+            # On Render this should never happen — propagate so the service restarts
+            raise
+        logger.warning(
+            f"⚠️ Health server could not bind to port {PORT}: {e}\n"
+            f"   Bot will run WITHOUT health endpoint (local dev only — safe to ignore)."
+        )
+        await runner.cleanup()
+        return None
 
 
 # ==========================================
@@ -9525,6 +9511,7 @@ async def main():
         else:
             # ── POLLING MODE (local dev fallback) ──────────────────────────
             logger.info("ℹ️ No RENDER_EXTERNAL_URL — using polling (local dev mode)")
+            await bot.delete_webhook(drop_pending_updates=True)
             await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
     except TelegramUnauthorizedError as e:
