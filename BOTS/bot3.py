@@ -33,19 +33,6 @@ from aiohttp import web
 import html as _html
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
-# Load environment variables.
-# Priority:
-# 1) Explicit BOT3_ENV_FILE override
-# 2) Backward-compatible default files used in existing deployments
-_explicit_env_file = os.environ.get("BOT3_ENV_FILE", "").strip()
-if _explicit_env_file:
-    ENV_FILE_CANDIDATES = (_explicit_env_file, "bot3.env", "bot3.env.txt", "BOT3.env", ".env")
-else:
-    ENV_FILE_CANDIDATES = ("bot3.env", "bot3.env.txt", "BOT3.env", ".env")
-
-ACTIVE_ENV_FILE = next((p for p in ENV_FILE_CANDIDATES if os.path.exists(p)), "BOT3.env")
-
-
 # ==========================================
 # ENTERPRISE CONFIGURATION
 # ==========================================
@@ -10532,18 +10519,35 @@ async def generate_daily_report():
         ig_cc_clicks_24h = 0
         yt_clicks_24h = 0
         
+        from dateutil.parser import parse as _parse_date
+        def _safe_dt(val):
+            if not val:
+                return None
+            if isinstance(val, str):
+                try:
+                    return _parse_date(val).replace(tzinfo=None)
+                except:
+                    return None
+            return val.replace(tzinfo=None) if hasattr(val, 'replace') else val
+
         # Count clicks from PDFs in last 24 hours
         for pdf in col_pdfs.find({}):
-            if pdf.get('last_clicked_at') and pdf['last_clicked_at'] >= yesterday.replace(tzinfo=None):
+            lca = _safe_dt(pdf.get('last_clicked_at'))
+            if lca and lca >= yesterday.replace(tzinfo=None):
                 total_clicks_24h += pdf.get('clicks', 0)
-            if pdf.get('last_affiliate_click') and pdf['last_affiliate_click'] >= yesterday.replace(tzinfo=None):
+            
+            lac = _safe_dt(pdf.get('last_affiliate_click'))
+            if lac and lac >= yesterday.replace(tzinfo=None):
                 pdf_clicks_24h += pdf.get('affiliate_clicks', 0)
-            if pdf.get('last_yt_click') and pdf['last_yt_click'] >= yesterday.replace(tzinfo=None):
+            
+            lyc = _safe_dt(pdf.get('last_yt_click'))
+            if lyc and lyc >= yesterday.replace(tzinfo=None):
                 yt_clicks_24h += pdf.get('yt_start_clicks', 0)
         
         # Count IG CC clicks in last 24 hours
         for ig in col_ig_content.find({}):
-            if ig.get('last_ig_cc_click') and ig['last_ig_cc_click'] >= yesterday.replace(tzinfo=None):
+            licc = _safe_dt(ig.get('last_ig_cc_click'))
+            if licc and licc >= yesterday.replace(tzinfo=None):
                 ig_cc_clicks_24h += ig.get('ig_cc_clicks', 0)
         
         # Get system metrics
