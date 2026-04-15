@@ -47,7 +47,6 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter, TelegramNetworkError, TelegramUnauthorizedError
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
-
 # ==========================================
 # ⚡ CONFIGURATION  — all values from env vars
 # ==========================================
@@ -3868,6 +3867,7 @@ async def handle_vault_join(event: ChatMemberUpdated):
         pending_payload = user_data.get('pending_payload')  # ← KEY: Get any pending payload they clicked
         
         # Update verification status and mark as EVER verified (for old user detection)
+        was_ever_verified = existing_bot1_user.get('ever_verified', False)
         update_verification_status(user_id, vault_joined=True, verified=True, ever_verified=True, rejoin_msg_id=None)
         # Clear any inactive-tracking fields from when they left — they're back now
         col_user_verification.update_one(
@@ -3935,22 +3935,38 @@ async def handle_vault_join(event: ChatMemberUpdated):
         
         # Send welcome message to user's DM
         try:
-            msg_success = (
-                f"👑 **{user_name}, You're Inside. Access Granted.**\n\n"
-                f"The **MSA NODE Agent** has verified your clearance.\n"
-                f"You are now part of the most exclusive network in the system.\n\n"
-                f"━━━━━━━━━━━━━━━━━━━━\n\n"
-                f"⚡ **WHAT YOU JUST UNLOCKED (100% FREE):**\n\n"
-                f"🆔 **MSA+ ID**: `{msa_id}` — Your permanent agent identity\n"
-                f"📂 **Full Blueprint Library**: Every premium guide, strategy & PDF, delivered on demand\n"
-                f"🤖 **Elite AI Tools**: Private automation scripts and agent-grade playbooks\n"
-                f"📊 **Live Intel Dashboard**: Real-time performance, stats, and insider announcements\n"
-                f"🔎 **MSA Code Access**: Search any code and unlock exclusive drops instantly\n"
-                f"💬 **Priority Support**: Direct line to the MSA NODE team\n\n"
-                f"━━━━━━━━━━━━━━━━━━━━\n\n"
-                f"Most people never reach this level. You did.\n"
-                f"The agent is online. The system is yours. \u26a1"
-            )
+            if was_ever_verified:
+                msg_success = (
+                    f"✅ **{user_name}, Access Restored.**\n\n"
+                    f"Welcome back to the **MSA NODE Vault**.\n"
+                    f"Your agent privileges have been fully reactivated.\n\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n\n"
+                    f"⚡ **YOUR SYSTEM IS ONLINE:**\n\n"
+                    f"🆔 **MSA+ ID**: `{msa_id}` — Your permanent agent identity\n"
+                    f"📂 **Full Blueprint Library**: Instantly unlocked\n"
+                    f"🤖 **Elite AI Tools**: Ready for deployment\n"
+                    f"📊 **Live Intel Dashboard**: Updated and tracking\n"
+                    f"💬 **Priority Support**: Reactivated\n\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n\n"
+                    f"The agent is back online. Let's get to work. \u26a1"
+                )
+            else:
+                msg_success = (
+                    f"👑 **{user_name}, You're Inside. Access Granted.**\n\n"
+                    f"The **MSA NODE Agent** has verified your clearance.\n"
+                    f"You are now part of the most exclusive network in the system.\n\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n\n"
+                    f"⚡ **WHAT YOU JUST UNLOCKED (100% FREE):**\n\n"
+                    f"🆔 **MSA+ ID**: `{msa_id}` — Your permanent agent identity\n"
+                    f"📂 **Full Blueprint Library**: Every premium guide, strategy & PDF, delivered on demand\n"
+                    f"🤖 **Elite AI Tools**: Private automation scripts and agent-grade playbooks\n"
+                    f"📊 **Live Intel Dashboard**: Real-time performance, stats, and insider announcements\n"
+                    f"🔎 **MSA Code Access**: Search any code and unlock exclusive drops instantly\n"
+                    f"💬 **Priority Support**: Direct line to the MSA NODE team\n\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n\n"
+                    f"Most people never reach this level. You did.\n"
+                    f"The agent is online. The system is yours. \u26a1"
+                )
             await bot.send_message(user_id, msg_success, parse_mode=ParseMode.MARKDOWN)
             
             # Send menu keyboard immediately
@@ -3975,41 +3991,37 @@ async def handle_vault_join(event: ChatMemberUpdated):
             if pending_payload:
                 logger.info(f"⚡ Delivering pending payload '{pending_payload}' to user {user_id} after vault join")
                 
-                # Build a minimal mock message so we can re-use the cmd_start delivery logic
-                class _MockChat:
-                    def __init__(self, chat_id): self.id = chat_id
-                
-                class _MockMessage:
-                    """Duck-typed Message that routes .answer() to bot.send_message."""
-                    def __init__(self, uid, fname, uname, payload_text):
-                        class _FU:
-                            def __init__(self, i, fn, un): self.id = i; self.first_name = fn; self.username = un
-                        self.from_user = _FU(uid, fname, uname)
-                        self.text = f"/start {payload_text}"
-                        self.chat = _MockChat(uid)
-                        self.message_id = int(time.time())
-                    async def answer(self, text, **kwargs):
-                        return await bot.send_message(self.from_user.id, text, **kwargs)
-                    async def delete(self): pass
-                
-                _mock = _MockMessage(user_id, user_name, username, pending_payload)
-                _key = StorageKey(bot_id=bot.id, chat_id=user_id, user_id=user_id)
-                _fsm = FSMContext(storage=dp.storage, key=_key)
-                
-                # Capture local copies for the closure
-                _uid = user_id
-                _pp  = pending_payload
-                
-                async def _deliver_pending():
-                    try:
-                        user_last_command.pop(_uid, None)   # clear rate-limit
-                        clear_user_processing(_uid)          # clear anti-spam lock
-                        await cmd_start(_mock, _fsm)
-                        logger.info(f"✅ Pending payload '{_pp}' delivered to {_uid}")
-                    except Exception as _e:
-                        logger.error(f"❌ Pending delivery failed for {_uid}: {_e}\n{traceback.format_exc()}")
-                
-                asyncio.create_task(_deliver_pending())
+                from aiogram.types import Message, Chat, User
+                import time
+
+                try:
+                    _msg = Message(
+                        message_id=int(time.time()),
+                        date=now_local(),
+                        chat=Chat(id=user_id, type="private"),
+                        from_user=User(id=user_id, is_bot=False, first_name=user_name, username=username or "User"),
+                        text=f"/start {pending_payload}"
+                    ).as_(bot)
+
+                    _key = StorageKey(bot_id=bot.id, chat_id=user_id, user_id=user_id)
+                    _fsm = FSMContext(storage=dp.storage, key=_key)
+                    
+                    # Capture local copies for the closure
+                    _uid = user_id
+                    _pp  = pending_payload
+                    
+                    async def _deliver_pending():
+                        try:
+                            user_last_command.pop(_uid, None)   # clear rate-limit
+                            clear_user_processing(_uid)          # clear anti-spam lock
+                            await cmd_start(_msg, _fsm)
+                            logger.info(f"✅ Pending payload '{_pp}' delivered to {_uid}")
+                        except Exception as _e:
+                            logger.error(f"❌ Pending delivery failed for {_uid}: {_e}\n{traceback.format_exc()}")
+                    
+                    asyncio.create_task(_deliver_pending())
+                except Exception as e:
+                    logger.error(f"Failed to create and dispatch message for {user_id}: {e}")
                 
 
         except Exception as e:
@@ -4040,7 +4052,7 @@ async def handle_vault_join(event: ChatMemberUpdated):
         )
         
         # Get user data for keyboard
-        user_data = get_user_verification_status(user_id)
+        user_data = get_user_verification_status(user_id) or {}
         
         # Send instant rejoin message with button and store message ID
         try:
@@ -4053,7 +4065,12 @@ async def handle_vault_join(event: ChatMemberUpdated):
             )
             rejoin_msg = await bot.send_message(
                 user_id,
-                f"💫 **{user_name}, Your Journey Paused**\n\nWe see you've stepped away from the Vault. Life happens—we understand.\n\n💎 **Here's the thing:** Your spot? Still reserved.\n🎯 **Your community?** Still rooting for you.\n\n**When you're ready to return, we'll be right here.** One click brings you back.\n\n*No pressure. Just opportunity.* ✨",
+                f"🔒 **{user_name}, YOU LEFT THE VAULT**\n\n"
+                f"You had access. You gave it up.\n"
+                f"Now the system won't let you in.\n\n"
+                f"**You know the drill:**\n"
+                f"No vault = No features. No exceptions.\n\n"
+                f"💎 **Get back in. Restore your status.**",
                 reply_markup=get_verification_keyboard(user_id, user_data, show_all=False),
                 parse_mode=ParseMode.MARKDOWN
             )
