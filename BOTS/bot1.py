@@ -18,6 +18,7 @@ if sys.platform == 'win32':
     sys.stdout.reconfigure(encoding='utf-8')
     sys.stderr.reconfigure(encoding='utf-8')
 from zoneinfo import ZoneInfo
+
 import aiohttp
 from aiohttp import web as aiohttp_web
 
@@ -46,6 +47,8 @@ from aiogram.enums import ParseMode
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter, TelegramNetworkError, TelegramUnauthorizedError
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
+
+
 
 # ==========================================
 # ⚡ CONFIGURATION  — all values from env vars
@@ -3801,6 +3804,7 @@ _Select a service from the menu ⬇️_
 # ==========================================
 
 @dp.chat_member()
+@dp.my_chat_member()
 async def handle_vault_join(event: ChatMemberUpdated):
     """Detect when user joins vault and auto-send welcome message with source-specific rewards"""
     # Check if this is the vault channel
@@ -9520,7 +9524,10 @@ async def main():
             # ── WEBHOOK MODE (production) ───────────────────────────────────
             logger.info("🔄 Starting in WEBHOOK mode...")
             await bot.delete_webhook(drop_pending_updates=True)
-            await bot.set_webhook(_WEBHOOK_URL)
+            await bot.set_webhook(
+                url=_WEBHOOK_URL,
+                allowed_updates=["message", "edited_message", "callback_query", "chat_member", "my_chat_member"]
+            )
             logger.info(f"✅ Webhook set: {_WEBHOOK_URL}")
             # Webhook handler is registered in start_health_server()
             # Just keep alive — aiohttp serves incoming Telegram updates
