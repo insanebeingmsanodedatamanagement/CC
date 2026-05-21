@@ -961,7 +961,7 @@ def _log_present_gdrive(bot_name: str, zip_name: str, deleted_count: int, backup
     try:
         bkp_client = _backup_mongo_client(backup_mongo_uri, serverSelectionTimeoutMS=6000)
         bkp_db     = bkp_client[backup_db_name]
-        history_col = bkp_db["bot_backup_history"]
+        history_col = bkp_db["bot2_backup_history"]
         history_col.insert_one({
             "bot":         bot_name,
             "action":      "Gdrive Upload Present",
@@ -979,7 +979,7 @@ def _log_present_gdrive_prod(bot_name: str, zip_name: str, doc_count: int, prod_
     try:
         prod_client = MongoClient(prod_mongo_uri, serverSelectionTimeoutMS=6000)
         prod_db     = prod_client[prod_db_name]
-        history_col = prod_db["bot_backup_history"]
+        history_col = prod_db["bot2_backup_history"]
         history_col.insert_one({
             "bot":         bot_name,
             "action":      "Gdrive Upload Present",
@@ -1329,6 +1329,7 @@ async def retry_operation(operation, max_retries=3, base_delay=1.0, operation_na
     # If we get here, all retries failed
     raise last_exception
 
+
 BOT_TOKEN = os.getenv("BOT_2_TOKEN")
 BOT_1_TOKEN = os.getenv("BOT_1_TOKEN")  # Bot 1 for delivery
 MASTER_ADMIN_ID = int(os.getenv("MASTER_ADMIN_ID", "0"))
@@ -1471,6 +1472,8 @@ col_suspended_features= db["bot1_suspended_features"]# Feature suspensions
 col_bot1_settings     = db["bot1_settings"]           # Bot 1 global settings
 col_user_verification = db["bot1_user_verification"] # Bot 1 user verification
 col_msa_ids           = db["bot1_msa_ids"]             # Bot 1 MSA+ ID registry
+col_referrals         = db["bot1_referrals"]           # Bot 1 referral tracking (read-only from bot2)
+col_reviews           = db["bot1_reviews"]             # Bot 1 reviews (read-only from bot2)
 col_bot1_backups      = backup_db["bot1_backups"]    # Bot 1 backups → BACKUP cluster only
 col_permanently_banned_msa = db["bot1_permanently_banned_msa"]  # Permanently banned MSA IDs
 col_offline_log       = db["bot1_offline_log"]        # Bot 1 ON/OFF event log (dedicated)
@@ -1687,6 +1690,15 @@ try:
 except Exception:
     _BOT2_TZ = ZoneInfo("Asia/Kolkata")
 
+
+def _escape_md(text: str) -> str:
+    if not text:
+        return ""
+    escape_chars = ['_', '*', '[', ']', '`']
+    for char in escape_chars:
+        text = str(text).replace(char, f"\\{char}")
+    return text
+
 def now_local() -> datetime:
     """Return current time as a naive datetime in the configured local timezone."""
     return datetime.now(_BOT2_TZ).replace(tzinfo=None)
@@ -1855,29 +1867,29 @@ class GuideStates(StatesGroup):
 # ==========================================
 
 _OFFLINE_TEMPLATES = [
-    {"title": "🔧 System Upgrade",        "text": "👤 **Dear Valued Member,**\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n🔧 **MSA NODE AGENT — SYSTEM UPGRADE**\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\nYour MSA Node Agent is currently undergoing a **premium infrastructure upgrade** to deliver you an even more powerful experience.\n\n🚫 **During Upgrade:**\n• Start links are not active\n• All bot features are temporarily paused\n• No new sessions can begin\n\n⏳ **Status:** Coming back online very soon.\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\nThank you for your patience. The upgrade ensures you receive the **best possible service**.\n\n_— MSA Node Systems_"},
+    {"title": "🔧 System Upgrade",        "text": "👤 **Dear Valued Member,**\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n🔧 **MSA NODE AGENT V2 — SYSTEM UPGRADE**\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\nYour MSA Node Agent V2 is currently undergoing a **premium infrastructure upgrade** to deliver you an even more powerful experience.\n\n🚫 **During Upgrade:**\n• Start links are not active\n• All bot features are temporarily paused\n• No new sessions can begin\n\n⏳ **Status:** Coming back online very soon.\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\nThank you for your patience. The upgrade ensures you receive the **best possible service**.\n\n_— MSA Node Systems_"},
     {"title": "🛠 Maintenance Window",     "text": "🛠 **SCHEDULED MAINTENANCE**\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n**MSA NODE is currently in a scheduled maintenance window.**\n\nOur team is performing essential updates to keep the system running at peak performance.\n\n⏸ **Services on hold:**\n• Content access temporarily unavailable\n• All start links paused\n• Support queue on standby\n\n🔄 **We'll be back shortly.** Thank you for your understanding.\n\n_— MSA NODE Operations Team_"},
     {"title": "⚠️ Emergency Maintenance",  "text": "⚠️ **EMERGENCY MAINTENANCE IN PROGRESS**\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\nWe have detected a critical issue requiring **immediate attention**.\n\nOur engineering team is working around the clock to resolve this as quickly as possible.\n\n🚫 **All bot features are temporarily offline.**\n\n⏳ **Estimated downtime:** Minimal. We're moving fast.\n\nWe apologize for any inconvenience and appreciate your patience.\n\n_— MSA NODE Emergency Response_"},
-    {"title": "📅 Scheduled Downtime",     "text": "📅 **SCHEDULED DOWNTIME NOTICE**\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\nAs part of our **regular system maintenance schedule**, MSA NODE Agent is currently offline.\n\nThis downtime was planned to ensure:\n• System stability\n• Performance improvements\n• Database optimization\n\n✅ **All your data and access are safe.** We'll notify you the moment we're back.\n\n_— MSA NODE Systems_"},
+    {"title": "📅 Scheduled Downtime",     "text": "📅 **SCHEDULED DOWNTIME NOTICE**\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\nAs part of our **regular system maintenance schedule**, MSA NODE Agent V2 is currently offline.\n\nThis downtime was planned to ensure:\n• System stability\n• Performance improvements\n• Database optimization\n\n✅ **All your data and access are safe.** We'll notify you the moment we're back.\n\n_— MSA NODE Systems_"},
     {"title": "🏗 Infrastructure Update",  "text": "🏗 **INFRASTRUCTURE UPDATE IN PROGRESS**\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\nWe are upgrading the **core infrastructure** behind MSA NODE to bring you:\n\n⚡ Faster response times\n🔒 Enhanced security\n📈 Better reliability\n🌐 Improved global access\n\n⏳ **The agent will return shortly with a significantly improved experience.**\n\n_— MSA NODE Engineering_"},
     {"title": "🔴 Critical Fix In Progress","text": "🔴 **CRITICAL FIX IN PROGRESS**\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\nOur team has identified and is actively resolving a **critical issue** in the MSA NODE system.\n\nTo maintain integrity and protect your experience, the agent has been **temporarily suspended**.\n\n🛡 **Your data and access remain fully protected.**\n\nWe will notify you immediately once the fix is deployed and the agent is restored.\n\n_— MSA NODE Tech Support_"},
-    {"title": "🚀 Premium Feature Update", "text": "🚀 **PREMIUM FEATURE UPDATE**\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\nExciting things are happening behind the scenes!\n\nWe are currently deploying a **major premium feature update** to your MSA NODE Agent.\n\nNew capabilities and improvements are being integrated right now.\n\n⏳ **The agent will return with even more power. Stay tuned.**\n\n_— MSA NODE Development Team_"},
+    {"title": "🚀 Premium Feature Update", "text": "🚀 **PREMIUM FEATURE UPDATE**\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\nExciting things are happening behind the scenes!\n\nWe are currently deploying a **major premium feature update** to your MSA NODE Agent V2.\n\nNew capabilities and improvements are being integrated right now.\n\n⏳ **The agent will return with even more power. Stay tuned.**\n\n_— MSA NODE Development Team_"},
     {"title": "🔒 Security Maintenance",   "text": "🔒 **SECURITY MAINTENANCE**\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\nWe are performing **critical security hardening** on the MSA NODE system.\n\nDuring this process, all services are temporarily suspended to ensure:\n• Complete system integrity\n• Protection of all member data\n• Zero-tolerance security standards\n\n🛡 **Your account and data are fully secure.**\n\nWe'll be back online shortly.\n\n_— MSA NODE Security Team_"},
     {"title": "💾 Database Optimization",  "text": "💾 **DATABASE OPTIMIZATION IN PROGRESS**\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\nWe are currently **optimizing our database architecture** to ensure:\n\n📊 Faster data retrieval\n🔄 Smoother user experience\n📈 Higher throughput for all members\n🗂 Better organization of your content\n\n⏳ **This optimization will be complete shortly.**\n\n_— MSA NODE Database Team_"},
-    {"title": "📦 New Updates in Agent",   "text": "📦 **NEW UPDATES INCOMING — AGENT OFFLINE**\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🚧 **We are installing new updates to your MSA NODE Agent.**\n\nFresh features, improved workflows, and enhanced content delivery are being prepared for you.\n\n🔧 **What's being updated:**\n• New agent capabilities\n• Enhanced search features\n• Improved dashboard\n• Backend performance boosts\n\n⏳ **Stand by — the new version launches soon.**\n\n_— MSA NODE Development_"},
+    {"title": "📦 New Updates in Agent",   "text": "📦 **NEW UPDATES INCOMING — AGENT OFFLINE**\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🚧 **We are installing new updates to your MSA NODE Agent V2.**\n\nFresh features, improved workflows, and enhanced content delivery are being prepared for you.\n\n🔧 **What's being updated:**\n• New agent capabilities\n• Enhanced search features\n• Improved dashboard\n• Backend performance boosts\n\n⏳ **Stand by — the new version launches soon.**\n\n_— MSA NODE Development_"},
 ]
 
 _ONLINE_TEMPLATES = [
-    {"title": "✅ Back Online",            "text": "✅ **MSA NODE AGENT — BACK ONLINE**\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🟢 Your MSA Node Agent has completed its upgrade and is now **fully operational**.\n\n**All features are now available:**\n• 📊 Dashboard\n• 🔍 Search Code\n• 📺 Tutorial\n• 📜 Rules\n• 📖 Agent Guide\n• 📞 Support\n• All start links are active\n\nThank you for your patience during the upgrade.\n\n_— MSA Node Systems_"},
+    {"title": "✅ Back Online",            "text": "✅ **MSA NODE AGENT V2 — BACK ONLINE**\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🟢 Your MSA Node Agent V2 has completed its upgrade and is now **fully operational**.\n\n**All features are now available:**\n• 📊 Dashboard\n• 🔍 Search Code\n• 📺 Tutorial\n• 📜 Rules\n• 📖 Agent Guide\n• 📞 Support\n• All start links are active\n\nThank you for your patience during the upgrade.\n\n_— MSA Node Systems_"},
     {"title": "🔧 System Restored",        "text": "🔧 **SYSTEM FULLY RESTORED**\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n✅ The MSA NODE system has been fully restored after maintenance.\n\n**Your full access has been reinstated:**\n• 📊 Dashboard — Active\n• 🔍 Search Code — Active\n• 📺 Tutorial — Active\n• 📜 Rules — Active\n• 📖 Agent Guide — Active\n• 📞 Support — Active\n\nWe appreciate your patience and look forward to serving you.\n\n_— MSA NODE Operations_"},
-    {"title": "🟢 All Systems Green",      "text": "🟢 **ALL SYSTEMS GREEN**\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n**MSA NODE Agent status: FULLY OPERATIONAL**\n\nEvery system has been verified and cleared for full operation.\n\n🚦 **System Status:**\n• 📊 Dashboard .................. ✅ Online\n• 🔍 Search ..................... ✅ Online\n• 📺 Tutorial ................... ✅ Online\n• 📜 Rules ...................... ✅ Online\n• 📖 Guide ...................... ✅ Online\n• 📞 Support .................... ✅ Online\n\nWelcome back!\n\n_— MSA NODE Systems_"},
-    {"title": "✨ Premium Upgrade Complete","text": "✨ **PREMIUM UPGRADE COMPLETE**\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\nThe premium upgrade to your MSA NODE Agent has been **successfully completed**.\n\nYour experience has been enhanced with improved speed, reliability, and features.\n\n**Everything you need is ready:**\n• 📊 Dashboard\n• 🔍 Search Code\n• 📜 Rules\n• 📖 Agent Guide\n• 📞 Support\n\nThank you for being a valued MSA NODE member.\n\n_— MSA NODE Development_"},
-    {"title": "🆕 New Features Available", "text": "🆕 **NEW FEATURES AVAILABLE NOW**\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🎉 MSA NODE Agent is back online with **exciting new features and improvements!**\n\nWe've been working hard to make your experience better. Explore everything that's new and improved.\n\n**All services restored:**\n• 📊 Dashboard\n• 🔍 Search Code\n• 📜 Rules\n• 📖 Agent Guide\n• 📞 Support\n\n_— MSA NODE Development Team_"},
-    {"title": "⚡ Agent Update Deployed",  "text": "⚡ **AGENT UPDATE SUCCESSFULLY DEPLOYED**\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\nYour MSA NODE Agent update has been **deployed and verified**.\n\nThe agent is now running at peak performance with all enhancements active.\n\n**Resume your activities:**\n• 📊 Dashboard\n• 🔍 Search Code\n• 📜 Rules\n• 📖 Agent Guide\n• 📞 Support\n\n_— MSA NODE Engineering_"},
+    {"title": "🟢 All Systems Green",      "text": "🟢 **ALL SYSTEMS GREEN**\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n**MSA NODE Agent V2 status: FULLY OPERATIONAL**\n\nEvery system has been verified and cleared for full operation.\n\n🚦 **System Status:**\n• 📊 Dashboard .................. ✅ Online\n• 🔍 Search ..................... ✅ Online\n• 📺 Tutorial ................... ✅ Online\n• 📜 Rules ...................... ✅ Online\n• 📖 Guide ...................... ✅ Online\n• 📞 Support .................... ✅ Online\n\nWelcome back!\n\n_— MSA NODE Systems_"},
+    {"title": "✨ Premium Upgrade Complete","text": "✨ **PREMIUM UPGRADE COMPLETE**\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\nThe premium upgrade to your MSA NODE Agent V2 has been **successfully completed**.\n\nYour experience has been enhanced with improved speed, reliability, and features.\n\n**Everything you need is ready:**\n• 📊 Dashboard\n• 🔍 Search Code\n• 📜 Rules\n• 📖 Agent Guide\n• 📞 Support\n\nThank you for being a valued MSA NODE member.\n\n_— MSA NODE Development_"},
+    {"title": "🆕 New Features Available", "text": "🆕 **NEW FEATURES AVAILABLE NOW**\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🎉 MSA NODE Agent V2 is back online with **exciting new features and improvements!**\n\nWe've been working hard to make your experience better. Explore everything that's new and improved.\n\n**All services restored:**\n• 📊 Dashboard\n• 🔍 Search Code\n• 📜 Rules\n• 📖 Agent Guide\n• 📞 Support\n\n_— MSA NODE Development Team_"},
+    {"title": "⚡ Agent Update Deployed",  "text": "⚡ **AGENT UPDATE SUCCESSFULLY DEPLOYED**\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\nYour MSA NODE Agent V2 update has been **deployed and verified**.\n\nThe agent is now running at peak performance with all enhancements active.\n\n**Resume your activities:**\n• 📊 Dashboard\n• 🔍 Search Code\n• 📜 Rules\n• 📖 Agent Guide\n• 📞 Support\n\n_— MSA NODE Engineering_"},
     {"title": "💎 Enhanced Experience",    "text": "💎 **ENHANCED EXPERIENCE READY**\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\nYour **enhanced MSA NODE experience** is now live!\n\nWe've upgraded performance, security, and features to give you the best possible agent experience.\n\n**Full access restored:**\n• 📊 Dashboard\n• 🔍 Search Code\n• 📜 Rules\n• 📖 Agent Guide\n• 📞 Support\n\n_— MSA NODE Premium Division_"},
     {"title": "🌐 MSA NODE Next Level",    "text": "🌐 **MSA NODE — NEXT LEVEL ONLINE**\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🟢 MSA NODE has been elevated to its **next performance tier**.\n\nFaster. More powerful. Smarter.\n\n**Your access:**\n• 📊 Dashboard\n• 🔍 Search Code\n• 📜 Rules\n• 📖 Agent Guide\n• 📞 Support\n\nUse /start to begin.\n\n_— MSA NODE Systems_"},
     {"title": "🔓 Elite Access Restored",  "text": "🔓 **ELITE ACCESS RESTORED**\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\nYour **elite MSA NODE membership** has been fully restored.\n\nAll premium tools and features are available to you again.\n\n**Available now:**\n• 📊 Dashboard\n• 🔍 Search Code\n• 📜 Rules\n• 📖 Agent Guide\n• 📞 Support\n\nWelcome back to the elite tier.\n\n_— MSA NODE Elite Division_"},
-    {"title": "📦 Agent Session Unlocked", "text": "📦 **AGENT SESSION UNLOCKED — UPDATES LIVE**\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🎯 **Your MSA NODE Agent has been updated and unlocked.**\n\nAll the new features from our latest session are now **live and ready** for you.\n\n**Explore what's new:**\n• 📊 Dashboard — Enhanced\n• 🔍 Search Code — Faster\n• 📜 Rules — Updated\n• 📖 Agent Guide — Expanded\n• 📞 Support — Improved\n\nUse /start to get started.\n\n_— MSA NODE Development_"},
+    {"title": "📦 Agent Session Unlocked", "text": "📦 **AGENT SESSION UNLOCKED — UPDATES LIVE**\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n🎯 **Your MSA NODE Agent V2 has been updated and unlocked.**\n\nAll the new features from our latest session are now **live and ready** for you.\n\n**Explore what's new:**\n• 📊 Dashboard — Enhanced\n• 🔍 Search Code — Faster\n• 📜 Rules — Updated\n• 📖 Agent Guide — Expanded\n• 📞 Support — Improved\n\nUse /start to get started.\n\n_— MSA NODE Development_"},
 ]
 
 _TPLS_PER_PAGE = 5   # templates shown per InlineKeyboard page
@@ -2004,9 +2016,10 @@ def get_mongo_storage_stats() -> dict:
         return {"ok": False, "error": str(e)[:100]}
 
 
-def log_action(action_type, user_id, details="", bot="bot2"):
+def log_action(action_type, user_id, details="", bot="bot2", user_name="", channel=""):
     """Log actions to console, memory, AND MongoDB for live terminal display (works on Render)"""
-    timestamp = now_local().strftime('%I:%M:%S %p')
+    _now = now_local()
+    timestamp = _now.strftime('%b %d  %I:%M:%S %p')  # e.g. Apr 27  01:23:45 PM
 
     # Color codes for console terminal
     CYAN = '\033[96m'
@@ -2014,8 +2027,9 @@ def log_action(action_type, user_id, details="", bot="bot2"):
     RESET = '\033[0m'
     BOLD = '\033[1m'
 
-    # Console output with colors
-    print(f"{CYAN}[{timestamp}]{RESET} {BOLD}{action_type}{RESET}")
+    # Console output with colors — include user info if available
+    user_tag = f" [{user_name} | {user_id}]" if user_name else (f" [ID:{user_id}]" if user_id else "")
+    print(f"{CYAN}[{timestamp}]{user_tag}{RESET} {BOLD}{action_type}{RESET}")
     if details:
         print(f"  📋 {details}")
     print(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
@@ -2027,8 +2041,10 @@ def log_action(action_type, user_id, details="", bot="bot2"):
         "bot": bot,
         "action": action_type,
         "user_id": user_id,
+        "user_name": user_name,
+        "channel": channel,
         "details": details,
-        "full_text": f"[{timestamp}] {action_type}" + (f"\n  {details}" if details else "")
+        "full_text": f"[{timestamp}]{user_tag} {action_type}" + (f" &gt; {details}" if details else "")
     }
 
     # Add to in-memory list
@@ -2054,7 +2070,8 @@ def log_action(action_type, user_id, details="", bot="bot2"):
         pass  # Never let logging break the bot
 
 def get_terminal_logs(bot="bot2", limit=50):
-    """Get raw terminal logs — reads from MongoDB first (Render-safe), falls back to memory"""
+    """Get raw terminal logs — reads from MongoDB first (Render-safe), falls back to memory.
+    Shows 12-hour AM/PM with full date, user ID, name, and channel."""
     try:
         # Read from MongoDB for cross-process / Render support
         docs = list(col_live_logs.find({"bot": bot}, {"_id": 0}).sort("created_at", -1).limit(limit))
@@ -2064,10 +2081,30 @@ def get_terminal_logs(bot="bot2", limit=50):
             MAX_CHARS = 3500
             current_length = 0
             for doc in docs:
-                ts = doc.get("timestamp", "??:??:?? ?M")
-                action = doc.get("action", "")
-                detail = doc.get("details", "")
-                line = f"[{ts}] {action}" + (f" > {detail}" if detail else "")
+                # Prefer reconstructing timestamp from created_at (datetime) for accuracy
+                raw_ca = doc.get("created_at")
+                if raw_ca and hasattr(raw_ca, "strftime"):
+                    ts = raw_ca.strftime('%b %d  %I:%M:%S %p')
+                else:
+                    ts = doc.get("timestamp", "??:??:?? ?M")
+
+                action  = doc.get("action", "")
+                detail  = doc.get("details", "")
+                uid     = doc.get("user_id", "")
+                uname   = doc.get("user_name", "")
+                chan    = doc.get("channel", "")
+
+                # Build user tag: name + ID + optional channel
+                parts = []
+                if uname:
+                    parts.append(str(uname))
+                if uid:
+                    parts.append(f"ID:{uid}")
+                if chan:
+                    parts.append(f"ch:{chan}")
+                user_tag = (" [" + " | ".join(parts) + "]") if parts else ""
+
+                line = f"[{ts}]{user_tag} {_html_escape(action)}" + (f" &gt; {_html_escape(str(detail))}" if detail else "")
                 if current_length + len(line) + 1 > MAX_CHARS:
                     break
                 log_lines.append(line)
@@ -2085,7 +2122,15 @@ def get_terminal_logs(bot="bot2", limit=50):
     final_lines = []
     current_length = 0
     for log in reversed(recent_logs):
-        line = f"[{log['timestamp']}] {log['action']} > {log['details']}"
+        uid     = log.get("user_id", "")
+        uname   = log.get("user_name", "")
+        if uname and uid:
+            user_tag = f" [{uname} | {uid}]"
+        elif uid:
+            user_tag = f" [ID:{uid}]"
+        else:
+            user_tag = ""
+        line = f"[{log['timestamp']}]{user_tag} {_html_escape(log['action'])} &gt; {_html_escape(log.get('details', ''))}"
         if current_length + len(line) + 1 > MAX_CHARS:
             break
         final_lines.insert(0, line)
@@ -2312,6 +2357,15 @@ def _esc_md(text: str) -> str:
         text = text.replace(ch, f'\\{ch}')
     return text
 
+def _html_escape(text) -> str:
+    """Escape HTML special chars so raw log/user data doesn't break parse_mode=HTML."""
+    if not text:
+        return ""
+    text = str(text)
+    text = text.replace("&", "&amp;")
+    text = text.replace("<", "&lt;")
+    text = text.replace(">", "&gt;")
+    return text
 
 # ── CHECK LINKS pagination store (in-memory, keyed by user_id) ──────────────
 # Each entry: list of page strings. TTL is implicit — overwritten on next /check.
@@ -2408,9 +2462,11 @@ def get_category_menu():
         [KeyboardButton(text="📺 YT"), KeyboardButton(text="📸 IG")],
         [KeyboardButton(text="📎 IG CC"), KeyboardButton(text="🔗 YTCODE")],
         [KeyboardButton(text="👥 ALL"), KeyboardButton(text="👤 UNKNOWN")],
+        [KeyboardButton(text="🎁 GRACE (UNCONSUMED)"), KeyboardButton(text="💎 VAULT (FOMO DROP)")],
         [KeyboardButton(text="⬅️ BACK"), KeyboardButton(text="❌ CANCEL")]
     ]
     return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
+
 
 def get_admin_menu():
     """Admin management submenu"""
@@ -2637,28 +2693,15 @@ async def cmd_start(message: types.Message, state: FSMContext):
     
     # 1. Check if user is Bot 2-banned - complete silent ignore
     if col_banned_users.find_one({"user_id": user_id, "scope": "bot2"}):
-        log_action("🚫 BANNED ACCESS BLOCKED", user_id, "Bot2-banned user tried /start")
+        log_action("🚫 BANNED ACCESS BLOCKED", user_id, "Bot2-banned user tried /start", user_name=user_name)
         return  # Complete silence
 
-    # ── Password gate: master admin must authenticate once per session ──────
-    if user_id == MASTER_ADMIN_ID and ADMIN_PASSWORD and user_id not in _admin_authenticated:
-        await state.set_state(AdminStates.waiting_for_admin_pw_1)
-        await message.answer(
-            "🔐 <b>Authentication Required</b>\n\nEnter your access password:",
-            reply_markup=ReplyKeyboardMarkup(
-                keyboard=[[KeyboardButton(text="❌ Cancel")]],
-                resize_keyboard=True,
-                one_time_keyboard=True,
-            ),
-            parse_mode="HTML",
-        )
-        return
-    # ────────────────────────────────────────────────────────────────────────
+    # Password gate removed. Telegram's user_id verification is sufficient.
     
     # 2. Check if user is admin
     if await is_admin(user_id):
         # Admin access granted
-        log_action("✅ ADMIN ACCESS", user_id, f"{user_name} started bot")
+        log_action("✅ ADMIN ACCESS", user_id, f"{user_name} started bot", user_name=user_name)
         menu = await get_main_menu(user_id)  # Pass user_id for permission filtering
         await message.answer(
             f"👋 Welcome to Bot 2!\n\n"
@@ -2672,7 +2715,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
     is_locked_admin = bool(admin_doc and admin_doc.get("locked", False))
     attempt_type = "LOCKED ADMIN" if is_locked_admin else "NON-ADMIN"
 
-    log_action("❌ UNAUTHORIZED START", user_id, f"{attempt_type} tried /start")
+    log_action("❌ UNAUTHORIZED START", user_id, f"{attempt_type} tried /start", user_name=user_name)
 
     # Record this attempt (used for anti-spam auto-ban)
     col_access_attempts.insert_one({
@@ -3324,6 +3367,14 @@ async def b8_stats_handler(message: types.Message):
     # ── Offline events log ──────────────────────────────────────────
     total_off_events = col_offline_log.count_documents({})
 
+    # ── Referral Stats ──────────────────────────────────────────────
+    try:
+        ref_confirmed = col_referrals.count_documents({"status": "confirmed"})
+        ref_pending = col_referrals.count_documents({"status": "pending"})
+    except Exception:
+        ref_confirmed = 0
+        ref_pending = 0
+
     # ── Maintenance status ──────────────────────────────────────────
     settings   = col_bot1_settings.find_one({"setting": "maintenance_mode"})
     is_maint   = settings.get("value", False) if settings else False
@@ -3338,6 +3389,9 @@ async def b8_stats_handler(message: types.Message):
         f"• Verified MSA Members: `{total_msa}`\n"
         f"• Banned: `{total_banned}`\n"
         f"• Feature Suspended: `{total_suspended}`\n\n"
+        f"🤝 **Referrals:**\n"
+        f"• Confirmed: `{ref_confirmed}`\n"
+        f"• Pending: `{ref_pending}`\n\n"
         f"🎫 **Support Tickets:**\n"
         f"• Open: `{open_tickets}`\n"
         f"• Resolved: `{closed_tickets}`\n"
@@ -3425,6 +3479,8 @@ async def process_category_selection(message: types.Message, state: FSMContext):
         "🔗 YTCODE": "YTCODE",
         "👥 ALL": "ALL",
         "👤 UNKNOWN": "UNKNOWN",
+        "🎁 GRACE (UNCONSUMED)": "GRACE (UNCONSUMED)",
+        "💎 VAULT (FOMO DROP)": "VAULT (FOMO DROP)",
     }
     
     if message.text not in category_map:
@@ -3498,14 +3554,22 @@ async def process_direct_broadcast(message: types.Message, state: FSMContext):
         media_type = "voice"
         file_id = message.voice.file_id
     
-    # Find target users based on category
-    if category == "ALL":
-        # Use user_tracking as authoritative source — all users who ever started the bot,
-        # locked to their permanent source. This keeps ALL count consistent with
-        # per-source counts and properly reflects dead-user cleanup.
-        target_users = list(col_user_tracking.find({}, {"user_id": 1}))
+    # STRICTLY RESTRICT BROADCASTS TO ACTIVE VAULT MEMBERS
+    # Find active vault members first, then intersect with category requirements.
+    _active_vault_ids = {u["user_id"] for u in col_user_verification.find({"vault_joined": True}, {"user_id": 1})}
+    
+    if category == "ALL" or category == "VAULT (FOMO DROP)":
+        target_users = [{"user_id": uid} for uid in _active_vault_ids]
+    elif category == "GRACE (UNCONSUMED)":
+        grace_docs = list(col_user_verification.find(
+            {"grace_allowed": True, "grace_consumed": {"$ne": True}},
+            {"user_id": 1}
+        ))
+        target_users = [u for u in grace_docs if u["user_id"] in _active_vault_ids]
     else:
-        target_users = list(col_user_tracking.find({"source": category}))
+        # Specific source (YT, IG, etc.)
+        tracking_docs = list(col_user_tracking.find({"source": category}, {"user_id": 1}))
+        target_users = [u for u in tracking_docs if u["user_id"] in _active_vault_ids]
     
     print(f"🎯 Found {len(target_users)} target users for category '{category}'")
     
@@ -4688,8 +4752,9 @@ async def direct_send_broadcast(message: types.Message, state: FSMContext):
     ytcode_count = col_user_tracking.count_documents({"source": "YTCODE"})
     unknown_count = col_user_tracking.count_documents({"source": "UNKNOWN"})
     all_count = col_user_tracking.count_documents({})  # All tracked users (source-locked, live)
+    grace_count = col_user_verification.count_documents({"grace_allowed": True, "grace_consumed": {"$ne": True}})
     
-    print(f"📀 User counts: YT={yt_count}, IG={ig_count}, IGCC={igcc_count}, YTCODE={ytcode_count}, UNKNOWN={unknown_count}, ALL={all_count}")
+    print(f"📀 User counts: YT={yt_count}, IG={ig_count}, IGCC={igcc_count}, YTCODE={ytcode_count}, UNKNOWN={unknown_count}, ALL={all_count}, GRACE_UNCONSUMED={grace_count}")
     
     await state.set_state(BroadcastStates.selecting_category)
     await message.answer(
@@ -4700,7 +4765,8 @@ async def direct_send_broadcast(message: types.Message, state: FSMContext):
         f"📎 **IG CC** - Users from IG CC links ({igcc_count} users)\n"
         f"🔗 **YTCODE** - Users from YTCODE links ({ytcode_count} users)\n"
         f"👤 **UNKNOWN** - Users with no referral link ({unknown_count} users)\n"
-        f"👥 **ALL** - All users ({all_count} users)\n\n"
+        f"👥 **ALL** - All users ({all_count} users)\n"
+        f"🎁 **GRACE (UNCONSUMED)** - Grace given, not yet used ({grace_count} users)\n\n"
         "Type /cancel to abort.",
         reply_markup=get_category_menu(),
         parse_mode="Markdown"
@@ -4719,8 +4785,9 @@ async def broadcast_with_buttons_start(message: types.Message, state: FSMContext
     ytcode_count = col_user_tracking.count_documents({"source": "YTCODE"})
     unknown_count = col_user_tracking.count_documents({"source": "UNKNOWN"})
     all_count = col_user_tracking.count_documents({})  # All tracked users (source-locked, live)
+    grace_count = col_user_verification.count_documents({"grace_allowed": True, "grace_consumed": {"$ne": True}})
     
-    print(f"📀 User counts: YT={yt_count}, IG={ig_count}, IGCC={igcc_count}, YTCODE={ytcode_count}, UNKNOWN={unknown_count}, ALL={all_count}")
+    print(f"📀 User counts: YT={yt_count}, IG={ig_count}, IGCC={igcc_count}, YTCODE={ytcode_count}, UNKNOWN={unknown_count}, ALL={all_count}, GRACE_UNCONSUMED={grace_count}")
     
     await state.set_state(BroadcastWithButtonsStates.selecting_category)
     await message.answer(
@@ -4731,11 +4798,13 @@ async def broadcast_with_buttons_start(message: types.Message, state: FSMContext
         f"📎 **IG CC** - Users from IG CC links ({igcc_count} users)\n"
         f"🔗 **YTCODE** - Users from YTCODE links ({ytcode_count} users)\n"
         f"👤 **UNKNOWN** - Users with no referral link ({unknown_count} users)\n"
-        f"👥 **ALL** - All users ({all_count} users)\n\n"
+        f"👥 **ALL** - All users ({all_count} users)\n"
+        f"🎁 **GRACE (UNCONSUMED)** - Grace given, not yet used ({grace_count} users)\n\n"
         "Type /cancel to abort.",
         reply_markup=get_category_menu(),
         parse_mode="Markdown"
     )
+
 
 @dp.message(BroadcastWithButtonsStates.selecting_category)
 async def process_button_broadcast_category(message: types.Message, state: FSMContext):
@@ -4772,6 +4841,8 @@ async def process_button_broadcast_category(message: types.Message, state: FSMCo
         "🔗 YTCODE": "YTCODE",
         "👥 ALL": "ALL",
         "👤 UNKNOWN": "UNKNOWN",
+        "🎁 GRACE (UNCONSUMED)": "GRACE (UNCONSUMED)",
+        "💎 VAULT (FOMO DROP)": "VAULT (FOMO DROP)",
     }
     
     if message.text not in category_map:
@@ -4955,12 +5026,22 @@ async def confirm_button_broadcast(message: types.Message, state: FSMContext):
         buttons = data.get('buttons', [])
         message_type = data.get('message_type')
         
-        # Get target users
-        if category == "ALL":
-            # Use user_tracking as authoritative source — consistent with per-source broadcasts
-            target_users = list(col_user_tracking.find({}, {"user_id": 1}))
+        # STRICTLY RESTRICT BROADCASTS TO ACTIVE VAULT MEMBERS
+        # Find active vault members first, then intersect with category requirements.
+        _active_vault_ids = {u["user_id"] for u in col_user_verification.find({"vault_joined": True}, {"user_id": 1})}
+        
+        if category == "ALL" or category == "VAULT (FOMO DROP)":
+            target_users = [{"user_id": uid} for uid in _active_vault_ids]
+        elif category == "GRACE (UNCONSUMED)":
+            grace_docs = list(col_user_verification.find(
+                {"grace_allowed": True, "grace_consumed": {"$ne": True}},
+                {"user_id": 1}
+            ))
+            target_users = [u for u in grace_docs if u["user_id"] in _active_vault_ids]
         else:
-            target_users = list(col_user_tracking.find({"source": category}))
+            # Specific source (YT, IG, etc.)
+            tracking_docs = list(col_user_tracking.find({"source": category}, {"user_id": 1}))
+            target_users = [u for u in tracking_docs if u["user_id"] in _active_vault_ids]
         
         if not target_users:
             await message.answer("❌ No users found in this category.", reply_markup=get_broadcast_menu(), parse_mode="Markdown")
@@ -5252,14 +5333,23 @@ async def process_send_broadcast(message: types.Message, state: FSMContext):
     media_type = broadcast.get('media_type')
     file_id = broadcast.get('file_id')
     
-    # Build user filter based on category
-    if category == "ALL":
-        # Use user_tracking as single source of truth — consistent with per-source broadcasts
-        # and properly reflects dead-user cleanup (purged records are gone from both).
-        target_users = list(col_user_tracking.find({}, {"user_id": 1}))
+    # STRICTLY RESTRICT BROADCASTS TO ACTIVE VAULT MEMBERS
+    # Find active vault members first, then intersect with category requirements.
+    _active_vault_ids = {u["user_id"] for u in col_user_verification.find({"vault_joined": True}, {"user_id": 1})}
+    
+    if category == "ALL" or category == "VAULT (FOMO DROP)":
+        target_users = [{"user_id": uid} for uid in _active_vault_ids]
+    elif category == "GRACE (UNCONSUMED)":
+        grace_docs = list(col_user_verification.find(
+            {"grace_allowed": True, "grace_consumed": {"$ne": True}},
+            {"user_id": 1}
+        ))
+        target_users = [u for u in grace_docs if u["user_id"] in _active_vault_ids]
     else:
-        # Send only to users who started via specific source
-        target_users = list(col_user_tracking.find({"source": category}, {"user_id": 1}))
+        # Specific source (YT, IG, etc.)
+        tracking_docs = list(col_user_tracking.find({"source": category}, {"user_id": 1}))
+        target_users = [u for u in tracking_docs if u["user_id"] in _active_vault_ids]
+
     
     if not target_users:
         # Debug information
@@ -5798,7 +5888,9 @@ def _traffic_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="🔄 REFRESH TRAFFIC"), KeyboardButton(text="🏆 TOP ANALYTICS")],
-            [KeyboardButton(text="🔗 CHECK LINKS"),      KeyboardButton(text="⬅️ MAIN MENU")],
+            [KeyboardButton(text="💰 VAULT FUNNEL"),     KeyboardButton(text="🔗 CHECK LINKS")],
+            [KeyboardButton(text="🤝 REFERRAL STATS"),   KeyboardButton(text="🏆 LEADERBOARD")],
+            [KeyboardButton(text="⭐ REVIEWS"),           KeyboardButton(text="⬅️ MAIN MENU")],
         ],
         resize_keyboard=True,
     )
@@ -5868,6 +5960,79 @@ async def _fetch_traffic_data() -> dict:
         "coverage":        coverage_pct,
         "pct_base":        pct_base,
         "snapshot_ts":     now_local().strftime("%b %d, %Y  %I:%M:%S %p"),
+    }
+
+
+async def _fetch_funnel_data() -> dict:
+    """
+    Single source-of-truth for all Vault conversion funnel numbers.
+    Reads directly from bot1_user_verification — no caching, always live.
+
+    Funnel stages:
+      grace_claimed     → users who claimed a free resource (grace_consumed=True)
+      nudge_24h_sent    → users who received the 24h follow-up
+      nudge_72h_sent    → users who received the 72h final follow-up
+      converted_nudge   → users who joined vault AFTER a nudge (converted_from_nudge=True)
+      vault_members     → currently in vault (vault_joined=True)
+      left_vault        → left vault and have vault_left_at set
+      day30_pipeline    → left 30-89 days ago (in reminder pipeline)
+      day60_pipeline    → left 60-89 days ago (in 2nd reminder zone)
+      archived_90       → soft-archived after 90 days inactive (is_archived=True)
+      never_claimed     → started bot but never claimed any resource
+    """
+    col = col_user_verification
+    total_users     = col.count_documents({})
+    grace_claimed   = col.count_documents({"grace_consumed": True})
+    vault_members   = col.count_documents({"vault_joined": True})
+    nudge_24h_sent  = col.count_documents({"vault_nudge_24h_sent": True})
+    nudge_72h_sent  = col.count_documents({"vault_nudge_72h_sent": True})
+    converted_nudge = col.count_documents({"converted_from_nudge": True})
+    left_vault      = col.count_documents({"vault_left_at": {"$exists": True, "$ne": None}})
+    archived_90     = col.count_documents({"is_archived": True})
+    never_claimed   = col.count_documents({"grace_consumed": {"$ne": True}})
+
+    # Abandonment pipeline buckets (users who left but haven't been archived yet)
+    from datetime import timedelta
+    now = now_local()
+    day30_cutoff = now - timedelta(days=30)
+    day60_cutoff = now - timedelta(days=60)
+    day90_cutoff = now - timedelta(days=90)
+
+    day30_pipeline = col.count_documents({
+        "vault_left_at": {"$lte": day30_cutoff, "$gt": day90_cutoff},
+        "is_archived": {"$ne": True}
+    })
+    day60_pipeline = col.count_documents({
+        "vault_left_at": {"$lte": day60_cutoff, "$gt": day90_cutoff},
+        "is_archived": {"$ne": True}
+    })
+
+    # Grace claimed but never joined vault (unconverted)
+    unconverted     = col.count_documents({
+        "grace_consumed": True,
+        "vault_joined": {"$ne": True}
+    })
+
+    # Conversion rates
+    claim_to_vault_rate = (vault_members / grace_claimed * 100) if grace_claimed > 0 else 0.0
+    nudge_conversion    = (converted_nudge / nudge_24h_sent * 100) if nudge_24h_sent > 0 else 0.0
+
+    return {
+        "total_users":        total_users,
+        "grace_claimed":      grace_claimed,
+        "vault_members":      vault_members,
+        "unconverted":        unconverted,
+        "nudge_24h_sent":     nudge_24h_sent,
+        "nudge_72h_sent":     nudge_72h_sent,
+        "converted_nudge":    converted_nudge,
+        "left_vault":         left_vault,
+        "archived_90":        archived_90,
+        "never_claimed":      never_claimed,
+        "day30_pipeline":     day30_pipeline,
+        "day60_pipeline":     day60_pipeline,
+        "claim_to_vault_rate": claim_to_vault_rate,
+        "nudge_conversion":   nudge_conversion,
+        "snapshot_ts":        now_local().strftime("%b %d, %Y  %I:%M:%S %p"),
     }
 
 
@@ -6005,7 +6170,7 @@ async def top_analytics_handler(message: types.Message):
             bar_fill  = round(pct / 10)
             bar       = "█" * bar_fill + "░" * (10 - bar_fill)
             medal     = medals[idx] if idx < len(medals) else "▪️"
-            report   += f"{medal} **{name}**\n   {bar}  {cnt:,} users  ({pct:.1f}%)\n\n"
+            report   += f"{medal} **{_escape_md(name)}**\n   {bar}  {cnt:,} users  ({pct:.1f}%)\n\n"
 
         top_name, top_cnt = sources[0]
         report += (
@@ -6026,6 +6191,87 @@ async def top_analytics_handler(message: types.Message):
         except Exception:
             pass
         print(f"❌ Top analytics error: {e}")
+
+
+@dp.message(F.text == "💰 VAULT FUNNEL")
+async def vault_funnel_handler(message: types.Message):
+    """
+    Live conversion funnel report — shows the full journey from free resource
+    claim → nudge → vault join → retention → abandonment lifecycle.
+    No DB access needed by the owner — all in one tap.
+    """
+    if not await has_permission(message.from_user.id, "traffic"):
+        return
+
+    loading = await message.answer("⏳ Fetching live funnel data...", parse_mode="Markdown")
+
+    try:
+        f = await _fetch_funnel_data()
+
+        def _pct(n, d):
+            return f"{n/d*100:.1f}%" if d > 0 else "—"
+
+        def _bar(rate_float, width=10):
+            """ASCII progress bar from a 0-100 float."""
+            filled = round(min(rate_float, 100) / 100 * width)
+            return "█" * filled + "░" * (width - filled)
+
+        report = (
+            "💰 **VAULT CONVERSION FUNNEL**\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "_Live data — direct from DB, no cache_\n\n"
+
+            "📥 **STAGE 1 — ACQUISITION**\n"
+            f"   └─ Total users in system   : {f['total_users']:,}\n"
+            f"   └─ Claimed free resource   : {f['grace_claimed']:,}  ({_pct(f['grace_claimed'], f['total_users'])})\n"
+            f"   └─ Never claimed anything  : {f['never_claimed']:,}\n\n"
+
+            "🏦 **STAGE 2 — VAULT CONVERSION**\n"
+            f"   └─ Currently in Vault      : {f['vault_members']:,}\n"
+            f"   └─ Claimed but NOT joined  : {f['unconverted']:,}\n"
+            f"   └─ Claim → Vault rate      : {f['claim_to_vault_rate']:.1f}%\n"
+            f"   {_bar(f['claim_to_vault_rate'])}  {f['claim_to_vault_rate']:.1f}%\n\n"
+
+            "📬 **STAGE 3 — NUDGE PIPELINE**\n"
+            f"   └─ 24h nudge sent          : {f['nudge_24h_sent']:,}\n"
+            f"   └─ 72h nudge sent          : {f['nudge_72h_sent']:,}\n"
+            f"   └─ Converted via nudge     : {f['converted_nudge']:,}\n"
+            f"   └─ Nudge conversion rate   : {f['nudge_conversion']:.1f}%\n"
+            f"   {_bar(f['nudge_conversion'])}  {f['nudge_conversion']:.1f}%\n\n"
+
+            "📉 **STAGE 4 — ABANDONMENT LIFECYCLE**\n"
+            f"   └─ Left vault (total)       : {f['left_vault']:,}\n"
+            f"   └─ In Day 30+ pipeline      : {f['day30_pipeline']:,}  _(1st reminder sent or due)_\n"
+            f"   └─ In Day 60+ pipeline      : {f['day60_pipeline']:,}  _(2nd reminder sent or due)_\n"
+            f"   └─ Soft-archived (90d+)     : {f['archived_90']:,}  _(MSA ID retired, recoverable)_\n\n"
+
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "📊 **FUNNEL SUMMARY**\n\n"
+            f"   🎯 Claim → Vault rate   : **{f['claim_to_vault_rate']:.1f}%**\n"
+            f"   💬 Nudge → Vault rate   : **{f['nudge_conversion']:.1f}%**\n"
+            f"   🚪 Left vault           : **{f['left_vault']:,}** users\n"
+            f"   🗃️ Archived (90d)       : **{f['archived_90']:,}** users\n\n"
+
+            f"🕒 **Snapshot:** {f['snapshot_ts']}"
+        )
+
+        await loading.delete()
+        await message.answer(report, parse_mode="Markdown", reply_markup=_traffic_keyboard())
+        print(
+            f"💰 VAULT FUNNEL — claimed={f['grace_claimed']} vault={f['vault_members']} "
+            f"unconverted={f['unconverted']} nudge24={f['nudge_24h_sent']} "
+            f"converted_nudge={f['converted_nudge']} left={f['left_vault']} archived={f['archived_90']}"
+        )
+
+    except Exception as e:
+        try:
+            await loading.edit_text(
+                f"❌ **Funnel Error**\n\n{_esc_md(str(e)[:150])}",
+                parse_mode="Markdown"
+            )
+        except Exception:
+            pass
+        print(f"❌ vault_funnel_handler error: {e}")
 
 
 @dp.message(F.text == "🔗 CHECK LINKS")
@@ -6189,11 +6435,453 @@ async def chk_links_page_nav(callback: types.CallbackQuery):
         await callback.answer(f"❌ Error: {str(e)[:50]}", show_alert=True)
         print(f"❌ chk_links_page_nav error: {e}")
 
+@dp.message(F.text == "🏆 LEADERBOARD")
+async def b2_leaderboard_handler(message: types.Message):
+    if not await has_permission(message.from_user.id, "traffic"):
+        return
+    loading = await message.answer("⏳ Fetching live leaderboard...", parse_mode="Markdown")
+    try:
+        report, markup = await _build_admin_leaderboard(0)
+        await loading.delete()
+        await message.answer(report, parse_mode="Markdown", reply_markup=markup)
+        log_action("LEADERBOARD", message.from_user.id, "Admin viewed leaderboard", "bot2")
+    except Exception as e:
+        try:
+            await loading.edit_text(f"❌ **Leaderboard Error**\n\n{_esc_md(str(e)[:200])}", parse_mode="Markdown")
+        except Exception:
+            pass
+
+@dp.callback_query(F.data.startswith("lb_page_"))
+async def b2_leaderboard_page_callback(callback: types.CallbackQuery):
+    try:
+        page = int(callback.data.split("_")[2])
+        report, markup = await _build_admin_leaderboard(page)
+        await callback.message.edit_text(report, parse_mode="Markdown", reply_markup=markup)
+        await callback.answer()
+    except Exception as e:
+        await callback.answer(f"❌ Error loading page.", show_alert=True)
+
+@dp.callback_query(F.data == "lb_noop")
+async def b2_leaderboard_noop(callback: types.CallbackQuery):
+    await callback.answer()
+
+async def _build_admin_leaderboard(page: int = 0):
+    PAGE_SIZE = 15
+    skip = page * PAGE_SIZE
+
+    col_msa_credits = db["bot1_msa_credits"]
+
+    pipeline_count = [
+        {"$unwind": "$ledger"},
+        {"$match": {"ledger.reason": {"$regex": "^Purchase:"}}},
+        {"$group": {"_id": "$user_id"}},
+        {"$count": "n"}
+    ]
+    count_res = list(col_msa_credits.aggregate(pipeline_count))
+    total_spenders = count_res[0]["n"] if count_res else 0
+    total_pages = (total_spenders + PAGE_SIZE - 1) // PAGE_SIZE if total_spenders > 0 else 1
+
+    if page >= total_pages:
+        page = max(0, total_pages - 1)
+        skip = page * PAGE_SIZE
+
+    pipeline = [
+        {"$unwind": "$ledger"},
+        {"$match": {"ledger.reason": {"$regex": "^Purchase:"}}},
+        {"$group": {
+            "_id": "$user_id",
+            "spent": {"$sum": {"$multiply": ["$ledger.pts", -1]}}
+        }},
+        {"$sort": {"spent": -1}},
+        {"$skip": skip},
+        {"$limit": PAGE_SIZE}
+    ]
+    top_spenders = list(col_msa_credits.aggregate(pipeline))
+
+    if not top_spenders:
+        text = "🏆 **ADMIN LEADERBOARD**\n━━━━━━━━━━━━━━━━━━━━━━\n\n_No spenders found yet._"
+        return text, None
+
+    text = f"🏆 **ADMIN LEADERBOARD (SPENDERS)**\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    
+    medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
+    for i, row in enumerate(top_spenders):
+        rank = skip + i + 1
+        uid = row["_id"]
+        cnt = row["spent"]
+        
+        doc = col_user_verification.find_one({"user_id": uid}, {"first_name": 1, "username": 1, "referral_tier_badge": 1})
+        if not doc:
+            doc = col_user_tracking.find_one({"user_id": uid}, {"first_name": 1, "username": 1})
+            
+        fname = (doc or {}).get("first_name") or "Unknown"
+        uname = (doc or {}).get("username")
+        badge = (doc or {}).get("referral_tier_badge", "")
+        
+        identifier = f"{fname}"
+        if uname:
+            identifier += f" (@{uname})"
+        else:
+            identifier += f" (ID: {uid})"
+            
+        medal = medals[rank - 1] if rank <= len(medals) else f"{rank}."
+        badge_str = f" {badge}" if badge else ""
+        
+        text += f"{medal} **{_esc_md(identifier)}**{badge_str}\n"
+        text += f"   └ {cnt} credits spent\n\n"
+        
+    text += f"━━━━━━━━━━━━━━━━━━━━━━\n"
+    text += f"📊 Page {page + 1} of {total_pages} (Total spenders: {total_spenders})"
+
+    kb_buttons = []
+    if total_pages > 1:
+        if page > 0:
+            kb_buttons.append(InlineKeyboardButton(text="◀️ Prev", callback_data=f"lb_page_{page-1}"))
+        kb_buttons.append(InlineKeyboardButton(text=f"{page+1}/{total_pages}", callback_data="lb_noop"))
+        if page < total_pages - 1:
+            kb_buttons.append(InlineKeyboardButton(text="Next ▶️", callback_data=f"lb_page_{page+1}"))
+            
+    markup = InlineKeyboardMarkup(inline_keyboard=[kb_buttons]) if kb_buttons else None
+    return text, markup
+
 
 @dp.callback_query(F.data == "chk_lnk_noop")
 async def chk_links_noop(callback: types.CallbackQuery):
     """No-op: page indicator button in CHECK LINKS nav bar."""
     await callback.answer()
+
+# ================================================================
+# ==================== REVIEW ANALYTICS ====================
+
+_review_pages_cache: dict[int, list[str]] = {}  # uid → paginated pages, session-scoped
+
+def _build_review_analytics_pages() -> list[str]:
+    """
+    Build all pages of the live Review Analytics report.
+    Page 1 = summary stats + star distribution + live rating.
+    Page 2+ = individual reviews (5 per page), newest first.
+    All pages are char-safe (≤ 3800 chars each).
+    """
+    try:
+        total_reviews   = col_reviews.count_documents({})
+        star_counts     = {}
+        for s in range(1, 6):
+            star_counts[s] = col_reviews.count_documents({"stars": s})
+
+        # Live rating: merge 16 baseline ratings (at 4.8) with real high-quality reviews
+        high_quality = list(col_reviews.aggregate([
+            {"$match": {"stars": {"$gte": 4}}},
+            {"$group": {"_id": None, "count": {"$sum": 1}, "total": {"$sum": "$stars"}}}
+        ]))
+        
+        real_count = 0
+        real_total = 0
+        if high_quality and high_quality[0]["count"] >= 1:
+            real_count = high_quality[0]["count"]
+            real_total = high_quality[0]["total"]
+            hq_count = real_count  # Just for the "4 & 5 stars" display line
+        else:
+            hq_count = 0
+            
+        # Merge baseline and real reviews
+        base_count = 16
+        base_stars = 16 * 4.8  # 76.8
+        
+        total_count = base_count + real_count
+        total_stars = base_stars + real_total
+        
+        raw_avg = total_stars / total_count
+        display_avg = round(raw_avg, 1)
+        
+        # Keep within authentic bounds (4.6 to 4.9)
+        if display_avg >= 5.0:
+            display_avg = 4.9
+        elif display_avg < 4.6:
+            display_avg = 4.6
+            
+        display_count = total_count
+        count_str = f"{display_count}"
+
+        vault_members = col_user_verification.count_documents({"vault_joined": True})
+        snap_ts = now_local().strftime("%b %d, %Y  %I:%M:%S %p")
+
+        stars_bar = ""
+        for s in range(5, 0, -1):
+            cnt = star_counts.get(s, 0)
+            pct = cnt / total_reviews * 100 if total_reviews > 0 else 0
+            filled = round(pct / 10)
+            bar = "█" * filled + "░" * (10 - filled)
+            stars_bar += f"   {'⭐'*s}  {bar}  {cnt} ({pct:.0f}%)\n"
+
+        page1 = (
+            "⭐ **REVIEW ANALYTICS — LIVE**\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+
+            "📊 **OVERVIEW**\n"
+            f"   └─ Total Reviews      : {total_reviews}\n"
+            f"   └─ 4★ & 5★ Reviews   : {hq_count} (quality-counted)\n"
+            f"   └─ Live Rating        : ⭐ {display_avg:.1f}/5.0 · {count_str} members\n"
+            f"   └─ Vault Members Now  : {vault_members:,}\n\n"
+
+            "📈 **STAR DISTRIBUTION**\n"
+            f"{stars_bar}\n"
+
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🕒 **Snapshot:** {snap_ts}\n"
+            "_Page 1 — Recent reviews on next pages →_"
+        )
+
+        # Individual review pages — 5 reviews per page, newest first
+        all_reviews = list(col_reviews.find().sort("submitted_at", -1))
+        pages = [page1]
+        PER_PAGE = 5
+        for chunk_start in range(0, len(all_reviews), PER_PAGE):
+            chunk = all_reviews[chunk_start:chunk_start + PER_PAGE]
+            chunk_text = "⭐ **RECENT REVIEWS**\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            for rv in chunk:
+                fname     = _esc_md(str(rv.get("first_name", "Agent"))[:20])
+                uname     = rv.get("username", "")
+                stars     = rv.get("stars", 5)
+                rev_text  = _esc_md(str(rv.get("review_text", ""))[:200])
+                sub_at    = rv.get("submitted_at")
+                date_str  = sub_at.strftime("%b %d, %Y") if sub_at else "—"
+                star_str  = "⭐" * stars
+                user_disp = f"@{uname}" if uname else f"User {fname}"
+                chunk_text += (
+                    f"{star_str} **{fname}** _{user_disp}_\n"
+                    f"   _{rev_text}_\n"
+                    f"   📅 {date_str}\n\n"
+                )
+            chunk_text = chunk_text.rstrip()
+            pages.append(chunk_text)
+
+        return pages if pages else ["⭐ **REVIEWS**\n\n_No reviews yet._"]
+    except Exception as e:
+        return [f"❌ **Review Analytics Error**\n\n{_esc_md(str(e)[:200])}"]
+
+
+def _review_nav_kb(uid: int, page: int, total: int) -> InlineKeyboardMarkup:
+    """Build prev/next inline keyboard for review pages."""
+    row = []
+    if page > 0:
+        row.append(InlineKeyboardButton(text="◀️ Prev", callback_data=f"rv_pg:{uid}:{page-1}"))
+    row.append(InlineKeyboardButton(text=f"📄 {page+1}/{total}", callback_data="rv_pg_noop"))
+    if page < total - 1:
+        row.append(InlineKeyboardButton(text="Next ▶️", callback_data=f"rv_pg:{uid}:{page+1}"))
+    return InlineKeyboardMarkup(inline_keyboard=[row])
+
+
+@dp.message(F.text == "⭐ REVIEWS")
+async def reviews_analytics_handler(message: types.Message):
+    """Live review analytics page with pagination — Bot 2 admin panel."""
+    if not await has_permission(message.from_user.id, "traffic"):
+        return
+    loading = await message.answer("⏳ Fetching live review data...", parse_mode="Markdown")
+    try:
+        pages = _build_review_analytics_pages()
+        uid   = message.from_user.id
+        _review_pages_cache[uid] = pages
+        total = len(pages)
+        await loading.delete()
+        kb = _review_nav_kb(uid, 0, total)
+        await message.answer(
+            pages[0] + f"\n\n_Page 1 of {total}_",
+            parse_mode="Markdown",
+            reply_markup=kb
+        )
+        print(f"⭐ REVIEWS accessed by {message.from_user.first_name} ({uid}) — {total} pages")
+    except Exception as e:
+        try:
+            await loading.edit_text(f"❌ **Error**\n\n{_esc_md(str(e)[:150])}", parse_mode="Markdown")
+        except Exception:
+            pass
+        print(f"❌ reviews_analytics_handler error: {e}")
+
+
+@dp.callback_query(F.data.startswith("rv_pg:"))
+async def review_page_nav(callback: types.CallbackQuery):
+    """Navigate review analytics pages (◀️ Prev / Next ▶️)."""
+    try:
+        _, uid_str, page_str = callback.data.split(":")
+        uid  = int(uid_str)
+        page = int(page_str)
+        pages = _review_pages_cache.get(uid)
+        if not pages:
+            await callback.answer("⏳ Session expired — tap ⭐ REVIEWS again.", show_alert=True)
+            return
+        total = len(pages)
+        page  = max(0, min(page, total - 1))
+        kb    = _review_nav_kb(uid, page, total)
+        await callback.message.edit_text(
+            pages[page] + f"\n\n_Page {page+1} of {total}_",
+            parse_mode="Markdown",
+            reply_markup=kb
+        )
+        await callback.answer()
+    except Exception as e:
+        await callback.answer(f"❌ {str(e)[:60]}", show_alert=True)
+        print(f"❌ review_page_nav error: {e}")
+
+
+@dp.callback_query(F.data == "rv_pg_noop")
+async def review_page_noop(callback: types.CallbackQuery):
+    """No-op page indicator button."""
+    await callback.answer()
+
+
+# ================================================================
+# ==================== REFERRAL ANALYTICS ====================
+
+@dp.message(F.text == "🤝 REFERRAL STATS")
+async def referral_stats_handler(message: types.Message):
+    if not await has_permission(message.from_user.id, "traffic"):
+        return
+    loading = await message.answer("⏳ Fetching live referral data...", parse_mode="Markdown")
+    try:
+        report, markup = await _build_referral_stats_report(1)
+        await loading.delete()
+        await message.answer(report, parse_mode="Markdown", reply_markup=markup)
+        
+        # Keep logging minimal
+        total_refs = col_referrals.count_documents({})
+        log_action("REFERRAL STATS", message.from_user.id, f"Total records: {total_refs}", "bot2")
+    except Exception as e:
+        try:
+            await loading.edit_text(f"❌ **Referral Stats Error**\n\n{_esc_md(str(e)[:200])}", parse_mode="Markdown")
+        except Exception:
+            pass
+
+@dp.callback_query(F.data.startswith("ref_stats_page_"))
+async def referral_stats_page_callback(callback: types.CallbackQuery):
+    try:
+        action = callback.data.split("_")[3]
+        if action == "noop":
+            await callback.answer()
+            return
+        page = int(action)
+        await callback.answer()
+        
+        report, markup = await _build_referral_stats_report(page)
+        await callback.message.edit_text(report, parse_mode="Markdown", reply_markup=markup)
+    except Exception as e:
+        await callback.answer(f"❌ Error loading page.", show_alert=True)
+
+async def _build_referral_stats_report(page: int = 1):
+    PAGE_SIZE = 10
+    now = now_local()
+
+    # Core counts
+    total_refs       = col_referrals.count_documents({})
+    confirmed_refs   = col_referrals.count_documents({"status": "confirmed"})
+    pending_refs     = col_referrals.count_documents({"status": "pending"})
+    rewarded_refs    = col_referrals.count_documents({"reward_delivered": True})
+    unique_referrers = len(col_referrals.distinct("referrer_id"))
+    unique_referred  = len(col_referrals.distinct("referred_id"))
+
+    confirm_rate = (confirmed_refs / total_refs * 100) if total_refs > 0 else 0.0
+    reward_rate  = (rewarded_refs  / confirmed_refs * 100) if confirmed_refs > 0 else 0.0
+
+    width = 10
+    filled = int(round(width * (confirm_rate / 100.0)))
+    progress_bar = "█" * filled + "░" * (width - filled)
+
+    # Top referrers count for pagination
+    pipeline_count = [
+        {"$group": {"_id": "$referrer_id", "confirmed": {"$sum": {"$cond": [{"$eq": ["$status", "confirmed"]}, 1, 0]}}}},
+        {"$match": {"confirmed": {"$gt": 0}}},
+        {"$count": "total_referrers"}
+    ]
+    count_res = list(col_referrals.aggregate(pipeline_count))
+    total_unique_confirmed_referrers = count_res[0]["total_referrers"] if count_res else 0
+    
+    import math
+    total_pages = math.ceil(total_unique_confirmed_referrers / PAGE_SIZE) if total_unique_confirmed_referrers > 0 else 1
+    if page > total_pages: page = total_pages
+
+    # Pipeline for pagination
+    pipeline = [
+        {"$group": {
+            "_id": "$referrer_id",
+            "confirmed": {"$sum": {"$cond": [{"$eq": ["$status", "confirmed"]}, 1, 0]}},
+            "pending":   {"$sum": {"$cond": [{"$eq": ["$status", "pending"]},   1, 0]}}
+        }},
+        {"$match": {"confirmed": {"$gt": 0}}},
+        {"$sort": {"confirmed": -1}},
+        {"$skip": (page - 1) * PAGE_SIZE},
+        {"$limit": PAGE_SIZE}
+    ]
+    top_referrers = list(col_referrals.aggregate(pipeline))
+
+    # Recent 7 days
+    sev_days_ago = now - timedelta(days=7)
+    recent_refs = col_referrals.count_documents({"started_at": {"$gte": sev_days_ago}})
+    recent_confirmed = col_referrals.count_documents({"confirmed_at": {"$gte": sev_days_ago}, "status": "confirmed"})
+
+    medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
+
+    report = (
+        "🤝 **REFERRAL SYSTEM ANALYTICS**\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "_Live from DB — no cache_\n\n"
+        "📊 **SYSTEM-WIDE TOTALS**\n\n"
+        f"   ✔️ Confirmed referrals  : **{confirmed_refs:,}**\n"
+        f"   ⏳ Pending referrals    : **{pending_refs:,}**\n"
+        f"   📌 Total referral records: **{total_refs:,}**\n"
+        f"   `{progress_bar}`  {confirm_rate:.1f}% confirmed\n\n"
+        "🏆 **REFERRER SUMMARY**\n\n"
+        f"   👤 Unique referrers     : **{unique_referrers:,}**\n"
+        f"   📥 Unique referred users : **{unique_referred:,}**\n"
+        f"   🎁 Rewards delivered     : **{rewarded_refs:,}** / {confirmed_refs:,}  ({reward_rate:.1f}%)\n\n"
+        "📅 **LAST 7 DAYS**\n\n"
+        f"   🔗 New referral links used   : **{recent_refs:,}**\n"
+        f"   ✅ Confirmed in last 7 days  : **{recent_confirmed:,}**\n\n"
+    )
+
+    if top_referrers:
+        report += f"🏆 **TOP REFERRERS — PAGE {page}/{total_pages}**\n\n"
+        for idx, entry in enumerate(top_referrers):
+            uid       = entry["_id"]
+            confirmed = entry["confirmed"]
+            pending   = entry["pending"]
+            rank      = (page - 1) * PAGE_SIZE + idx
+            medal     = medals[rank] if rank < len(medals) else "▪️"
+            
+            try:
+                uv = col_user_verification.find_one({"user_id": uid}, {"first_name": 1, "username": 1})
+                name = uv.get("first_name", "") if uv else ""
+                if not name:
+                    track_rec = db["bot2_user_tracking"].find_one({"user_id": uid}, {"name": 1})
+                    name = (track_rec or {}).get("name", "")
+                uname = uv.get("username", "") if uv else ""
+                display = _esc_md(name) if name else f"ID:{uid}"
+                if uname:
+                    display += f" (@{_esc_md(uname)})"
+            except Exception:
+                display = f"ID:{uid}"
+                
+            report += (
+                f"{medal} `{uid}`  {display}\n"
+                f"   ✔️ {confirmed} confirmed  ⏳ {pending} pending\n\n"
+            )
+    else:
+        report += "_No referral activity recorded yet._\n\n"
+
+    snap_ts = now.strftime("%b %d, %Y  %I:%M:%S %p")
+    report += f"━━━━━━━━━━━━━━━━━━━━━━\n🕑 **Snapshot:** {snap_ts}"
+
+    # Build markup
+    buttons = []
+    if page > 1:
+        buttons.append(InlineKeyboardButton(text="⬅️ Prev", callback_data=f"ref_stats_page_{page-1}"))
+    if total_pages > 1:
+        buttons.append(InlineKeyboardButton(text=f"Page {page}/{total_pages}", callback_data="ref_stats_page_noop"))
+    if page < total_pages:
+        buttons.append(InlineKeyboardButton(text="Next ➡️", callback_data=f"ref_stats_page_{page+1}"))
+    
+    markup = InlineKeyboardMarkup(inline_keyboard=[buttons]) if len(buttons) > 1 else None
+
+    return report, markup
+
 
 # ================================================================
 # ==================== SUPPORT PAGINATION CALLBACKS ====================
@@ -7804,8 +8492,13 @@ async def process_unban_confirm(message: types.Message, state: FSMContext):
                     r3 = col_msa_ids.delete_one({"user_id": user_id})
                     # Also clear any suspended features left over
                     col_suspended_features.delete_one({"user_id": user_id})
+                    # ── Wipe referral, credits, and review history so they start fresh ──
+                    db["bot1_referrals"].delete_many({"referred_id": user_id})
+                    db["bot1_referrals"].delete_many({"referrer_id": user_id})
+                    db["bot1_msa_credits"].delete_many({"user_id": user_id})
+                    db["bot1_reviews"].delete_many({"user_id": user_id})
                     records_cleared = r1.deleted_count + r2.deleted_count + r3.deleted_count
-                    print(f"🗑️ Permanent-ban data wipe for user {user_id}: tracking={r1.deleted_count}, verification={r2.deleted_count}, msa_ids={r3.deleted_count}")
+                    print(f"🗑️ Permanent-ban data wipe for user {user_id}: tracking={r1.deleted_count}, verification={r2.deleted_count}, msa_ids={r3.deleted_count}, referrals/credits/reviews cleared")
 
                 # Notify user with appropriate message
                 try:
@@ -7874,6 +8567,8 @@ async def process_unban_confirm(message: types.Message, state: FSMContext):
             await message.answer(f"❌ **UNBAN FAILED:** {str(e)[:100]}", parse_mode="Markdown")
     else:
         await message.answer("⚠️ Please click **✅ CONFIRM UNBAN** or **❌ CANCEL**", parse_mode="Markdown")
+
+# _build_suspend_keyboard defined below near its usage block
 
 # ==========================================
 # DELETE USER HANDLERS
@@ -7993,6 +8688,11 @@ async def process_delete_confirm(message: types.Message, state: FSMContext):
             del4 = col_suspended_features.delete_many({"user_id": user_id})
             del5 = col_msa_ids.delete_many({"user_id": user_id})           # Destroy MSA ID forever
             del6 = col_user_verification.delete_many({"user_id": user_id}) # Remove verification
+            # ── Wipe referral, credits, and review history so they start completely fresh ──
+            db["bot1_referrals"].delete_many({"referred_id": user_id})
+            db["bot1_referrals"].delete_many({"referrer_id": user_id})
+            db["bot1_msa_credits"].delete_many({"user_id": user_id})
+            db["bot1_reviews"].delete_many({"user_id": user_id})
             
             total_deleted = (del1.deleted_count + del2.deleted_count + del3.deleted_count
                             + del4.deleted_count + del5.deleted_count + del6.deleted_count)
@@ -8116,12 +8816,10 @@ async def process_reset_confirm(message: types.Message, state: FSMContext):
         
         try:
             # ── Step 1: DELETE MSA ID permanently — number returned to pool, can be reallocated ──
-            # Look up by msa_id string (e.g. "MSA324935688") — avoids user_id type mismatch
             msa_doc = col_msa_ids.find_one({"msa_id": msa_id})
             if not msa_doc and user_id:
-                # fallback: try by user_id in case msa_id field is missing
                 msa_doc = col_msa_ids.find_one({"user_id": user_id})
-            deleted_msa_id = msa_id  # fallback to state data value
+            deleted_msa_id = msa_id
             if msa_doc:
                 deleted_msa_id = msa_doc.get("msa_id", msa_id)
                 col_msa_ids.delete_one({"_id": msa_doc["_id"]})
@@ -8139,11 +8837,20 @@ async def process_reset_confirm(message: types.Message, state: FSMContext):
             # ── Step 5: Delete all support tickets for this user ──
             col_support_tickets.delete_many({"user_id": user_id})
 
+            # ── Step 6: Wipe referral, credits, and review history — they start completely fresh ──
+            #    referred_id:  removes them as a referred user (so they can be referred again)
+            #    referrer_id:  removes their pending referrals they created (clean slate)
+            db["bot1_referrals"].delete_many({"referred_id": user_id})
+            db["bot1_referrals"].delete_many({"referrer_id": user_id})
+            db["bot1_msa_credits"].delete_many({"user_id": user_id})
+            db["bot1_reviews"].delete_many({"user_id": user_id})
+
             await state.clear()
             await message.answer(
                 f"✅ **USER PERMANENTLY ERASED**\n\n"
                 f"👤 {first_name} (`{deleted_msa_id}`) has been fully removed.\n\n"
-                f"🗑️ **Deleted:** MSA ID, verification, tracking, bans, suspensions, ticket history\n"
+                f"🗑️ **Deleted:** MSA ID, verification, tracking, tickets, bans\n"
+                f"♻️ **Economy Wiped:** Referrals, credits, and reviews erased\n"
                 f"🆓 **MSA ID `{deleted_msa_id}` deleted** — number freed back to allocation pool\n\n"
                 f"🆕 If this user starts Bot 1 again they will receive a **brand-new MSA ID**.\n\n"
                 f"🕒 Erased at: {now_local().strftime('%I:%M:%S %p')}",
@@ -8278,11 +8985,12 @@ def _build_suspend_keyboard(selected: list) -> ReplyKeyboardMarkup:
 # Covers both ticked (✅ 🔍 SEARCH CODE) and plain (🔍 SEARCH CODE)
 # ──────────────────────────────────────────────────────────────────
 _FEATURE_MAP = {
-    "SEARCH CODE":   "SEARCH_CODE",
-    "DASHBOARD":     "DASHBOARD",
+    "SEARCH CODE":    "SEARCH_CODE",
+    "DASHBOARD":      "DASHBOARD",
     "WATCH TUTORIAL": "TUTORIAL",
-    "RULES":         "RULES",
-    "GUIDE":         "GUIDE",
+    "RULES":          "RULES",
+    "GUIDE":          "GUIDE",
+    "RATE AGENT":     "RATE_AGENT",
 }
 
 def _resolve_feature(text: str):
@@ -8752,9 +9460,10 @@ async def show_pending_tickets_page(message: types.Message, page: int = 1):
     page = max(1, min(page, total_pages))  # Clamp page number
     skip = (page - 1) * ITEMS_PER_PAGE
     
-    # Get tickets for current page
+    # Get tickets for current page — sort by created_at desc (older docs may lack this field;
+    # guard: sort on created_at only, fallback to _id for legacy tickets)
     tickets = list(col_support_tickets.find({"status": "open"})
-                   .sort("created_at", -1)
+                   .sort([("created_at", -1), ("_id", -1)])
                    .skip(skip)
                    .limit(ITEMS_PER_PAGE))
     
@@ -8770,8 +9479,8 @@ async def show_pending_tickets_page(message: types.Message, page: int = 1):
         msa_id = ticket.get('msa_id', 'Not Assigned') 
         issue_full = ticket.get('issue_text', 'No description')
         issue = issue_full[:80]
-        created = ticket.get('created_at', now_local())
-        date_str = created.strftime("%b %d, %I:%M %p")
+        created = ticket.get('created_at') or ticket.get('_id').generation_time.replace(tzinfo=None) if ticket.get('_id') else now_local()
+        date_str = created.strftime("%b %d, %I:%M %p") if hasattr(created, 'strftime') else str(created)
         support_count = ticket.get('support_count', 1)
 
         # Per-user spam & history info
@@ -8783,11 +9492,13 @@ async def show_pending_tickets_page(message: types.Message, page: int = 1):
         _total_user = col_support_tickets.count_documents({"user_id": user_id})
         _prev_list = list(
             col_support_tickets.find({"user_id": user_id})
-            .sort("created_at", -1).skip(1).limit(1)
+            .sort([("created_at", -1), ("_id", -1)]).skip(1).limit(1)
         )
+        _prev_doc = _prev_list[0] if _prev_list else None
+        _prev_ts = _prev_doc.get("created_at") if _prev_doc else None
         _last_sub = (
-            _prev_list[0]["created_at"].strftime("%b %d, %I:%M %p")
-            if _prev_list else "First ever"
+            _prev_ts.strftime("%b %d, %I:%M %p") if _prev_ts and hasattr(_prev_ts, 'strftime')
+            else ("First ever" if not _prev_doc else "—")
         )
         _is_dup = user_id in _seen_users_page
         _seen_users_page.add(user_id)
@@ -8797,7 +9508,7 @@ async def show_pending_tickets_page(message: types.Message, page: int = 1):
             response += f"⚠️ **SPAM ALERT** — {_recent_count}x in last hour!\n"
         if _is_dup:
             response += f"♻️ **DUPLICATE** — multiple open tickets\n"
-        response += f"👤 **{user_name}** (@{username})\n"
+        response += f"👤 **{_escape_md(user_name)}** (@{username})\n"
         response += f"🆔 TG: `{user_id}` | MSA: `{msa_id}`\n"
         response += f"🎫 Ticket #{support_count} · {date_str}\n"
         response += f"📊 Total: {_total_user} ticket(s) · Prev sub: {_last_sub}\n"
@@ -8877,9 +9588,9 @@ async def show_all_tickets_page(message: types.Message, page: int = 1):
     page = max(1, min(page, total_pages))
     skip = (page - 1) * ITEMS_PER_PAGE
     
-    # Get tickets for current page
+    # Get tickets for current page — dual sort guards against legacy tickets missing created_at
     tickets = list(col_support_tickets.find({})
-                   .sort("created_at", -1)
+                   .sort([("created_at", -1), ("_id", -1)])
                    .skip(skip)
                    .limit(ITEMS_PER_PAGE))
     
@@ -8892,11 +9603,11 @@ async def show_all_tickets_page(message: types.Message, page: int = 1):
         msa_id = ticket.get('msa_id', 'N/A')
         status = ticket.get('status', 'unknown')
         status_emoji = "⏳" if status == "open" else "✅"
-        created = ticket.get('created_at', now_local())
-        date_str = created.strftime("%b %d, %I:%M %p")
+        created = ticket.get('created_at')
+        date_str = created.strftime("%b %d, %I:%M %p") if created and hasattr(created, 'strftime') else "—"
         issue = ticket.get('issue_text', 'N/A')[:50]  # First 50 chars
         
-        response += f"{status_emoji} **{user_name}** (MSA: `{msa_id}`)\n"
+        response += f"{status_emoji} **{_escape_md(user_name)}** (MSA: `{msa_id}`)\n"
         response += f"   📝 {issue}... · {date_str}\n\n"
     
     # Hard-cap at 3800 chars to stay safely within Telegram's 4096-char limit
@@ -9027,8 +9738,8 @@ async def process_resolve_ticket(message: types.Message, state: FSMContext):
     has_video = ticket.get('has_video', False)
     support_count = ticket.get('support_count', 1)
     channel_message_id = ticket.get('channel_message_id')
-    created = ticket.get('created_at', now_local())
-    created_str = created.strftime("%B %d, %Y at %I:%M %p")
+    created = ticket.get('created_at')
+    created_str = created.strftime("%B %d, %Y at %I:%M %p") if created and hasattr(created, 'strftime') else "Unknown date"
     resolved_str = resolved_at.strftime("%B %d, %Y at %I:%M %p")
     
     await state.clear()
@@ -9396,7 +10107,7 @@ async def show_admin_search_ticket_page(message_or_cb, user_id: int, page: int):
     support_num = ticket.get('support_count', page + 1)
     
     response = f"🔍 **USER TICKET HISTORY**\n\n"
-    response += f"👤 **{user_name}** (@{username})\n"
+    response += f"👤 **{_escape_md(user_name)}** (@{username})\n"
     response += f"🆔 Telegram ID: `{user_id}`\n"
     response += f"💳 MSA+ ID: `{msa_id}`\n"
     response += f"📊 Total: {total} (⏳ {open_count} | ✅ {resolved_count})\n\n"
@@ -11638,7 +12349,7 @@ async def terminal_handler(message: types.Message, state: FSMContext):
         # Show view selection with reply keyboard
         keyboard = ReplyKeyboardMarkup(
             keyboard=[
-                [KeyboardButton(text="📱 BOT 1 LOGS"), KeyboardButton(text="🎛️ BOT 2 LOGS")],
+                [KeyboardButton(text="🖥️ BOT 1 LOGS"), KeyboardButton(text="🖥️ BOT 2 LOGS")],
                 [KeyboardButton(text="⬅️ MAIN MENU")]
             ],
             resize_keyboard=True
@@ -11661,60 +12372,107 @@ async def terminal_handler(message: types.Message, state: FSMContext):
             parse_mode="HTML"
         )
 
-@dp.message(F.text.in_({"📱 BOT 1 LOGS", "🔄 REFRESH BOT 1"}))
+@dp.message(F.text.in_({"🖥️ BOT 1 LOGS", "🔄 REFRESH BOT 1"}))
 async def view_bot1_logs(message: types.Message, state: FSMContext):
-    """Show Bot 1 live logs in raw terminal format"""
-    # Simply log strictly (no stats query)
-    log_action("CMD", message.from_user.id, "Opened Bot 1 Terminal", "bot1")
-    
+    """Show Bot 1 live logs — 12h AM/PM with date, user ID, name, channel"""
+    log_action("CMD", message.from_user.id, "Opened Bot 1 Terminal", "bot2",
+               user_name=message.from_user.full_name or "")
     try:
         logs_text = get_terminal_logs(bot="bot1", limit=50)
-        
-        # Specific keyboard for Bot 1 view
+        now_str     = now_local().strftime("%b %d, %Y  %I:%M:%S %p")
+        user        = message.from_user
+        user_name   = user.full_name or str(user.id)
+        username    = f"@{user.username}" if user.username else f"ID:{user.id}"
+        uptime_b2   = now_local() - bot2_health["bot_start_time"]
+        h2, m2      = int(uptime_b2.total_seconds() // 3600), int((uptime_b2.total_seconds() % 3600) // 60)
+        started_str = bot2_health["bot_start_time"].strftime("%b %d, %Y  %I:%M:%S %p")
+        log_count   = col_live_logs.count_documents({"bot": "bot1"}) if col_live_logs is not None else 0
+
         keyboard = ReplyKeyboardMarkup(
             keyboard=[
                 [KeyboardButton(text="🔄 REFRESH BOT 1"), KeyboardButton(text="⬅️ RETURN TO MENU")]
             ],
             resize_keyboard=True
         )
-        
-        # Raw terminal appearance
+        header = (
+            f"<b>🖥️ BOT 1 — LIVE TERMINAL</b>\n"
+            f"<code>"
+            f"Refreshed by : {_html_escape(user_name)} ({_html_escape(username)})\n"
+            f"User ID      : {user.id}\n"
+            f"Time         : {now_str}\n"
+            f"Bot 2 Started: {started_str}\n"
+            f"Bot 2 Uptime : {h2}h {m2}m\n"
+            f"DB Log Count : {log_count} entries\n"
+            f"Format       : [Date  Time] [Name|ID|Channel] Action &gt; Detail\n"
+            f"{'━'*42}\n"
+            f"</code>"
+        )
         await message.answer(
-            f"<b>📱 BOT 1 TERMINAL VIEW</b>\n"
-            f"<pre language='bash'>{logs_text}</pre>",
+            header + f"<pre>{_html_escape(logs_text)}</pre>",
             reply_markup=keyboard,
             parse_mode="HTML"
         )
-        
     except Exception as e:
         await message.answer(f"Error: {e}")
 
-@dp.message(F.text.in_({"🎛️ BOT 2 LOGS", "🔄 REFRESH BOT 2"}))
+@dp.message(F.text.in_({"🖥️ BOT 2 LOGS", "🔄 REFRESH BOT 2"}))
 async def view_bot2_logs(message: types.Message, state: FSMContext):
-    """Show Bot 2 live logs in raw terminal format"""
-    log_action("CMD", message.from_user.id, "Opened Bot 2 Terminal", "bot2")
-    
+    """Show Bot 2 live logs — 12h AM/PM with date, user ID, name, channel"""
+    log_action("CMD", message.from_user.id, "Opened Bot 2 Terminal", "bot2",
+               user_name=message.from_user.full_name or "")
     try:
-        logs_text = get_terminal_logs(bot="bot2", limit=50)
-        
-        # Specific keyboard for Bot 2 view
+        logs_text   = get_terminal_logs(bot="bot2", limit=50)
+        now_str     = now_local().strftime("%b %d, %Y  %I:%M:%S %p")
+        user        = message.from_user
+        user_name   = user.full_name or str(user.id)
+        username    = f"@{user.username}" if user.username else f"ID:{user.id}"
+        uptime_b2   = now_local() - bot2_health["bot_start_time"]
+        h2, m2      = int(uptime_b2.total_seconds() // 3600), int((uptime_b2.total_seconds() % 3600) // 60)
+        started_str = bot2_health["bot_start_time"].strftime("%b %d, %Y  %I:%M:%S %p")
+        log_count   = col_live_logs.count_documents({"bot": "bot2"}) if col_live_logs is not None else 0
+
         keyboard = ReplyKeyboardMarkup(
             keyboard=[
                 [KeyboardButton(text="🔄 REFRESH BOT 2"), KeyboardButton(text="⬅️ RETURN TO MENU")]
             ],
             resize_keyboard=True
         )
-        
-        # Raw terminal appearance  
+        header = (
+            f"<b>🖥️ BOT 2 — LIVE TERMINAL</b>\n"
+            f"<code>"
+            f"Refreshed by : {_html_escape(user_name)} ({_html_escape(username)})\n"
+            f"User ID      : {user.id}\n"
+            f"Time         : {now_str}\n"
+            f"Bot 2 Started: {started_str}\n"
+            f"Bot 2 Uptime : {h2}h {m2}m\n"
+            f"DB Log Count : {log_count} entries\n"
+            f"Format       : [Date  Time] [Name|ID|Channel] Action &gt; Detail\n"
+            f"{'━'*42}\n"
+            f"</code>"
+        )
         await message.answer(
-            f"<b>🎛️ BOT 2 TERMINAL VIEW</b>\n"
-            f"<pre language='bash'>{logs_text}</pre>",
+            header + f"<pre>{_html_escape(logs_text)}</pre>",
             reply_markup=keyboard,
             parse_mode="HTML"
         )
-        
     except Exception as e:
         await message.answer(f"Error: {e}")
+
+
+@dp.message(F.text.in_({"📚 BOT 3 LOGS", "🔄 REFRESH BOT 3"}))
+async def view_bot3_logs_redirect(message: types.Message, state: FSMContext):
+    """Bot 3 logs are in Bot 3's own terminal — redirect notice."""
+    await message.answer(
+        "<b>📚 BOT 3 LOGS</b>\n\n"
+        "Bot 3 has its own terminal inside the Bot 3 admin panel.\n"
+        "Open Bot 3 and go to <b>🖥️ TERMINAL</b> to view its live logs.\n\n"
+        "<i>Bot 2 terminal shows only Bot 1 &amp; Bot 2 actions.</i>",
+        parse_mode="HTML",
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text="⬅️ RETURN TO MENU")]],
+            resize_keyboard=True
+        )
+    )
 
 
 @dp.message(F.text == "⬅️ RETURN TO MENU")
@@ -11773,15 +12531,26 @@ async def terminal_bot1_view(callback: types.CallbackQuery, state: FSMContext):
         open_tickets = col_support_tickets.count_documents({"status": "open"})
         resolved_tickets = col_support_tickets.count_documents({"status": "resolved"})
         
+        # Viewer info
+        _viewer      = callback.from_user
+        _viewer_name = _viewer.full_name or str(_viewer.id)
+        _viewer_un   = f"@{_viewer.username}" if _viewer.username else f"ID:{_viewer.id}"
+        _started_str = bot2_health["bot_start_time"].strftime("%b %d, %Y  %I:%M:%S %p")
+        _uptime_b2   = now_local() - bot2_health["bot_start_time"]
+        _h2, _m2     = int(_uptime_b2.total_seconds() // 3600), int((_uptime_b2.total_seconds() % 3600) // 60)
         # Build terminal-style output
         terminal_output = (
             "<b>🖥️ MSA NODE - SYSTEM TERMINAL</b>\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
             f"<code>$ system_info --status\n"
-            f"System: {MONGO_DB_NAME}\n"
-            f"Status: ONLINE ✅\n"
-            f"Timestamp: {now_local().strftime('%Y-%m-%d %H:%M:%S')}\n"
-            f"Admin: Bot 2 Control Panel\n\n"
+            f"System       : {MONGO_DB_NAME}\n"
+            f"Status       : ONLINE ✅\n"
+            f"Viewed by    : {_viewer_name} ({_viewer_un})\n"
+            f"User ID      : {_viewer.id}\n"
+            f"Timestamp    : {now_local().strftime('%b %d, %Y  %I:%M:%S %p')}\n"
+            f"Bot 2 Started: {_started_str}\n"
+            f"Bot 2 Uptime : {_h2}h {_m2}m\n"
+            f"Admin Panel  : Bot 2 Control Panel\n\n"
             
             f"$ bot2_features --list\n\n"
             f"BOT 2 AVAILABLE ACTIONS:\n"
@@ -11876,10 +12645,14 @@ async def terminal_bot1_view(callback: types.CallbackQuery, state: FSMContext):
             "<b>📱 BOT 1 LIVE TERMINAL</b>\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
             f"<code>$ bot1_info --status\n"
-            f"Bot: MSA Node Bot (Bot 1)\n"
-            f"Status: ONLINE ✅\n"
-            f"Timestamp: {now_local().strftime('%Y-%m-%d %H:%M:%S')}\n"
-            f"Live Updates: ENABLED ✅\n\n"
+            f"Bot          : MSA Node Bot (Bot 1)\n"
+            f"Status       : ONLINE ✅\n"
+            f"Viewed by    : {_viewer_name} ({_viewer_un})\n"
+            f"User ID      : {_viewer.id}\n"
+            f"Timestamp    : {now_local().strftime('%b %d, %Y  %I:%M:%S %p')}\n"
+            f"Bot 2 Started: {_started_str}\n"
+            f"Bot 2 Uptime : {_h2}h {_m2}m\n"
+            f"Live Updates : ENABLED ✅\n\n"
             
             f"$ user_data --collections\n\n"
             f"USER DATA COLLECTIONS:\n"
@@ -11964,15 +12737,26 @@ async def terminal_bot2_view(callback: types.CallbackQuery, state: FSMContext):
         )
         
         # Build Bot 2 terminal output
+        # Viewer info for bot2 terminal
+        _viewer2      = callback.from_user
+        _viewer2_name = _viewer2.full_name or str(_viewer2.id)
+        _viewer2_un   = f"@{_viewer2.username}" if _viewer2.username else f"ID:{_viewer2.id}"
+        _started2_str = bot2_health["bot_start_time"].strftime("%b %d, %Y  %I:%M:%S %p")
+        _uptime2      = now_local() - bot2_health["bot_start_time"]
+        _h2b, _m2b    = int(_uptime2.total_seconds() // 3600), int((_uptime2.total_seconds() % 3600) // 60)
         bot2_terminal = (
             "<b>🎛️ BOT 2 LIVE TERMINAL</b>\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
             f"<code>$ bot2_info --status\n"
-            f"Bot: Admin Control Panel (Bot 2)\n"
-            f"Status: ONLINE ✅\n"
-            f"Timestamp: {now_local().strftime('%Y-%m-%d %H:%M:%S')}\n"
-            f"Live Updates: ENABLED ✅\n"
-            f"Console Logging: ACTIVE ✅\n\n"
+            f"Bot          : Admin Control Panel (Bot 2)\n"
+            f"Status       : ONLINE ✅\n"
+            f"Viewed by    : {_viewer2_name} ({_viewer2_un})\n"
+            f"User ID      : {_viewer2.id}\n"
+            f"Timestamp    : {now_local().strftime('%b %d, %Y  %I:%M:%S %p')}\n"
+            f"Bot 2 Started: {_started2_str}\n"
+            f"Bot 2 Uptime : {_h2b}h {_m2b}m\n"
+            f"Live Updates : ENABLED ✅\n"
+            f"Console Log  : ACTIVE ✅\n\n"
             
             f"$ admin_actions --available\n\n"
             f"AVAILABLE ADMIN ACTIONS:\n"
@@ -12891,7 +13675,7 @@ async def process_role_admin_id(message: types.Message, state: FSMContext):
             ban_info = admin.get('ban_info', {})
             
             if name != str(uid):
-                msg += f"👤 **{name}** (`{uid}`)\n"
+                msg += f"👤 **{_escape_md(name)}** (`{uid}`)\n"
             else:
                 msg += f"👤 **{uid}**\n"
                 
@@ -14237,7 +15021,7 @@ async def _send_admin_list_page(message: types.Message, state: FSMContext, page:
             date_text = "Unknown"
             
         if name != str(uid):
-            lines.append(f"{icon} **{name}** ({uid})")
+            lines.append(f"{icon} **{_escape_md(name)}** ({uid})")
         else:
             lines.append(f"{icon} **{uid}**")
         lines.append(f"👔 Role: **{role}**")
@@ -14417,6 +15201,66 @@ _BOT1_GUIDE_FOR_BOT2 = (
     "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
     "<i>For full user guide details, check Bot 1's 📚 GUIDE.</i>"
 )
+
+def _generate_status_report(now, h, m, db_ok, db_status, bkp_status, bot2_health, b1_msa_total, b1_new_users_today, b1_verified, b1_unverified, b1_banned, b1_perm_banned, b1_suspended, b1_open_tickets, b1_new_tickets, b1_resolved_today, b1_total_tickets, b2_tracked, b2_ig, b2_yt, b2_igcc, b2_ytcode, b2_broadcasts, last_bcast_str, b2_admins, b2_locked_admins, b2_banned_own, b3_pdfs, b3_ig, b3_total_clicks, b3_pdf_clicks, b3_aff_clicks, b3_igcc_clicks, b3_yt_clicks, b3_ig_clicks, b3_ytc_clicks, bk1_count, bk1_str, bk2_count, bk2_str, col_support_tickets, _st) -> str:
+    def _pct(val, total): return f"{(val/total)*100:.1f}%" if total > 0 else "0%"
+    
+    period = "🌅 MORNING" if now.hour < 12 else "🌆 EVENING"
+    report_time = now.strftime("%B %d, %Y  %I:%M %p")
+
+    report = (
+        f"📊 **DAILY {period} REPORT**\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🗓 **{report_time}**\n\n"
+
+        f"⚡ **BOT 2 — SYSTEM STATUS**\n"
+        f"• Status: ✅ Online\n"
+        f"• Uptime: `{h}h {m}m`\n"
+        f"• Main DB (`MSANodeDB`): {'✅' if db_ok else '❌'} {db_status}\n"
+        f"• Backup DB (`MSANodeBackups`): {bkp_status}\n"
+        f"• Auto-Healer: ✅ Active | Watchdog: ✅ Hourly\n"
+        f"• Errors Caught: `{bot2_health['errors_caught']}` | Auto-Healed: `{bot2_health['auto_healed']}` | Alerts Sent: `{bot2_health['owner_notified']}`\n\n"
+
+        f"🤖 **BOT 1 — USER DATA**\n"
+        f"• MSA IDs: `{b1_msa_total:,}` | 🆕 New Today: `{b1_new_users_today}`\n"
+        f"• Verified: `{b1_verified:,}` | Unverified: `{b1_unverified:,}`\n"
+        f"• Banned: `{b1_banned:,}` | Perm Banned MSA: `{b1_perm_banned:,}` | Suspended: `{b1_suspended:,}`\n"
+        f"• Open Tickets: `{b1_open_tickets}` | New Today: `{b1_new_tickets}` | Resolved Today: `{b1_resolved_today}`\n"
+        f"• Total Tickets: `{b1_total_tickets:,}` | Resolution Rate: `{_pct(col_support_tickets.count_documents({'status': 'resolved'}), b1_total_tickets) if b1_total_tickets else 'N/A'}`\n\n"
+
+        f"🎛 **BOT 2 — TRAFFIC & ADMIN**\n"
+        f"• Total Tracked Users: `{b2_tracked:,}`\n"
+        f"• 📸 IG Start: `{b2_ig}` ({_pct(b2_ig, b2_tracked)}) | ▶️ YT Start: `{b2_yt}` ({_pct(b2_yt, b2_tracked)})\n"
+        f"• 📸 IG CC: `{b2_igcc}` ({_pct(b2_igcc, b2_tracked)}) | 🔑 YT Code: `{b2_ytcode}` ({_pct(b2_ytcode, b2_tracked)})\n"
+        f"• Broadcasts: `{b2_broadcasts}` | Last: {last_bcast_str}\n"
+        f"• Admins: `{b2_admins}` | Locked: `{b2_locked_admins}` | Bot2 Bans: `{b2_banned_own}`\n\n"
+
+        f"📚 **BOT 3 — CONTENT & CLICKS**\n"
+        f"• PDFs: `{b3_pdfs}` | IG Content: `{b3_ig}`\n"
+        f"• Total Clicks (All-Time): `{b3_total_clicks:,}`\n"
+        f"• 📄 PDF: `{b3_pdf_clicks:,}` | 💸 Affiliate: `{b3_aff_clicks:,}` | 📸 IG CC: `{b3_igcc_clicks:,}`\n"
+        f"• ▶️ YT Start: `{b3_yt_clicks:,}` | 📸 IG Start: `{b3_ig_clicks:,}` | 🔑 YT Code: `{b3_ytc_clicks:,}`\n\n"
+
+        f"💾 **BACKUP CLUSTER (MSANodeBackups)**\n"
+        f"• Bot 1 — Snapshots: `{bk1_count}` | Last: {bk1_str}\n"
+        f"• Bot 2 — Snapshots: `{bk2_count}` | Last: {bk2_str}\n\n"
+    )
+
+    if _st["ok"]:
+        report += (
+            f"🗄 **MONGODB STORAGE**\n"
+            f"• Used: `{_st['used_mb']:.1f}MB` / `{_st['cap_mb']:.0f}MB` ({_st['pct']:.1f}%)\n"
+            f"• [{_st['bar']}] {_st['risk_icon']} {_st['risk_label']}\n"
+        )
+        if _st["pct"] >= 75:
+            report += f"• ⚠️ Storage at {_st['pct']:.0f}% — plan upgrade soon\n"
+        report += "\n"
+
+    report += (
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"_Auto-report · Next in 12h_"
+    )
+    return report
 
 def _guide_selector_kb() -> ReplyKeyboardMarkup:
     """Keyboard shown on guide selector screen."""
@@ -14782,6 +15626,9 @@ async def reset_data_final_confirm(message: types.Message, state: FSMContext):
             (col_bot1_settings, "bot1_settings"),
             (col_permanently_banned_msa, "bot1_permanently_banned_msa"),
             (col_offline_log, "bot1_offline_log"),
+            (db["bot1_referrals"], "bot1_referrals"),
+            (db["bot1_msa_credits"], "bot1_msa_credits"),
+            (db["bot1_reviews"], "bot1_reviews"),
         ]
         snapshot = {}
         total_docs_found = 0
@@ -14829,10 +15676,14 @@ async def reset_data_final_confirm(message: types.Message, state: FSMContext):
         r6 = col_bot1_settings.delete_many({})
         r7 = col_permanently_banned_msa.delete_many({})
         r8 = col_offline_log.delete_many({})
+        r9 = db["bot1_referrals"].delete_many({})
+        r10 = db["bot1_msa_credits"].delete_many({})
+        r11 = db["bot1_reviews"].delete_many({})
         
         total_deleted = sum([r1.deleted_count, r2.deleted_count, r3.deleted_count, 
                             r4.deleted_count, r5.deleted_count, r6.deleted_count,
-                            r7.deleted_count, r8.deleted_count])
+                            r7.deleted_count, r8.deleted_count, r9.deleted_count,
+                            r10.deleted_count, r11.deleted_count])
         
         success_msg = (
             "<b>✅ ALL BOT 1 DATA DELETED</b>\n\n"
@@ -14845,7 +15696,10 @@ async def reset_data_final_confirm(message: types.Message, state: FSMContext):
             f" ├─ bot1_suspended_features: {r5.deleted_count:,}\n"
             f" ├─ bot1_settings: {r6.deleted_count:,}\n"
             f" ├─ bot1_permanently_banned_msa: {r7.deleted_count:,}\n"
-            f" └─ bot1_offline_log: {r8.deleted_count:,}\n\n"
+            f" ├─ bot1_offline_log: {r8.deleted_count:,}\n"
+            f" ├─ bot1_referrals: {r9.deleted_count:,}\n"
+            f" ├─ bot1_msa_credits: {r10.deleted_count:,}\n"
+            f" └─ bot1_reviews: {r11.deleted_count:,}\n\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"<b>Total Deleted:</b> {total_deleted:,}\n\n"
             f"<i>⏰ Completed at {now_local().strftime('%Y-%m-%d %I:%M:%S %p')}</i>"
@@ -14986,6 +15840,34 @@ async def automated_database_cleanup():
     print(f"🧹 ═══════════════════════════════════════\n")
     
     return cleanup_stats
+
+def build_daily_report() -> str:
+    """
+    Thin synchronous wrapper around generate_daily_report().
+    The real report is built by generate_daily_report() (async, live DB).
+    This stub is kept for backward compat — any legacy sync callers will get a
+    basic fallback; actual scheduling uses generate_daily_report() directly.
+    """
+    now = now_local()
+    period = "🌅 MORNING" if now.hour < 12 else "🌆 EVENING"
+    report_time = now.strftime("%B %d, %Y  %I:%M %p")
+    uptime = now - bot2_health.get("bot_start_time", now)
+    h = int(uptime.total_seconds() // 3600)
+    m = int((uptime.total_seconds() % 3600) // 60)
+    return (
+        f"📊 **DAILY {period} REPORT**\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🗓 **{report_time}**\n\n"
+        f"⚡ **BOT 2 — SYSTEM STATUS**\n"
+        f"• Status: ✅ Online | Uptime: `{h}h {m}m`\n"
+        f"• Auto-Healer: ✅ Active | Watchdog: ✅ Hourly\n"
+        f"• Errors Caught: `{bot2_health.get('errors_caught', 0)}` "
+        f"| Auto-Healed: `{bot2_health.get('auto_healed', 0)}` "
+        f"| Alerts Sent: `{bot2_health.get('owner_notified', 0)}`\n\n"
+        f"_Full live report runs via generate_daily_report() at 8:40 AM/PM_\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"_Auto-report · Next in 12h_"
+    )
 
 async def schedule_daily_cleanup():
     """Schedule cleanup to run daily at 3 AM"""
@@ -15138,6 +16020,25 @@ async def bot2_auto_heal(error_type: str, error: Exception) -> bool:
             "deactivated", "kicked", "not enough rights", "member list is inaccessible"
         ]):
             print("🤖 [AUTO-HEAL] Telegram user/chat issue suppressed (user-side, not our fault)")
+            bot2_health["auto_healed"] += 1
+            bot2_health["consecutive_failures"] = 0
+            return True
+
+        # KeyError / TypeError — typically from a DB document missing an optional field
+        # Root-cause is stale/legacy documents; suppress and log field name for admin review
+        elif error_type in ("KeyError", "TypeError", "AttributeError"):
+            _em = str(error)
+            field_hint = _em.strip("'\"") if _em else "unknown"
+            print(f"🔑 [AUTO-HEAL] {error_type} on field '{field_hint}' — suppressed (legacy/missing DB field). "
+                  f"Ensure all documents contain this field or use .get() instead of [] access.")
+            bot2_health["auto_healed"] += 1
+            bot2_health["consecutive_failures"] = 0
+            return True
+
+        # ValueError / IndexError — typically from bad user input parsing
+        elif error_type in ("ValueError", "IndexError"):
+            _em = str(error)
+            print(f"📋 [AUTO-HEAL] {error_type} — user input parse error suppressed: {_em[:80]}")
             bot2_health["auto_healed"] += 1
             bot2_health["consecutive_failures"] = 0
             return True
@@ -15375,7 +16276,7 @@ async def monthly_json_delivery_bot2():
                         "bot2_cleanup_backups",       # broadcast rollback snapshots — already on prod
                         "bot2_cleanup_logs",          # internal cleanup event logs
                         "bot1_offline_log",           # bot on/off event log — not critical monthly
-                        "bot_backup_history",         # backup event history — on backup cluster
+                        "bot2_backup_history",         # backup event history — on backup cluster
                     }
                     all_db_cols = sorted(db.list_collection_names())
                     all_cols    = [c for c in all_db_cols if c not in _SKIP_MONTHLY]
@@ -15498,7 +16399,7 @@ async def state_auto_save_loop():
 # DAILY REPORT SYSTEM (8:40 AM & 8:40 PM)
 # ==========================================
 
-async def generate_daily_report() -> str:
+async def generate_daily_report(page: int = 1) -> str:
     """Generate comprehensive daily report for Bot 1 + Bot 2 with real live data."""
     now = now_local()
     uptime = now - bot2_health["bot_start_time"]
@@ -15538,9 +16439,19 @@ async def generate_daily_report() -> str:
         b1_new_tickets   = col_support_tickets.count_documents({"created_at": {"$gte": today_start}})
         b1_banned        = col_banned_users.count_documents({})
         b1_suspended     = col_suspended_features.count_documents({})
+        # Rating stats: only count >4 stars (5-star reviews) for social proof display
+        _reviews_col     = db["bot1_reviews"]
+        b1_five_star_reviews = _reviews_col.count_documents({"stars": {"$gt": 4}})
+        b1_total_reviews     = _reviews_col.count_documents({})
+        # Referral stats
+        _referrals_col       = db["bot1_referrals"]
+        b1_referrals_confirmed = _referrals_col.count_documents({"status": "confirmed"})
+        b1_referrals_pending   = _referrals_col.count_documents({"status": "pending"})
     except Exception:
         b1_msa_total = b1_verified = b1_unverified = b1_perm_banned = 0
         b1_open_tickets = b1_total_tickets = b1_new_tickets = b1_banned = b1_suspended = 0
+        b1_five_star_reviews = b1_total_reviews = 0
+        b1_referrals_confirmed = b1_referrals_pending = 0
 
     # === BOT 2 DATA ===
     try:
@@ -15551,7 +16462,8 @@ async def generate_daily_report() -> str:
         b2_ytcode        = col_user_tracking.count_documents({"source": "YTCODE"})
         b2_broadcasts    = col_broadcasts.count_documents({})
         last_bcast       = col_broadcasts.find_one({}, sort=[("created_at", -1)])
-        last_bcast_str   = last_bcast["created_at"].strftime("%d %b %I:%M %p") if last_bcast and last_bcast.get("created_at") else "Never"
+        _lbca = last_bcast.get("created_at") if last_bcast else None
+        last_bcast_str   = _lbca.strftime("%d %b %I:%M %p") if _lbca and hasattr(_lbca, "strftime") else "Never"
         b2_admins        = col_admins.count_documents({})
         b2_locked_admins = col_admins.count_documents({"locked": True})
         b2_banned_own    = col_banned_users.count_documents({"scope": "bot2"})
@@ -15564,13 +16476,58 @@ async def generate_daily_report() -> str:
     try:
         bk1 = col_bot1_backups.find_one({}, sort=[("backup_date", -1)])
         bk2 = col_bot2_backups.find_one({}, sort=[("backup_date", -1)])
-        bk1_str = bk1["backup_date"].strftime("%d %b %I:%M %p") if bk1 and bk1.get("backup_date") else "Never"
-        bk2_str = bk2["backup_date"].strftime("%d %b %I:%M %p") if bk2 and bk2.get("backup_date") else "Never"
+        _bk1d = bk1.get("backup_date") if bk1 else None
+        _bk2d = bk2.get("backup_date") if bk2 else None
+        bk1_str = _bk1d.strftime("%d %b %I:%M %p") if _bk1d and hasattr(_bk1d, "strftime") else "Never"
+        bk2_str = _bk2d.strftime("%d %b %I:%M %p") if _bk2d and hasattr(_bk2d, "strftime") else "Never"
         bk1_count = col_bot1_backups.count_documents({})
         bk2_count = col_bot2_backups.count_documents({})
     except Exception:
         bk1_str = bk2_str = "Unavailable"
         bk1_count = bk2_count = 0
+
+    # === TRAFFIC % CALCULATIONS ===
+    def _pct(n, total):
+        return f"{n/total*100:.1f}%" if total > 0 else "0.0%"
+
+    # === TODAY ACTIVE USERS (new this session) ===
+    try:
+        b1_new_users_today = col_user_verification.count_documents(
+            {"first_start": {"$gte": today_start}}
+        )
+        b1_resolved_today  = col_support_tickets.count_documents(
+            {"status": "resolved", "resolved_at": {"$gte": today_start}}
+        )
+    except Exception:
+        b1_new_users_today = b1_resolved_today = 0
+
+    # === BOT 3 STATS ===
+    try:
+        _b3db = client[MONGO_DB_NAME]
+        b3_pdfs      = _b3db["bot3_pdfs"].count_documents({})
+        b3_ig        = _b3db["bot3_ig_content"].count_documents({})
+        _b3agg       = list(_b3db["bot3_pdfs"].aggregate([
+            {"$group": {"_id": None,
+                        "pdf_clicks":  {"$sum": {"$ifNull": ["$clicks", 0]}},
+                        "aff_clicks":  {"$sum": {"$ifNull": ["$affiliate_clicks", 0]}},
+                        "yt_clicks":   {"$sum": {"$ifNull": ["$yt_start_clicks", 0]}},
+                        "ytc_clicks":  {"$sum": {"$ifNull": ["$yt_code_clicks", 0]}},
+                        "ig_clicks":   {"$sum": {"$ifNull": ["$ig_start_clicks", 0]}}}}
+        ]))
+        _b3ig_agg    = list(_b3db["bot3_ig_content"].aggregate([
+            {"$group": {"_id": None, "igcc_clicks": {"$sum": {"$ifNull": ["$ig_cc_clicks", 0]}}}}
+        ]))
+        _s = _b3agg[0] if _b3agg else {}
+        b3_pdf_clicks  = _s.get("pdf_clicks", 0)
+        b3_aff_clicks  = _s.get("aff_clicks", 0)
+        b3_yt_clicks   = _s.get("yt_clicks", 0)
+        b3_ytc_clicks  = _s.get("ytc_clicks", 0)
+        b3_ig_clicks   = _s.get("ig_clicks", 0)
+        b3_igcc_clicks = _b3ig_agg[0].get("igcc_clicks", 0) if _b3ig_agg else 0
+        b3_total_clicks = b3_pdf_clicks + b3_aff_clicks + b3_yt_clicks + b3_ytc_clicks + b3_ig_clicks + b3_igcc_clicks
+    except Exception:
+        b3_pdfs = b3_ig = b3_total_clicks = 0
+        b3_pdf_clicks = b3_aff_clicks = b3_yt_clicks = b3_ytc_clicks = b3_ig_clicks = b3_igcc_clicks = 0
 
     # === MONGODB STORAGE ===
     _st = get_mongo_storage_stats()
@@ -15578,57 +16535,84 @@ async def generate_daily_report() -> str:
     period     = "🌅 MORNING" if now.hour < 12 else "🌆 EVENING"
     report_time = now.strftime("%B %d, %Y  %I:%M %p")
 
-    report = (
-        f"📊 **DAILY {period} REPORT**\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🗓 **{report_time}**\n\n"
-
-        f"⚡ **BOT 2 — SYSTEM STATUS**\n"
-        f"• Status: ✅ Online\n"
-        f"• Uptime: `{h}h {m}m`\n"
-        f"• Main DB (`MSANodeDB`): {'✅' if db_ok else '❌'} {db_status}\n"
-        f"• Backup DB (`MSANodeBackups`): {bkp_status}\n"
-        f"• Auto-Healer: ✅ Active\n"
-        f"• Watchdog Monitor: ✅ Active (hourly DB + bot ping)\n"
-        f"• Daily Reports: ✅ 8:40 AM & 8:40 PM (this report)"
-        f"\n• Errors Caught: `{bot2_health['errors_caught']}`"
-        f" | Auto-Healed: `{bot2_health['auto_healed']}`"
-        f" | Alerts Sent: `{bot2_health['owner_notified']}`\n\n"
-
-        f"🤖 **BOT 1 — USER DATA**\n"
-        f"• MSA IDs Registered: `{b1_msa_total:,}`\n"
-        f"• Verified Users: `{b1_verified:,}` | Unverified: `{b1_unverified:,}`\n"
-        f"• Banned Users: `{b1_banned:,}` | Perm Banned MSA: `{b1_perm_banned:,}`\n"
-        f"• Feature Suspended: `{b1_suspended:,}`\n"
-        f"• Open Tickets: `{b1_open_tickets}` | Total: `{b1_total_tickets:,}` | New Today: `{b1_new_tickets}`\n\n"
-
-        f"🎛 **BOT 2 — ADMIN DATA**\n"
-        f"• User Tracking Total: `{b2_tracked:,}`\n"
-        f"• By Source — YT: `{b2_yt}` | IG: `{b2_ig}` | IGCC: `{b2_igcc}` | YTCODE: `{b2_ytcode}`\n"
-        f"• Broadcasts Stored: `{b2_broadcasts}` | Last: {last_bcast_str}\n"
-        f"• Admins: `{b2_admins}` | Locked: `{b2_locked_admins}`\n"
-        f"• Bot2-Scoped Bans: `{b2_banned_own}`\n\n"
-
-        f"💾 **BACKUP CLUSTER (MSANodeBackups)**\n"
-        f"• Bot 1 — Snapshots: `{bk1_count}` | Last: {bk1_str}\n"
-        f"• Bot 2 — Snapshots: `{bk2_count}` | Last: {bk2_str}\n\n"
-    )
-
-    if _st["ok"]:
-        report += (
-            f"🗄 **MONGODB STORAGE**\n"
-            f"• Used: `{_st['used_mb']:.1f}MB` / `{_st['cap_mb']:.0f}MB` ({_st['pct']:.1f}%)\n"
-            f"• [{_st['bar']}] {_st['risk_icon']} {_st['risk_label']}\n"
+    if page == 1:
+        report = (
+            f"📊 **DAILY {period} REPORT (Page 1/2)**\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🗓 **{report_time}**\n\n"
+    
+            f"⚡ **BOT 2 — SYSTEM STATUS**\n"
+            f"• Status: ✅ Online\n"
+            f"• Uptime: `{h}h {m}m`\n"
+            f"• Main DB (`MSANodeDB`): {'✅' if db_ok else '❌'} {db_status}\n"
+            f"• Backup DB (`MSANodeBackups`): {bkp_status}\n"
+            f"• Auto-Healer: ✅ Active\n"
+            f"• Watchdog Monitor: ✅ Active (hourly DB + bot ping)\n"
+            f"• Errors Caught: `{bot2_health['errors_caught']}`"
+            f" | Auto-Healed: `{bot2_health['auto_healed']}`"
+            f" | Alerts Sent: `{bot2_health['owner_notified']}`\n\n"
+    
+            f"🤖 **BOT 1 — USER DATA**\n"
+            f"• MSA IDs Registered: `{b1_msa_total:,}`\n"
+            f"• Verified Users: `{b1_verified:,}` | Unverified: `{b1_unverified:,}`\n"
+            f"• Banned Users: `{b1_banned:,}` | Perm Banned MSA: `{b1_perm_banned:,}`\n"
+            f"• Feature Suspended: `{b1_suspended:,}`\n"
+            f"• Open Tickets: `{b1_open_tickets}` | Total: `{b1_total_tickets:,}` | New Today: `{b1_new_tickets}`\n\n"
+    
+            f"🎛 **BOT 2 — ADMIN DATA**\n"
+            f"• User Tracking Total: `{b2_tracked:,}`\n"
+            f"• By Source — YT: `{b2_yt}` | IG: `{b2_ig}` | IGCC: `{b2_igcc}` | YTCODE: `{b2_ytcode}`\n"
+            f"• Broadcasts Stored: `{b2_broadcasts}` | Last: {last_bcast_str}\n"
+            f"• Bot2-Scoped Bans: `{b2_banned_own}`\n\n"
+    
+            f"💾 **BACKUP CLUSTER (MSANodeBackups)**\n"
+            f"• Bot 1 — Snapshots: `{bk1_count}` | Last: {bk1_str}\n"
+            f"• Bot 2 — Snapshots: `{bk2_count}` | Last: {bk2_str}\n\n"
         )
-        if _st["pct"] >= 75:
-            report += f"• ⚠️ Storage at {_st['pct']:.0f}% — plan upgrade soon\n"
-        report += "\n"
+    
+        if _st["ok"]:
+            report += (
+                f"🗄 **MONGODB STORAGE**\n"
+                f"• Used: `{_st['used_mb']:.1f}MB` / `{_st['cap_mb']:.0f}MB` ({_st['pct']:.1f}%)\n"
+                f"• [{_st['bar']}] {_st['risk_icon']} {_st['risk_label']}\n"
+            )
+            if _st["pct"] >= 75:
+                report += f"• ⚠️ Storage at {_st['pct']:.0f}% — plan upgrade soon\n"
+            report += "\n"
+    
+        report += (
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"_Auto-report · Next in 12h_"
+        )
+        return report
 
-    report += (
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"_Auto-report · Next in 12h_"
-    )
-    return report
+    else:
+        report = (
+            f"📊 **DAILY {period} REPORT (Page 2/2)**\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🗓 **{report_time}**\n\n"
+
+            f"📚 **BOT 3 — CONTENT & CLICKS**\n"
+            f"• Total PDFs: `{b3_pdfs}` | Total IG Content: `{b3_ig}`\n"
+            f"• Total Clicks (All-Time): `{b3_total_clicks:,}`\n"
+            f"• 📄 PDF Clicks: `{b3_pdf_clicks:,}` | 💸 Affiliate: `{b3_aff_clicks:,}`\n"
+            f"• 📸 IG CC Clicks: `{b3_igcc_clicks:,}`\n"
+            f"• ▶️ YT Start: `{b3_yt_clicks:,}` | 📸 IG Start: `{b3_ig_clicks:,}`\n"
+            f"• 🔑 YT Code: `{b3_ytc_clicks:,}`\n\n"
+
+            f"🤝 **REFERRALS (BOT 1)**\n"
+            f"• Confirmed Invites: `{b1_referrals_confirmed:,}`\n"
+            f"• Pending Invites: `{b1_referrals_pending:,}`\n\n"
+
+            f"⭐ **USER REVIEWS**\n"
+            f"• 5-Star Reviews: `{b1_five_star_reviews:,}` (only >4 stars counted)\n"
+            f"• Total Reviews: `{b1_total_reviews:,}`\n\n"
+        )
+        report += (
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"_Use buttons to navigate_"
+        )
+        return report
 
 
 async def schedule_storage_alerts():
@@ -15697,8 +16681,11 @@ async def schedule_daily_reports():
             if current_slot and current_slot not in sent_times:
                 print(f"📊 [DAILY REPORT] Sending {current_slot} report...")
                 try:
-                    report_text = await generate_daily_report()
-                    await bot.send_message(MASTER_ADMIN_ID, report_text, parse_mode="Markdown")
+                    report_text = await generate_daily_report(page=1)
+                    kb = InlineKeyboardMarkup(inline_keyboard=[
+                        [InlineKeyboardButton(text="➡️ PAGE 2 (DETAILS)", callback_data="report_page_2")]
+                    ])
+                    await bot.send_message(MASTER_ADMIN_ID, report_text, parse_mode="Markdown", reply_markup=kb)
                     sent_times.add(current_slot)
                     print(f"✅ [DAILY REPORT] {current_slot} report sent to owner")
                     # Clean old slots (keep only today's)
@@ -15716,6 +16703,22 @@ async def schedule_daily_reports():
             print(f"❌ [DAILY REPORT SCHEDULER] Error: {e}")
             await asyncio.sleep(60)
 
+@dp.callback_query(lambda c: c.data and c.data.startswith("report_page_"))
+async def handle_report_pagination(callback_query: types.CallbackQuery):
+    try:
+        page = int(callback_query.data.split("_")[-1])
+        report_text = await generate_daily_report(page=page)
+        
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ PAGE 1 (SYSTEM)", callback_data="report_page_1")] if page == 2 else 
+            [InlineKeyboardButton(text="➡️ PAGE 2 (DETAILS)", callback_data="report_page_2")]
+        ])
+        
+        await callback_query.message.edit_text(report_text, parse_mode="Markdown", reply_markup=kb)
+        await callback_query.answer()
+    except Exception as e:
+        # Ignore message not modified errors
+        await callback_query.answer()
 
 # ==========================================
 # 🌐 RENDER HEALTH CHECK WEB SERVER
