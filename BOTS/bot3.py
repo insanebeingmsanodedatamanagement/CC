@@ -34,7 +34,6 @@ import html as _html
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
 
-
 # ==========================================
 # ENTERPRISE CONFIGURATION
 # ==========================================
@@ -12438,8 +12437,8 @@ _PDF_EXCLUDED_BUTTONS = {
     "🔍 SEARCH", "🔗 LINKS", "📊 ANALYTICS", "🩺 DIAGNOSIS",
     "🖥️ TERMINAL", "💾 BACKUP DATA", "👥 ADMINS", "⚠️ RESET BOT DATA",
     # ── Economy menu ──────────────────────────────────────────────────────────
-    "✏️ EDIT REFERRAL PTS", "✏️ EDIT BONUS PTS", "✏️ EDIT IGCC PTS",
-    "✏️ EDIT LB GOLD", "✏️ EDIT LB SILVER", "✏️ EDIT LB BRONZE",
+    "✏️ EDIT REFERRAL PTS (REFERRER)", "✏️ EDIT BONUS PTS (NEW USER)", "✏️ EDIT IGCC PTS (BOUNTY)",
+    "🏆 EDIT LB GOLD", "🏆 EDIT LB SILVER", "🏆 EDIT LB BRONZE",
     # ── Store / Reward menus ───────────────────────────────────────────────────
     "🛒 STORE MANAGER", "➕ ADD STORE ITEM", "✏️ EDIT STORE ITEM",
     "🗑️ DELETE STORE ITEM", "📋 LIST STORE ITEMS",
@@ -12608,7 +12607,7 @@ async def economy_menu(message: types.Message, state: FSMContext):
 
 
 # ── Edit Referral (Referrer) pts ─────────────────────────────────────────────
-@dp.message(F.text == "✏️ EDIT REFERRAL PTS")
+@dp.message(F.text == "✏️ EDIT REFERRAL PTS (REFERRER)")
 async def econ_edit_ref(message: types.Message, state: FSMContext):
     if message.from_user.id != MASTER_ADMIN_ID: return
     cancel_kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="⬅️ BACK")]], resize_keyboard=True)
@@ -12640,7 +12639,7 @@ async def econ_save_ref(message: types.Message, state: FSMContext):
 
 
 # ── Edit Referred Bonus (New User) pts ───────────────────────────────────────
-@dp.message(F.text == "✏️ EDIT BONUS PTS")
+@dp.message(F.text == "✏️ EDIT BONUS PTS (NEW USER)")
 async def econ_edit_bonus(message: types.Message, state: FSMContext):
     if message.from_user.id != MASTER_ADMIN_ID: return
     cancel_kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="⬅️ BACK")]], resize_keyboard=True)
@@ -12672,7 +12671,7 @@ async def econ_save_bonus(message: types.Message, state: FSMContext):
 
 
 # ── Edit IGCC pts ─────────────────────────────────────────────────────────────
-@dp.message(F.text == "✏️ EDIT IGCC PTS")
+@dp.message(F.text == "✏️ EDIT IGCC PTS (BOUNTY)")
 async def econ_edit_igcc(message: types.Message, state: FSMContext):
     if message.from_user.id != MASTER_ADMIN_ID: return
     cancel_kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="⬅️ BACK")]], resize_keyboard=True)
@@ -12705,7 +12704,7 @@ async def econ_save_igcc(message: types.Message, state: FSMContext):
 
 
 # ── Edit Leaderboard Rewards ─────────────────────────────────────────────────────────────
-@dp.message(F.text == "✏️ EDIT LB GOLD")
+@dp.message(F.text == "🏆 EDIT LB GOLD")
 async def econ_edit_lb_gold(message: types.Message, state: FSMContext):
     if message.from_user.id != MASTER_ADMIN_ID: return
     cancel_kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="⬅️ BACK")]], resize_keyboard=True)
@@ -12727,7 +12726,7 @@ async def econ_save_lb_gold(message: types.Message, state: FSMContext):
     await state.clear()
     await message.answer(f"✅ Gold Rank reward updated to *{pts} pts*\n\n" + _econ_text(get_economy_settings_doc()), reply_markup=get_economy_menu_kb(), parse_mode="Markdown")
 
-@dp.message(F.text == "✏️ EDIT LB SILVER")
+@dp.message(F.text == "🏆 EDIT LB SILVER")
 async def econ_edit_lb_silver(message: types.Message, state: FSMContext):
     if message.from_user.id != MASTER_ADMIN_ID: return
     cancel_kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="⬅️ BACK")]], resize_keyboard=True)
@@ -12749,7 +12748,7 @@ async def econ_save_lb_silver(message: types.Message, state: FSMContext):
     await state.clear()
     await message.answer(f"✅ Silver Rank reward updated to *{pts} pts*\n\n" + _econ_text(get_economy_settings_doc()), reply_markup=get_economy_menu_kb(), parse_mode="Markdown")
 
-@dp.message(F.text == "✏️ EDIT LB BRONZE")
+@dp.message(F.text == "🏆 EDIT LB BRONZE")
 async def econ_edit_lb_bronze(message: types.Message, state: FSMContext):
     if message.from_user.id != MASTER_ADMIN_ID: return
     cancel_kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="⬅️ BACK")]], resize_keyboard=True)
