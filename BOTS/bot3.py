@@ -33,6 +33,8 @@ from aiohttp import web
 import html as _html
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
+
+
 # ==========================================
 # ENTERPRISE CONFIGURATION
 # ==========================================
@@ -40,7 +42,7 @@ from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_applicati
 # Bot Configuration
 # Prefer bot-specific tokens first; generic BOT_TOKEN is last fallback.
 BOT_TOKEN = os.environ.get("BOT_3_TOKEN") or os.environ.get("BOT_TOKEN")
-BOT_USERNAME = os.environ.get("BOT_USERNAME", "msanodebot")  # Bot's @username for generating t.me links
+BOT_USERNAME = os.environ.get("BOT_USERNAME", "").strip().lstrip("@")  # Auto-detected at startup if empty
 MONGO_URI = os.environ.get("MONGO_URI")
 MASTER_ADMIN_ID = int(os.environ.get("MASTER_ADMIN_ID", 0))
 OWNER_ID = int(os.environ.get("OWNER_ID", 0))
@@ -82,6 +84,7 @@ _BOT_COLLECTIONS = {
     "bot3": [
         "bot3_pdfs",
         "bot3_ig_content",
+        "bot3_rewards",
         "bot3_admins",
         "bot3_settings",
         "bot3_banned_users",
@@ -513,8 +516,52 @@ async def weekly_backup_scheduler(
 
                     _, last_day = monthrange(run_now.year, run_now.month)
                     if run_now.day == last_day:
-                        # No-op month-end auto-zip for bot3 (cluster data already stored)
-                        logging.info(f"[BACKUP] Month-end reached for {bot_name} — cluster snapshot is current.")
+                        # ── MONTH-END: upload this snapshot to Google Drive ──────────
+                        try:
+                            bkp_col_name = f"bot{bot_name[-1]}_backups"
+                            latest_rec = bkp_db[bkp_col_name].find_one(
+                                {"bot": bot_name},
+                                sort=[("backup_date", -1)]
+                            )
+                            if latest_rec:
+                                gdrive_result = await asyncio.to_thread(
+                                    gdrive_upload_cluster_backup,
+                                    str(latest_rec["_id"]),
+                                    bot_name,
+                                    _write_uri,
+                                    _write_db,
+                                    None  # uses _BOT3_GDRIVE_FOLDER_ID from env
+                                )
+                                if gdrive_result.get("status") == "success":
+                                    logging.info(f"[BACKUP] Month-end GDrive upload OK: {gdrive_result['zip_name']}")
+                                    try:
+                                        await bot_instance.send_message(
+                                            chat_id=owner_id,
+                                            text=(
+                                                f"☁️ <b>Month-End GDrive Backup</b> — <code>{bot_name}</code>\n"
+                                                f"📁 <b>File:</b> {gdrive_result['zip_name']}\n"
+                                                f"💾 <b>Size:</b> {gdrive_result['size_mb']:.2f} MB\n"
+                                                f"✅ Uploaded to Google Drive folder"
+                                            ),
+                                            parse_mode="HTML"
+                                        )
+                                    except Exception:
+                                        pass
+                                else:
+                                    logging.error(f"[BACKUP] Month-end GDrive FAILED: {gdrive_result.get('message')}")
+                                    try:
+                                        await bot_instance.send_message(
+                                            chat_id=owner_id,
+                                            text=(
+                                                f"⚠️ <b>Month-End GDrive FAILED</b> — <code>{bot_name}</code>\n"
+                                                f"<code>{str(gdrive_result.get('message', 'Unknown error'))[:200]}</code>"
+                                            ),
+                                            parse_mode="HTML"
+                                        )
+                                    except Exception:
+                                        pass
+                        except Exception as gdrive_err:
+                            logging.error(f"[BACKUP] Month-end GDrive upload exception for {bot_name}: {gdrive_err}")
 
                     is_sunday = run_now.weekday() == 6
                     bkp_client.close()
@@ -626,6 +673,34 @@ except Exception:
 def now_local() -> datetime:
     """Return current time as a naive datetime in the configured local timezone."""
     return datetime.now(_BOT3_TZ).replace(tzinfo=None)
+
+# Bot 3 live terminal logger — writes to shared bot2_live_terminal_logs collection
+_BOT3_LOG_MAX = 100  # Keep last 100 bot3 entries
+
+def log_to_terminal(action_type: str, user_id: int = 0, details: str = "", user_name: str = "", channel: str = ""):
+    """Write a bot3 log entry to the shared live terminal collection (viewable in Bot 2 Terminal)."""
+    try:
+        _now = now_local()
+        timestamp = _now.strftime('%b %d  %I:%M:%S %p')
+        entry = {
+            "timestamp": timestamp,
+            "created_at": _now,
+            "bot": "bot3",
+            "action": action_type,
+            "user_id": user_id,
+            "user_name": user_name,
+            "channel": channel,
+            "details": details,
+        }
+        col_live_logs.insert_one(entry)
+        # Trim: keep newest _BOT3_LOG_MAX entries for bot3
+        count = col_live_logs.count_documents({"bot": "bot3"})
+        if count > _BOT3_LOG_MAX:
+            oldest = list(col_live_logs.find({"bot": "bot3"}, {"_id": 1}).sort("created_at", 1).limit(count - _BOT3_LOG_MAX))
+            if oldest:
+                col_live_logs.delete_many({"_id": {"$in": [d["_id"] for d in oldest]}})
+    except Exception:
+        pass  # Never let logging crash the bot
 # --------------------------------
 
 # State Persistence Configuration
@@ -684,6 +759,26 @@ logging.basicConfig(
     handlers=[main_handler, error_handler, console_handler]
 )
 logger = logging.getLogger(__name__)
+
+def _escape_md(text) -> str:
+    """Escape Telegram MarkdownV1 special chars in user-supplied names."""
+    if not text:
+        return ""
+    text = str(text)
+    for ch in ('_', '*', '[', ']', '`'):
+        text = text.replace(ch, f'\\{ch}')
+    return text
+
+def _html_escape(text) -> str:
+    """Escape HTML special chars for safe use in parse_mode=HTML messages."""
+    if not text:
+        return ""
+    text = str(text)
+    text = text.replace("&", "&amp;")
+    text = text.replace("<", "&lt;")
+    text = text.replace(">", "&gt;")
+    return text
+
 
 # Suppress noisy background warnings from aiogram/pymongo auto-reconnections
 for _noisy in ("aiogram", "aiogram.event", "aiogram.dispatcher", "aiohttp", "asyncio"):
@@ -831,6 +926,7 @@ class HealthMonitor:
             col_logs = db["bot3_logs"]
             col_pdfs = db["bot3_pdfs"]
             col_ig_content = db["bot3_ig_content"]
+            col_rewards = db["bot3_rewards"]
             col_settings = db["bot3_settings"]
             col_admins = db["bot3_admins"]
             col_banned_users = db["bot3_banned_users"]
@@ -1219,7 +1315,7 @@ async def notify_admin_unauthorized_access(user, action: str, attempt_count: int
             f"🚨 <b>UNAUTHORIZED ACCESS ATTEMPT</b>\n\n"
             f"👤 <b>User ID</b>: `{user.id}`\n"
             f"📝 <b>Username</b>: @{username}\n"
-            f"👨 <b>Name</b>: {full_name}\n"
+            f"👨 <b>Name</b>: {_html_escape(full_name)}\n"
             f"🕐 <b>Time</b>: {timestamp}\n"
             f"🎯 <b>Action</b>: {action}\n"
             f"🔢 <b>Attempt</b>: #{attempt_count}\n\n"
@@ -1337,6 +1433,16 @@ async def check_authorization(message: types.Message, action_name: str = "access
                 logger.warning(f"Admin {user_id} denied access to {action_name} (Missing: {required_perm})")
                 return False
         
+        # Log successful authorized access to shared live terminal
+        try:
+            log_to_terminal(
+                action_type=f"✅ {action_name}",
+                user_id=user_id,
+                user_name=message.from_user.full_name or "",
+                details=f"@{message.from_user.username}" if message.from_user.username else f"ID:{user_id}"
+            )
+        except Exception:
+            pass
         return True
 
     # 3. Process Non-Admin (If we are here, admin_doc is None)
@@ -1395,11 +1501,15 @@ try:
     col_logs = db["bot3_logs"]
     col_pdfs = db["bot3_pdfs"]
     col_ig_content = db["bot3_ig_content"]
+    col_rewards = db["bot3_rewards"]          # Referral reward content pool (RW1, RW2...)
     col_settings = db["bot3_settings"]
     col_admins = db["bot3_admins"]
     col_banned_users = db["bot3_banned_users"]
     col_user_activity = db["bot3_user_activity"]
     col_backups = db["bot3_backups"]  # Backup history collection
+    col_live_logs = db["bot2_live_terminal_logs"]  # Shared live terminal with Bot 2
+    col_store_items = db["bot3_store_items"]  # Vault Shop items
+    col_milestones  = db["bot3_milestones"]   # Referral milestone tiers
     
     # Test connection
     client.admin.command('ping')
@@ -1522,6 +1632,10 @@ try:
 
         # Settings collection — key field is the natural primary key
         create_index_safe(col_settings, "key", unique=True, name="settings_key_unique")
+
+        # Rewards collection indexes (RW codes for referral reward pool)
+        create_index_safe(col_rewards, "rw_number", unique=True, name="reward_rw_number_unique")
+        create_index_safe(col_rewards, "created_at", name="reward_created_at")
 
         # PDF lookup by yt_start_code (used by bot1 on every user click)
         create_index_safe(col_pdfs, "yt_start_code", sparse=True, name="pdf_yt_start_code")
@@ -1737,10 +1851,11 @@ class ListStates(StatesGroup):
     viewing_ig = State()   # For viewing IG content
 
 class SearchStates(StatesGroup):
-    viewing_pdf_list = State()       # Viewing paginated PDF list
-    waiting_for_pdf_input = State()  # Waiting for PDF index/name
-    viewing_ig_list = State()        # Viewing paginated IG list
-    waiting_for_ig_input = State()   # Waiting for IG index/CC code
+    viewing_pdf_list = State()           # Viewing paginated PDF list
+    waiting_for_pdf_input = State()      # Waiting for PDF index/name
+    viewing_ig_list = State()            # Viewing paginated IG list
+    waiting_for_ig_input = State()       # Waiting for IG index/CC code
+    waiting_for_reward_input = State()   # Waiting for RW index/code in search
 
 class PDFActionStates(StatesGroup):
     waiting_for_action = State()
@@ -1754,6 +1869,40 @@ class ResetStates(StatesGroup):
 class BackupResetStates(StatesGroup):
     waiting_for_confirm_button = State()
     waiting_for_confirm_text = State()
+
+class RewardStates(StatesGroup):
+    waiting_for_content = State()           # ADD: waiting for reward text/link
+    edit_waiting_for_selection = State()    # EDIT: select reward by RW number
+    edit_waiting_for_new_content = State()  # EDIT: enter new content
+    delete_waiting_for_selection = State()  # DELETE: select reward to remove
+    delete_waiting_for_confirm = State()    # DELETE: confirm removal
+    viewing_list = State()                  # LIST: paginated browsing state
+
+class MilestoneStates(StatesGroup):
+    waiting_for_refs       = State()   # ADD: referral count
+    waiting_for_name       = State()   # ADD: milestone name
+    waiting_for_badge      = State()   # ADD: badge emoji
+    waiting_for_credits    = State()   # ADD: bonus credits
+    waiting_for_reward_txt = State()   # ADD: reward text
+    edit_select            = State()   # EDIT: select milestone
+    edit_field             = State()   # EDIT: choose field
+    edit_value             = State()   # EDIT: enter new value
+    delete_select          = State()   # DELETE: select
+    delete_confirm         = State()   # DELETE: confirm
+
+class StoreStates(StatesGroup):
+    waiting_for_name       = State()   # ADD: item name
+    waiting_for_desc       = State()   # ADD: description
+    waiting_for_cost       = State()   # ADD: credit cost
+    waiting_for_btn_name   = State()   # ADD: reply keyboard button label
+    waiting_for_reward_txt = State()   # ADD: reward text
+    edit_select            = State()   # EDIT: select item
+    edit_field             = State()   # EDIT: choose field
+    edit_value             = State()   # EDIT: new value
+    delete_select          = State()   # DELETE: select
+    delete_confirm         = State()   # DELETE: confirm
+    list_select            = State()   # LIST: select item to view content
+    viewing_detail         = State()   # LIST: full-detail view of a single reward
 
 class AnalyticsStates(StatesGroup):
     viewing_analytics = State()
@@ -3079,6 +3228,19 @@ def get_next_cc_code():
     next_number = highest + 1
     return f"CC{next_number}", next_number
 
+def get_next_rw_code():
+    """
+    Generate next RW code filling the lowest available gap.
+    Examples: RW1,RW3 exist → returns RW2. RW1,RW2,RW3 exist → returns RW4.
+    """
+    existing = sorted([r["rw_number"] for r in col_rewards.find({}, {"rw_number": 1})])
+    # Walk from 1 upward, find first gap
+    for i, n in enumerate(existing, 1):
+        if n != i:
+            return f"RW{i}", i
+    next_num = len(existing) + 1
+    return f"RW{next_num}", next_num
+
 def is_ig_name_duplicate(name, exclude_id=None):
     """
     Check if IG content name already exists
@@ -3127,16 +3289,35 @@ async def send_chunked_message(
     disable_web_page_preview: bool = False,
     chunk_size: int = 3800,
 ):
-    """Send long text safely; only the final chunk keeps the reply keyboard."""
+    """Send long text safely; only the final chunk keeps the reply keyboard.
+    If HTML parse fails (unclosed tags from user content), auto-retries as plain text."""
+    from aiogram.exceptions import TelegramBadRequest
+    import re as _re
     parts = split_text_chunks(text, chunk_size=chunk_size)
     for i, part in enumerate(parts):
         kb = reply_markup if i == len(parts) - 1 else None
-        await message.answer(
-            part,
-            reply_markup=kb,
-            parse_mode=parse_mode,
-            disable_web_page_preview=disable_web_page_preview,
-        )
+        try:
+            await message.answer(
+                part,
+                reply_markup=kb,
+                parse_mode=parse_mode,
+                disable_web_page_preview=disable_web_page_preview,
+            )
+        except TelegramBadRequest as _html_err:
+            if "can't parse entities" in str(_html_err).lower() or "bad request" in str(_html_err).lower():
+                # Strip all HTML tags and retry as plain text
+                plain = _re.sub(r'<[^>]+>', '', part)
+                try:
+                    await message.answer(
+                        plain,
+                        reply_markup=kb,
+                        parse_mode=None,
+                        disable_web_page_preview=disable_web_page_preview,
+                    )
+                except Exception:
+                    pass  # Silent fail on last resort
+            else:
+                raise
 
 async def send_ig_list_view(message: types.Message, page=0, mode="list"):
     """
@@ -3431,7 +3612,7 @@ def get_main_menu(user_id: int):
             [KeyboardButton(text="📊 ANALYTICS"), KeyboardButton(text="🩺 DIAGNOSIS")],
             [KeyboardButton(text="🖥️ TERMINAL"), KeyboardButton(text="💾 BACKUP DATA")],
             [KeyboardButton(text="👥 ADMINS"), KeyboardButton(text="⚠️ RESET BOT DATA")],
-            [KeyboardButton(text="📚 BOT GUIDE")]
+            [KeyboardButton(text="⚙️ ECONOMY SETTINGS"), KeyboardButton(text="📚 BOT GUIDE")]
         ]
         return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
 
@@ -3492,7 +3673,8 @@ def get_add_menu():
     keyboard = [
         [KeyboardButton(text="📄 PDF"), KeyboardButton(text="💸 AFFILIATE")],
         [KeyboardButton(text="🔑 CODE"), KeyboardButton(text="▶️ YT")],
-        [KeyboardButton(text="📸 IGCC"), KeyboardButton(text="🎬 TUTORIAL")],
+        [KeyboardButton(text="📸 IGCC"), KeyboardButton(text="🎁 REWARD")],
+        [KeyboardButton(text="🎬 TUTORIAL")],
         [KeyboardButton(text="⬅️ BACK TO MAIN MENU")]
     ]
     return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
@@ -3535,9 +3717,9 @@ def get_yt_menu():
 def get_links_menu():
     """Links Submenu Structure"""
     keyboard = [
-        [KeyboardButton(text="📑 ALL PDF"), KeyboardButton(text="📸 IG CC")],
-        [KeyboardButton(text="🏠 HOME YT")],
-        [KeyboardButton(text="⬅️ BACK TO MAIN MENU")]
+        [KeyboardButton(text="\U0001f4d1 ALL PDF"), KeyboardButton(text="\U0001f4f8 IG CC")],
+        [KeyboardButton(text="\U0001f3e0 HOME YT")],
+        [KeyboardButton(text="\u2b05\ufe0f BACK TO MAIN MENU")]
     ]
     return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
 
@@ -3580,7 +3762,7 @@ def get_analytics_menu():
         [KeyboardButton(text="📄 PDF Clicks"), KeyboardButton(text="💸 Affiliate Clicks")],
         [KeyboardButton(text="📸 IG Start Clicks"), KeyboardButton(text="▶️ YT Start Clicks")],
         [KeyboardButton(text="📸 IG CC Start Clicks"), KeyboardButton(text="🔑 YT Code Start Clicks")],
-        [KeyboardButton(text="🆔 MSA ID POOL")],
+        [KeyboardButton(text="🤝 Referral Overview"), KeyboardButton(text="🆔 MSA ID POOL")],
         [KeyboardButton(text="⬅️ BACK TO MAIN MENU")]
     ]
     return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
@@ -3690,6 +3872,34 @@ def get_ig_menu():
         [KeyboardButton(text="📋 LIST IG"), KeyboardButton(text="⬅️ BACK TO ADD MENU")]
     ]
     return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
+
+def get_reward_menu():
+    """Reward Content Submenu — Store Manager only (Milestones and RW deprecated)"""
+    keyboard = [
+        [KeyboardButton(text="🛒 STORE MANAGER")],
+        [KeyboardButton(text="⬅️ BACK TO ADD MENU")]
+    ]
+    return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
+
+def get_milestone_menu():
+    """Milestone submenu keyboard."""
+    keyboard = [
+        [KeyboardButton(text="➕ ADD MILESTONE"), KeyboardButton(text="✏️ EDIT MILESTONE")],
+        [KeyboardButton(text="🗑️ DELETE MILESTONE"), KeyboardButton(text="📋 LIST MILESTONES")],
+        [KeyboardButton(text="⬅️ BACK TO REWARD MENU")]
+    ]
+    return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
+
+def get_store_menu():
+    """Store Manager submenu keyboard."""
+    keyboard = [
+        [KeyboardButton(text="➕ ADD STORE ITEM"), KeyboardButton(text="✏️ EDIT STORE ITEM")],
+        [KeyboardButton(text="🗑️ DELETE STORE ITEM"), KeyboardButton(text="📋 LIST STORE ITEMS")],
+        [KeyboardButton(text="⬅️ BACK TO REWARD MENU")]
+    ]
+    return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
+
+RW_PAGE_SIZE = 8  # Rewards per page in list view
 
 def get_ig_affiliate_menu():
     """IG Affiliate Submenu Structure"""
@@ -4012,7 +4222,7 @@ async def show_admin_list_page(message: types.Message, admins: list, page: int):
         status_icon = "🔒" if is_locked else "🔓"
         
         # Add to text list
-        admin_list_text += f"{i+1}. <b>{name}</b> (`{user_id}`) [{status_icon}]\n"
+        admin_list_text += f"{i+1}. <b>{_html_escape(name)}</b> (`{user_id}`) [{status_icon}]\n"
         
         # Add button
         btn_text = f"❌ Remove: {name} ({user_id})"
@@ -5004,7 +5214,7 @@ async def process_aff_delete_select(message: types.Message, state: FSMContext):
         msg += "\n\n❓ Remove affiliate links from all selected PDFs?"
     else:
         pdf = found_pdfs[0]
-        msg = f"⚠️ Remove Affiliate Link from <b>{pdf['name']}</b>?"
+        msg = f"⚠️ Remove Affiliate Link from <b>{_html.escape(str(pdf['name']))}</b>?"
     
     await message.answer(msg, reply_markup=kb, parse_mode="HTML")
 
@@ -5238,7 +5448,7 @@ async def process_msa_delete_select(message: types.Message, state: FSMContext):
     msg += "You are about to remove MSA Codes from:\n"
     
     for p in found_pdfs:
-        msg += f"• `{p['index']}`. <b>{p['name']}</b> (Code: `{p.get('msa_code', 'N/A')}`)\n"
+        msg += f"• `{p['index']}`. <b>{_html.escape(str(p['name']))}</b> (Code: `{p.get('msa_code', 'N/A')}`)\n"
         
     if not_found or no_code:
         msg += "\n⚠️ <b>SKIPPED ITEMS (Ignored):</b>\n"
@@ -5617,7 +5827,7 @@ async def process_yt_delete_select(message: types.Message, state: FSMContext):
     
     for p in found_pdfs:
         # Show both sequential position? No, show actual Name and Title
-        msg += f"• <b>{p['name']}</b> (YT: {p.get('yt_title', 'N/A')})\n"
+        msg += f"• <b>{_html.escape(str(p['name']))}</b> (YT: {p.get('yt_title', 'N/A')})\n"
         
     if not_found:
         msg += "\n⚠️ <b>SKIPPED ITEMS (Ignored):</b>\n"
@@ -5999,7 +6209,8 @@ async def process_ig_content_name(message: types.Message, state: FSMContext):
         "created_at": now_local(),
         # Initialize click tracking field
         "ig_cc_clicks": 0,
-        "last_ig_cc_click": None
+        "last_ig_cc_click": None,
+        "credit_points": 25  # MSA Credits awarded to vault members on first claim
     }
     col_ig_content.insert_one(doc)
     
@@ -6348,15 +6559,246 @@ async def back_to_ig_menu(message: types.Message, state: FSMContext):
     await message.answer("📸 <b>IG MANAGEMENT</b>", reply_markup=get_ig_menu(), parse_mode="HTML")
 
 
+# =============================================================================
+# 🎁 REWARD CONTENT MANAGEMENT (RW1, RW2... — Referral Reward Pool)
+# Admin pastes content text → auto-assigned RW code → stored in bot3_rewards
+# Bot1 picks a random reward and delivers it to the referrer on vault join.
+# =============================================================================
+
+@dp.message(F.text == "🎁 REWARD")
+async def reward_menu_handler(message: types.Message):
+    """Entry point to reward content management"""
+    if not await check_authorization(message, "Reward Menu", "can_add"):
+        return
+    total = col_rewards.count_documents({})
+    await message.answer(
+        f"🎁 <b>REWARD CONTENT POOL</b>\n"
+        f"────────────────────\n"
+        f"📦 Total Rewards: <b>{total}</b>\n"
+        f"🔗 Purpose: Referral reward delivery pool\n\n"
+        f"ℹ️ Rewards are auto-assigned RW1, RW2... codes.\n"
+        f"When a referred user joins vault, Bot 1 picks a random reward and delivers it to the referrer.",
+        reply_markup=get_reward_menu(),
+        parse_mode="HTML"
+    )
+
+# --- ADD REWARD ---
+@dp.message(F.text == "➕ ADD REWARD")
+async def start_add_reward(message: types.Message, state: FSMContext):
+    """Start adding a new reward content item"""
+    if not await check_authorization(message, "Add Reward", "can_add"):
+        return
+    await state.set_state(RewardStates.waiting_for_content)
+    await message.answer(
+        "🎁 <b>ADD REWARD CONTENT</b>\n"
+        "────────────────────\n"
+        "📝 <b>Paste the reward content below:</b>\n\n"
+        "• Can be a link, a piece of text, a tip, or any exclusive content\n"
+        "• An RW code (RW1, RW2...) will be auto-assigned\n"
+        "• This content will be randomly delivered to users who refer someone",
+        reply_markup=get_cancel_keyboard(),
+        parse_mode="HTML"
+    )
+
+@dp.message(RewardStates.waiting_for_content)
+async def process_add_reward_content(message: types.Message, state: FSMContext):
+    """Receive and store new reward content with auto-generated RW code"""
+    if message.text == "❌ CANCEL":
+        await state.clear()
+        return await message.answer("❌ Cancelled.", reply_markup=get_reward_menu())
+
+    content = message.text.strip()
+    if not content:
+        await message.answer("⚠️ Content cannot be empty. Please paste your reward content:", reply_markup=get_cancel_keyboard())
+        return
+
+    rw_code, rw_number = get_next_rw_code()
+
+    doc = {
+        "rw_code": rw_code,
+        "rw_number": rw_number,
+        "content": content,
+        "affiliate_link": "",
+        "created_at": now_local(),
+    }
+    col_rewards.insert_one(doc)
+
+    await state.clear()
+    log_user_action(message.from_user, "Add Reward", f"Added {rw_code}")
+    await message.answer(
+        f"✅ <b>Reward Added!</b>\n\n"
+        f"🎁 Code: <b>{rw_code}</b>\n"
+        f"📝 Content Preview: {content[:80]}{'...' if len(content) > 80 else ''}",
+        reply_markup=get_reward_menu(),
+        parse_mode="HTML"
+    )
+
+# --- EDIT REWARD ---
+@dp.message(F.text == "✏️ EDIT REWARD")
+async def start_edit_reward(message: types.Message, state: FSMContext):
+    """Start edit flow — list all rewards and ask which to edit"""
+    if not await check_authorization(message, "Edit Reward", "can_add"):
+        return
+    total = col_rewards.count_documents({})
+    if total == 0:
+        await message.answer("⚠️ No rewards found. Add one first.", reply_markup=get_reward_menu())
+        return
+    all_rewards = list(col_rewards.find({}, {"rw_code": 1, "rw_number": 1, "content": 1}).sort("rw_number", 1))
+    lines = []
+    for r in all_rewards:
+        preview = str(r.get("content", ""))[:50]
+        lines.append(f"• <b>{r['rw_code']}</b> — {preview}{'...' if len(str(r.get('content',''))) > 50 else ''}")
+    listing = "\n".join(lines)
+    await state.set_state(RewardStates.edit_waiting_for_selection)
+    await message.answer(
+        f"✏️ <b>EDIT REWARD</b>\n────────────────────\n{listing}\n\n"
+        f"📌 Enter the RW code to edit (e.g. <code>RW1</code>) or its number (e.g. <code>1</code>):",
+        reply_markup=get_cancel_keyboard(),
+        parse_mode="HTML"
+    )
+
+@dp.message(RewardStates.edit_waiting_for_selection)
+async def process_edit_reward_selection(message: types.Message, state: FSMContext):
+    if message.text == "❌ CANCEL":
+        await state.clear()
+        return await message.answer("❌ Cancelled.", reply_markup=get_reward_menu())
+    query = message.text.strip().upper()
+    reward = None
+    if query.startswith("RW") and query[2:].isdigit():
+        reward = col_rewards.find_one({"rw_code": query})
+    elif message.text.strip().isdigit():
+        reward = col_rewards.find_one({"rw_number": int(message.text.strip())})
+    if not reward:
+        await message.answer("❌ Reward not found. Try again (e.g. <code>RW1</code> or <code>1</code>):", reply_markup=get_cancel_keyboard(), parse_mode="HTML")
+        return
+    await state.update_data(reward_id=str(reward["_id"]), rw_code=reward["rw_code"])
+    await state.set_state(RewardStates.edit_waiting_for_new_content)
+    await message.answer(
+        f"✏️ <b>EDITING {reward['rw_code']}</b>\n\n"
+        f"📌 Current content:\n<i>{reward.get('content', '')[:200]}</i>\n\n"
+        f"📝 Paste the new content to replace it:",
+        reply_markup=get_cancel_keyboard(),
+        parse_mode="HTML"
+    )
+
+@dp.message(RewardStates.edit_waiting_for_new_content)
+async def process_edit_reward_new_content(message: types.Message, state: FSMContext):
+    if message.text == "❌ CANCEL":
+        await state.clear()
+        return await message.answer("❌ Cancelled.", reply_markup=get_reward_menu())
+    new_content = message.text.strip()
+    if not new_content:
+        await message.answer("⚠️ Content cannot be empty. Try again:", reply_markup=get_cancel_keyboard())
+        return
+    data = await state.get_data()
+    from bson.objectid import ObjectId
+    col_rewards.update_one({"_id": ObjectId(data["reward_id"])}, {"$set": {"content": new_content}})
+    await state.clear()
+    log_user_action(message.from_user, "Edit Reward", f"Updated {data['rw_code']}")
+    await message.answer(
+        f"✅ <b>{data['rw_code']} Updated!</b>\n"
+        f"📝 New preview: {new_content[:80]}{'...' if len(new_content) > 80 else ''}",
+        reply_markup=get_reward_menu(), parse_mode="HTML"
+    )
+
+# --- DELETE REWARD ---
+@dp.message(F.text == "🗑️ DELETE REWARD")
+async def start_delete_reward(message: types.Message, state: FSMContext):
+    if not await check_authorization(message, "Delete Reward", "can_add"):
+        return
+    total = col_rewards.count_documents({})
+    if total == 0:
+        await message.answer("⚠️ No rewards to delete.", reply_markup=get_reward_menu())
+        return
+    all_rewards = list(col_rewards.find({}, {"rw_code": 1, "rw_number": 1, "content": 1}).sort("rw_number", 1))
+    lines = [f"• <b>{r['rw_code']}</b> — {str(r.get('content',''))[:40]}..." for r in all_rewards]
+    await state.set_state(RewardStates.delete_waiting_for_selection)
+    await message.answer(
+        f"🗑️ <b>DELETE REWARD</b>\n────────────────────\n" + "\n".join(lines) +
+        "\n\n📌 Enter RW code or number to delete:",
+        reply_markup=get_cancel_keyboard(), parse_mode="HTML"
+    )
+
+@dp.message(RewardStates.delete_waiting_for_selection)
+async def process_delete_reward_selection(message: types.Message, state: FSMContext):
+    if message.text == "❌ CANCEL":
+        await state.clear()
+        return await message.answer("❌ Cancelled.", reply_markup=get_reward_menu())
+    query = message.text.strip().upper()
+    reward = None
+    if query.startswith("RW") and query[2:].isdigit():
+        reward = col_rewards.find_one({"rw_code": query})
+    elif message.text.strip().isdigit():
+        reward = col_rewards.find_one({"rw_number": int(message.text.strip())})
+    if not reward:
+        await message.answer("❌ Not found. Try again:", reply_markup=get_cancel_keyboard())
+        return
+    await state.update_data(reward_id=str(reward["_id"]), rw_code=reward["rw_code"])
+    await state.set_state(RewardStates.delete_waiting_for_confirm)
+    kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="✅ CONFIRM DELETE"), KeyboardButton(text="❌ CANCEL")]], resize_keyboard=True)
+    await message.answer(
+        f"⚠️ <b>Delete {reward['rw_code']}?</b>\n"
+        f"📝 Content: {str(reward.get('content',''))[:100]}...\n\n"
+        f"This cannot be undone.",
+        reply_markup=kb, parse_mode="HTML"
+    )
+
+@dp.message(RewardStates.delete_waiting_for_confirm)
+async def process_delete_reward_confirm(message: types.Message, state: FSMContext):
+    if message.text == "✅ CONFIRM DELETE":
+        data = await state.get_data()
+        from bson.objectid import ObjectId
+        col_rewards.delete_one({"_id": ObjectId(data["reward_id"])})
+        await state.clear()
+        log_user_action(message.from_user, "Delete Reward", f"Deleted {data['rw_code']}")
+        await message.answer(f"🗑️ <b>{data['rw_code']} deleted.</b>", reply_markup=get_reward_menu(), parse_mode="HTML")
+    else:
+        await state.clear()
+        await message.answer("❌ Cancelled.", reply_markup=get_reward_menu())
+
+# --- LIST REWARD ---
+@dp.message(F.text == "📋 LIST REWARD")
+async def list_rewards(message: types.Message, state: FSMContext):
+    """Show all reward content items"""
+    if not await check_authorization(message, "List Reward", "can_list"):
+        return
+    all_rewards = list(col_rewards.find().sort("rw_number", 1))
+    if not all_rewards:
+        await message.answer("⚠️ No rewards added yet. Use ➕ ADD REWARD to add one.", reply_markup=get_reward_menu())
+        return
+    lines = []
+    for r in all_rewards:
+        preview = str(r.get("content", ""))[:80]
+        lines.append(
+            f"🎁 <b>{r['rw_code']}</b>\n"
+            f"   {preview}{'...' if len(str(r.get('content',''))) > 80 else ''}"
+        )
+    text = f"📋 <b>REWARD POOL</b> ({len(all_rewards)} items)\n────────────────────\n\n" + "\n\n".join(lines)
+    MAX = 4000
+    if len(text) <= MAX:
+        await message.answer(text, reply_markup=get_reward_menu(), parse_mode="HTML")
+    else:
+        parts = []
+        while text:
+            cut = text.rfind('\n', 0, MAX)
+            if cut == -1: cut = MAX
+            parts.append(text[:cut])
+            text = text[cut:].lstrip('\n')
+        for i, part in enumerate(parts):
+            kb = get_reward_menu() if i == len(parts) - 1 else None
+            await message.answer(part, reply_markup=kb, parse_mode="HTML")
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # COMPREHENSIVE LIST - Shows ALL Data (PDFs + IG Content)
 # ═══════════════════════════════════════════════════════════════════════════
 
 @dp.message(F.text == "📋 LIST")
 async def comprehensive_list_handler(message: types.Message, state: FSMContext):
-    """Show menu to choose between ALL (PDFs) or IG CC"""
+    """Show menu to choose between ALL, IG CC, or REWARDS"""
     kb = ReplyKeyboardMarkup(keyboard=[
         [KeyboardButton(text="📚 ALL"), KeyboardButton(text="📸 IG CONTENT")],
+        [KeyboardButton(text="🎁 REWARDS")],
         [KeyboardButton(text="⬅️ BACK")]
     ], resize_keyboard=True)
     await message.answer("📋 <b>SELECT VIEW:</b>", reply_markup=kb, parse_mode="HTML")
@@ -6404,7 +6846,7 @@ async def send_all_pdfs_view(message: types.Message, page=0):
     text = f"📚 <b>PDF DATA</b> (Page {page+1})\nTotal: {total}\n━━━━━━━━━━━━━━━━━━━━\n"
     
     for pdf in pdfs:
-        text += f"{pdf['index']}. <b>{pdf['name']}</b>\n"
+        text += f"{pdf['index']}. <b>{_html.escape(str(pdf['name']))}</b>\n"
         text += f"🔗 Link: {pdf['link']}\n"
         text += f"💸 AFF: {pdf.get('affiliate_link', 'Not Set')}\n"
         text += f"▶️ YT Title: {pdf.get('yt_title', 'Not Set')}\n"
@@ -6542,7 +6984,7 @@ async def handle_ig_cc_pagination(message: types.Message, state: FSMContext):
         f"📸 <b>IG CONTENT — FULL DETAIL</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"<b>#{display_index}  {content['cc_code']}</b>\n\n"
-        f"📝 <b>Name / Content:</b>\n{name}\n\n"
+        f"📝 <b>Name / Content:</b>\n{_html_escape(name)}\n\n"
         f"💸 <b>Affiliate Link:</b>\n{aff_link}\n\n"
         f"🔗 <b>Start Code:</b> `{start_code}`\n"
         f"📊 <b>IG CC Clicks:</b> `{ig_cc_clicks:,}`\n"
@@ -6564,18 +7006,686 @@ async def return_to_ig_list_from_detail(message: types.Message, state: FSMContex
     await send_all_ig_view(message, page=0)
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# 🎁 REWARDS — Paginated List View (from 📋 LIST → 🎁 REWARDS)
+# ═══════════════════════════════════════════════════════════════════════════
+
+async def send_all_rewards_view(message: types.Message, page: int = 0):
+    """Display paginated store items (the active vault shop items)."""
+    skip = page * RW_PAGE_SIZE
+    total = col_store_items.count_documents({})
+    items = list(col_store_items.find().sort("cost", 1).skip(skip).limit(RW_PAGE_SIZE))
+
+    if not items:
+        await message.answer(
+            "\u26a0\ufe0f No store items found. Add some via \u2795 ADD \u2192 \U0001f6d2 REWARD \u2192 \U0001f6d2 STORE MANAGER.",
+            reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="\u2b05\ufe0f BACK")]], resize_keyboard=True)
+        )
+        return
+
+    text = f"\U0001f6cd\ufe0f <b>STORE ITEMS</b> (Page {page + 1})\nTotal: <b>{total}</b>\n\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+    for idx, item in enumerate(items, start=1):
+        display_idx = skip + idx
+        status = "\u2705 Active" if item.get("active") else "\u26d4 Inactive"
+        desc_preview = str(item.get("description", ""))[:50]
+        if len(str(item.get("description", ""))) > 50:
+            desc_preview += "..."
+        text += (
+            f"{display_idx}. <b>{item.get('name','?')}</b>\n"
+            f"   \U0001f4b3 Cost: {item.get('cost', 0)} Credits  |  {status}\n"
+            f"   \U0001f7e2 Btn: <code>{item.get('btn_name','')}</code>\n"
+            + (f"   {desc_preview}\n" if desc_preview else "")
+            + "\n"
+        )
+    text += "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\u2328\ufe0f <b>Tap an index number to view full reward text.</b>"
+
+    nav_row = []
+    if page > 0:
+        nav_row.append(KeyboardButton(text=f"\u2b05\ufe0f PREV_RW {page}"))
+    if (skip + RW_PAGE_SIZE) < total:
+        nav_row.append(KeyboardButton(text=f"\u27a1\ufe0f NEXT_RW {page + 2}"))
+    keyboard = []
+    if nav_row:
+        keyboard.append(nav_row)
+    keyboard.append([KeyboardButton(text="\u2b05\ufe0f BACK")])
+    await message.answer(
+        text,
+        reply_markup=ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True),
+        parse_mode="HTML"
+    )
+
+@dp.message(F.text == "🎁 REWARDS")
+async def list_rewards_entry(message: types.Message, state: FSMContext):
+    """Entry from 📋 LIST → 🎁 REWARDS"""
+    if not await check_authorization(message, "List Rewards", "can_list"):
+        return
+    await state.set_state(RewardStates.viewing_list)
+    await send_all_rewards_view(message, page=0)
+
+@dp.message(RewardStates.viewing_list)
+async def handle_rewards_list_state(message: types.Message, state: FSMContext):
+    """Handle pagination and full-detail lookup for reward list."""
+    text = message.text or ""
+
+    # PREV / NEXT pagination
+    if text.startswith("⬅️ PREV_RW") or text.startswith("➡️ NEXT_RW"):
+        try:
+            page = int(text.split()[-1]) - 1
+            await send_all_rewards_view(message, page=page)
+        except Exception:
+            await send_all_rewards_view(message, page=0)
+        return
+
+    # BACK — return to LIST selection menu
+    if text == "⬅️ BACK":
+        await state.clear()
+        await comprehensive_list_handler(message, state)
+        return
+
+    # Full detail view — by index number
+    query = text.strip()
+    if not query:
+        return
+
+    all_items = list(col_store_items.find().sort("cost", 1))
+    item = None
+    display_idx = None
+
+    if query.isdigit():
+        idx = int(query) - 1
+        if 0 <= idx < len(all_items):
+            item = all_items[idx]
+            display_idx = int(query)
+
+    if not item:
+        await message.answer(
+            "\u274c <b>Not Found</b>\n\nSend an index number (e.g. <code>1</code>) to view full reward text.\nOr press \u2b05\ufe0f BACK.",
+            parse_mode="HTML",
+            reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="\u2b05\ufe0f BACK")]], resize_keyboard=True)
+        )
+        return
+
+    reward_text = str(item.get("reward_text", "\u2014 No reward text set \u2014"))
+    created_at = item.get("created_at")
+    created_str = created_at.strftime("%b %d, %Y  %I:%M %p") if hasattr(created_at, 'strftime') else str(created_at) if created_at else "N/A"
+    status = "\u2705 Active" if item.get("active") else "\u26d4 Inactive"
+
+    detail_header = (
+        f"\U0001f6cd\ufe0f <b>STORE ITEM — REWARD TEXT</b>\n"
+        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+        f"<b>#{display_idx}  {item.get('name','?')}</b>\n"
+        f"\U0001f4b3 Cost: {item.get('cost', 0)} Credits  |  {status}\n"
+        f"\U0001f7e2 Btn: <code>{item.get('btn_name','')}</code>\n"
+        + (f"\U0001f4dd Desc: {item.get('description','') or '\u2014'}\n" if item.get('description') else "")
+        + f"\U0001f4c5 Added: {created_str}\n"
+        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+        f"\U0001f381 <b>Reward Text:</b>\n"
+    )
+    kb = ReplyKeyboardMarkup(keyboard=[
+        [KeyboardButton(text="\u2b05\ufe0f BACK TO REWARD LIST")],
+        [KeyboardButton(text="\u2b05\ufe0f BACK")]
+    ], resize_keyboard=True)
+
+    MAX = 4096 - len(detail_header)
+    if len(reward_text) <= MAX:
+        await message.answer(detail_header + reward_text, parse_mode="HTML", reply_markup=kb)
+    else:
+        await message.answer(detail_header, parse_mode="HTML")
+        chunks = [reward_text[i:i + 4096] for i in range(0, len(reward_text), 4096)]
+        for ci, chunk in enumerate(chunks):
+            await message.answer(chunk, reply_markup=kb if ci == len(chunks) - 1 else None)
+
+
+
+@dp.message(RewardStates.viewing_list, F.text == "⬅️ BACK TO REWARD LIST")
+async def back_to_reward_list(message: types.Message, state: FSMContext):
+    await send_all_rewards_view(message, page=0)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 🔗 REWARD LINKS — from LINKS menu → 🎁 REWARD LINKS
+# Shows each reward's index + code (no deep-link, rewards are DM-delivered)
+# ═══════════════════════════════════════════════════════════════════════════
+
+@dp.message(F.text == "\U0001f381 REWARD LINKS")
+async def reward_links_handler(message: types.Message):
+    """REWARD LINKS removed — redirect to Store Manager."""
+    if not await check_authorization(message, "Reward Links", "can_list"):
+        return
+    await message.answer(
+        "\U0001f6d2 Reward Links have moved. Use <b>\u2795 ADD \u2192 \U0001f381 REWARD \u2192 \U0001f6d2 STORE MANAGER</b> to manage store items.",
+        reply_markup=get_links_menu(), parse_mode="HTML"
+    )
+
+
+
+# =============================================================================
+# 🎯 MILESTONES MANAGER + 🛒 STORE MANAGER
+# =============================================================================
+
+# --- BACK TO REWARD MENU ---
+@dp.message(F.text == "⬅️ BACK TO REWARD MENU")
+async def back_to_reward_menu(message: types.Message, state: FSMContext):
+    if not await check_authorization(message, "Back to Reward", "can_add"):
+        return
+    await state.clear()
+    total = col_rewards.count_documents({})
+    ms_total = col_milestones.count_documents({})
+    store_total = col_store_items.count_documents({})
+    await message.answer(
+        f"<b>🎁 REWARD MENU</b>\n"
+        f"────────────────────\n"
+        f"📦 Rewards Pool: <b>{total}</b>\n"
+        f"🎯 Milestones: <b>{ms_total}</b>\n"
+        f"🛒 Store Items: <b>{store_total}</b>",
+        reply_markup=get_reward_menu(), parse_mode="HTML"
+    )
+
+# ─────────── MILESTONES ───────────
+
+@dp.message(F.text == "🎯 MILESTONES")
+async def milestones_menu_handler(message: types.Message, state: FSMContext):
+    if not await check_authorization(message, "Milestones", "can_add"):
+        return
+    await state.clear()
+    total = col_milestones.count_documents({})
+    await message.answer(
+        f"<b>🎯 MILESTONE MANAGER</b>\n────────────────────\n"
+        f"Active Milestones: <b>{total}</b>\n\n"
+        f"Milestones fire automatically when a user hits the required referral count.\n"
+        f"They can award bonus MSA Credits, a badge, and a custom reward text.",
+        reply_markup=get_milestone_menu(), parse_mode="HTML"
+    )
+
+@dp.message(F.text == "📋 LIST MILESTONES")
+async def list_milestones(message: types.Message, state: FSMContext):
+    if not await check_authorization(message, "List Milestones", "can_list"):
+        return
+    await state.clear()
+    docs = list(col_milestones.find().sort("refs_required", 1))
+    if not docs:
+        await message.answer("⚠️ No milestones set yet. Add one first!", reply_markup=get_milestone_menu())
+        return
+    lines = ["<b>🎯 MILESTONES</b>\n────────────────────"]
+    for d in docs:
+        lines.append(
+            f"<b>{d.get('badge','🏅')} {d.get('refs_required')} refs → {d.get('name','?')}</b>\n"
+            f"   💎 Bonus: {d.get('bonus_credits',0)} MSA Credits\n"
+            f"   🎁 Reward: {str(d.get('reward_text','None'))[:60]}"
+        )
+    await message.answer("\n\n".join(lines), reply_markup=get_milestone_menu(), parse_mode="HTML")
+
+@dp.message(F.text == "➕ ADD MILESTONE")
+async def add_milestone_start(message: types.Message, state: FSMContext):
+    if not await check_authorization(message, "Add Milestone", "can_add"):
+        return
+    await state.set_state(MilestoneStates.waiting_for_refs)
+    await message.answer(
+        "<b>➕ ADD MILESTONE</b>\n────────────────────\n"
+        "Step 1/5: How many <b>confirmed referrals</b> triggers this milestone?\n"
+        "<i>Example: 3  (for 3 referrals)</i>",
+        reply_markup=get_cancel_keyboard(), parse_mode="HTML"
+    )
+
+@dp.message(MilestoneStates.waiting_for_refs)
+async def add_milestone_refs(message: types.Message, state: FSMContext):
+    if message.text == "❌ CANCEL":
+        await state.clear(); return await message.answer("❌ Cancelled.", reply_markup=get_milestone_menu())
+    try:
+        refs = int(message.text.strip())
+        if refs < 1: raise ValueError
+    except ValueError:
+        return await message.answer("⚠️ Enter a positive number.", reply_markup=get_cancel_keyboard())
+    if col_milestones.find_one({"refs_required": refs}):
+        return await message.answer(f"⚠️ A milestone for <b>{refs} refs</b> already exists. Delete it first.", reply_markup=get_cancel_keyboard(), parse_mode="HTML")
+    await state.update_data(refs=refs)
+    await state.set_state(MilestoneStates.waiting_for_name)
+    await message.answer("Step 2/5: Enter a <b>milestone name</b>.\n<i>Example: Silver Networker</i>", reply_markup=get_cancel_keyboard(), parse_mode="HTML")
+
+@dp.message(MilestoneStates.waiting_for_name)
+async def add_milestone_name(message: types.Message, state: FSMContext):
+    if message.text == "❌ CANCEL":
+        await state.clear(); return await message.answer("❌ Cancelled.", reply_markup=get_milestone_menu())
+    await state.update_data(name=message.text.strip())
+    await state.set_state(MilestoneStates.waiting_for_badge)
+    await message.answer("Step 3/5: Enter a <b>badge emoji</b> for this milestone.\n<i>Example: 🥈</i>", reply_markup=get_cancel_keyboard(), parse_mode="HTML")
+
+@dp.message(MilestoneStates.waiting_for_badge)
+async def add_milestone_badge(message: types.Message, state: FSMContext):
+    if message.text == "❌ CANCEL":
+        await state.clear(); return await message.answer("❌ Cancelled.", reply_markup=get_milestone_menu())
+    await state.update_data(badge=message.text.strip())
+    await state.set_state(MilestoneStates.waiting_for_credits)
+    await message.answer("Step 4/5: How many <b>bonus MSA Credits</b> to award? (Enter 0 for none)", reply_markup=get_cancel_keyboard(), parse_mode="HTML")
+
+@dp.message(MilestoneStates.waiting_for_credits)
+async def add_milestone_credits(message: types.Message, state: FSMContext):
+    if message.text == "❌ CANCEL":
+        await state.clear(); return await message.answer("❌ Cancelled.", reply_markup=get_milestone_menu())
+    try:
+        pts = max(0, int(message.text.strip()))
+    except ValueError:
+        return await message.answer("⚠️ Enter a number (0 or more).", reply_markup=get_cancel_keyboard())
+    await state.update_data(bonus_credits=pts)
+    await state.set_state(MilestoneStates.waiting_for_reward_txt)
+    await message.answer("Step 5/5: Enter the <b>reward text</b> delivered to the user when they hit this milestone.\n<i>This can be a link, a secret message, or any exclusive content.</i>\n\nType <code>SKIP</code> to leave empty.", reply_markup=get_cancel_keyboard(), parse_mode="HTML")
+
+@dp.message(MilestoneStates.waiting_for_reward_txt)
+async def add_milestone_reward_txt(message: types.Message, state: FSMContext):
+    if message.text == "❌ CANCEL":
+        await state.clear(); return await message.answer("❌ Cancelled.", reply_markup=get_milestone_menu())
+    reward_txt = "" if message.text.strip().upper() == "SKIP" else message.text.strip()
+    data = await state.get_data()
+    doc = {
+        "refs_required": data["refs"],
+        "name": data["name"],
+        "badge": data["badge"],
+        "bonus_credits": data["bonus_credits"],
+        "reward_text": reward_txt,
+        "created_at": now_local()
+    }
+    col_milestones.insert_one(doc)
+    await state.clear()
+    await message.answer(
+        f"✅ <b>Milestone Added!</b>\n────────────────────\n"
+        f"{data['badge']} <b>{data['refs']} refs → {data['name']}</b>\n"
+        f"💎 Bonus: {data['bonus_credits']} MSA Credits\n"
+        f"🎁 Reward: {reward_txt[:60] if reward_txt else 'None'}",
+        reply_markup=get_milestone_menu(), parse_mode="HTML"
+    )
+
+@dp.message(F.text == "🗑️ DELETE MILESTONE")
+async def delete_milestone_start(message: types.Message, state: FSMContext):
+    if not await check_authorization(message, "Delete Milestone", "can_add"):
+        return
+    docs = list(col_milestones.find().sort("refs_required", 1))
+    if not docs:
+        return await message.answer("⚠️ No milestones to delete.", reply_markup=get_milestone_menu())
+    lines = ["<b>🗑️ DELETE MILESTONE</b>\nType the <b>refs_required number</b> to delete:\n────────────────────"]
+    for d in docs:
+        lines.append(f"• <b>{d['refs_required']}</b> → {d.get('badge','')} {d.get('name','?')}")
+    await state.set_state(MilestoneStates.delete_select)
+    await message.answer("\n".join(lines), reply_markup=get_cancel_keyboard(), parse_mode="HTML")
+
+@dp.message(MilestoneStates.delete_select)
+async def delete_milestone_confirm(message: types.Message, state: FSMContext):
+    if message.text == "❌ CANCEL":
+        await state.clear(); return await message.answer("❌ Cancelled.", reply_markup=get_milestone_menu())
+    try:
+        refs = int(message.text.strip())
+    except ValueError:
+        return await message.answer("⚠️ Enter a valid number.", reply_markup=get_cancel_keyboard())
+    doc = col_milestones.find_one({"refs_required": refs})
+    if not doc:
+        return await message.answer(f"❌ No milestone found for {refs} refs.", reply_markup=get_cancel_keyboard())
+    await state.update_data(del_refs=refs, del_name=doc.get("name","?"))
+    await state.set_state(MilestoneStates.delete_confirm)
+    await message.answer(
+        f"⚠️ Delete milestone <b>{doc.get('badge','')} {refs} refs → {doc.get('name','?')}</b>?\n"
+        f"Type <code>CONFIRM</code> to delete.",
+        reply_markup=get_cancel_keyboard(), parse_mode="HTML"
+    )
+
+@dp.message(MilestoneStates.delete_confirm)
+async def delete_milestone_execute(message: types.Message, state: FSMContext):
+    if message.text == "❌ CANCEL":
+        await state.clear(); return await message.answer("❌ Cancelled.", reply_markup=get_milestone_menu())
+    if message.text.strip().upper() != "CONFIRM":
+        return await message.answer("Type exactly <code>CONFIRM</code> to proceed.", reply_markup=get_cancel_keyboard(), parse_mode="HTML")
+    data = await state.get_data()
+    col_milestones.delete_one({"refs_required": data["del_refs"]})
+    await state.clear()
+    await message.answer(f"✅ Milestone <b>{data['del_refs']} refs → {data['del_name']}</b> deleted.", reply_markup=get_milestone_menu(), parse_mode="HTML")
+
+# ─────────── STORE MANAGER ───────────
+
+@dp.message(F.text == "🛒 STORE MANAGER")
+async def store_menu_handler(message: types.Message, state: FSMContext):
+    if not await check_authorization(message, "Store Manager", "can_add"):
+        return
+    await state.clear()
+    total = col_store_items.count_documents({})
+    active = col_store_items.count_documents({"active": True})
+    await message.answer(
+        f"<b>🛒 VAULT STORE MANAGER</b>\n────────────────────\n"
+        f"Total Items: <b>{total}</b> | Active: <b>{active}</b>\n\n"
+        f"Items set here appear in the user's 💎 MSA CREDITS shop.\n"
+        f"Users spend MSA Credits to unlock reward text (link, file info, etc.).",
+        reply_markup=get_store_menu(), parse_mode="HTML"
+    )
+
+@dp.message(F.text == "📋 LIST STORE ITEMS")
+async def list_store_items(message: types.Message, state: FSMContext):
+    if not await check_authorization(message, "List Store Items", "can_list"):
+        return
+    await state.clear()
+    docs = list(col_store_items.find().sort("cost", 1))
+    if not docs:
+        await message.answer("⚠️ No store items yet. Add one!", reply_markup=get_store_menu())
+        return
+    lines = ["<b>🛒 STORE ITEMS</b>\n────────────────────"]
+    for i, d in enumerate(docs, 1):
+        status = "✅ Active" if d.get("active") else "⛔ Inactive"
+        lines.append(
+            f"<b>{i}. {d.get('name','?')}</b> — {d.get('cost',0)} Credits | {status}\n"
+            f"   {d.get('description','')[:60]}"
+        )
+    lines.append("\n👉 <b>Type an item number to view its full reward payload.</b>")
+    await state.update_data(store_docs=[str(d["_id"]) for d in docs])
+    await state.set_state(StoreStates.list_select)
+    await message.answer("\n\n".join(lines), reply_markup=get_cancel_keyboard(), parse_mode="HTML")
+
+@dp.message(StoreStates.list_select)
+async def list_store_select(message: types.Message, state: FSMContext):
+    if message.text in ["❌ CANCEL", "⬅️ BACK"]:
+        await state.clear(); return await message.answer("⬅️ Back to Store Manager.", reply_markup=get_store_menu())
+    try:
+        from bson.objectid import ObjectId
+        idx = int(message.text.strip()) - 1
+        data = await state.get_data()
+        doc_ids = data.get("store_docs", [])
+        if idx < 0 or idx >= len(doc_ids): raise ValueError
+    except (ValueError, IndexError):
+        return await message.answer("⚠️ Enter a valid item number, or tap ⬅️ BACK.", reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="⬅️ BACK")]], resize_keyboard=True))
+    
+    doc = col_store_items.find_one({"_id": ObjectId(doc_ids[idx])})
+    if not doc:
+        return await message.answer("❌ Item not found.", reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="⬅️ BACK")]], resize_keyboard=True))
+    
+    status = "✅ Active" if doc.get("active") else "⛔ Inactive"
+    content = (
+        f"<b>🛒 STORE ITEM: {doc.get('name', '?')}</b>\n"
+        f"────────────────────\n"
+        f"<b>Button Label:</b> <code>{doc.get('btn_name', '?')}</code>\n"
+        f"<b>Cost:</b> {doc.get('cost', 0)} Credits\n"
+        f"<b>Status:</b> {status}\n\n"
+        f"<b>Preview Description:</b>\n{doc.get('description', 'None')}\n\n"
+        f"<b>💎 FULL REWARD PAYLOAD:</b>\n"
+        f"<pre>{_html.escape(doc.get('reward_text', ''))}</pre>\n"
+    )
+    
+    kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="⬅️ BACK")]], resize_keyboard=True)
+    await message.answer(content, reply_markup=kb, parse_mode="HTML")
+
+@dp.message(F.text == "➕ ADD STORE ITEM")
+async def add_store_item_start(message: types.Message, state: FSMContext):
+    if not await check_authorization(message, "Add Store Item", "can_add"):
+        return
+    await state.set_state(StoreStates.waiting_for_name)
+    await message.answer(
+        "<b>➕ ADD STORE ITEM</b>\n────────────────────\n"
+        "Step 1/4: Enter the <b>item name</b>.\n<i>Example: Viral Hook Playbook</i>",
+        reply_markup=get_cancel_keyboard(), parse_mode="HTML"
+    )
+
+@dp.message(StoreStates.waiting_for_name)
+async def add_store_name(message: types.Message, state: FSMContext):
+    if message.text == "❌ CANCEL":
+        await state.clear(); return await message.answer("❌ Cancelled.", reply_markup=get_store_menu())
+    await state.update_data(name=message.text.strip())
+    await state.set_state(StoreStates.waiting_for_desc)
+    await message.answer("Step 2/4: Enter a short <b>description</b> (shown in shop preview).\nType <code>SKIP</code> to leave empty.", reply_markup=get_cancel_keyboard(), parse_mode="HTML")
+
+@dp.message(StoreStates.waiting_for_desc)
+async def add_store_desc(message: types.Message, state: FSMContext):
+    if message.text == "❌ CANCEL":
+        await state.clear(); return await message.answer("❌ Cancelled.", reply_markup=get_store_menu())
+    desc = "" if message.text.strip().upper() == "SKIP" else message.text.strip()
+    await state.update_data(description=desc)
+    await state.set_state(StoreStates.waiting_for_cost)
+    await message.answer("Step 3/4: How many <b>MSA Credits</b> does this item cost?\n<i>Example: 500</i>", reply_markup=get_cancel_keyboard(), parse_mode="HTML")
+
+@dp.message(StoreStates.waiting_for_cost)
+async def add_store_cost(message: types.Message, state: FSMContext):
+    if message.text == "❌ CANCEL":
+        await state.clear(); return await message.answer("❌ Cancelled.", reply_markup=get_store_menu())
+    try:
+        cost = int(message.text.strip())
+        if cost < 1: raise ValueError
+    except ValueError:
+        return await message.answer("⚠️ Enter a positive number.", reply_markup=get_cancel_keyboard())
+    await state.update_data(cost=cost)
+    await state.set_state(StoreStates.waiting_for_btn_name)
+    await message.answer(
+        "Step 4/5: Enter a short <b>button label</b> for this item.\n"
+        "This appears as a keyboard button inside the 🛍️ REWARD STORE.\n"
+        "<i>Max 25 chars. Example: 🔥 Hook Playbook</i>",
+        reply_markup=get_cancel_keyboard(), parse_mode="HTML"
+    )
+
+@dp.message(StoreStates.waiting_for_btn_name)
+async def add_store_btn_name(message: types.Message, state: FSMContext):
+    if message.text == "❌ CANCEL":
+        await state.clear(); return await message.answer("❌ Cancelled.", reply_markup=get_store_menu())
+    await state.update_data(btn_name=message.text.strip()[:25])
+    await state.set_state(StoreStates.waiting_for_reward_txt)
+    await message.answer(
+        "Step 5/5: Enter the <b>reward text</b> delivered after purchase.\n"
+        "<i>This is a link, instructions, or exclusive content the user receives.</i>",
+        reply_markup=get_cancel_keyboard(), parse_mode="HTML"
+    )
+
+@dp.message(StoreStates.waiting_for_reward_txt)
+async def add_store_reward_txt(message: types.Message, state: FSMContext):
+    if message.text == "❌ CANCEL":
+        await state.clear(); return await message.answer("❌ Cancelled.", reply_markup=get_store_menu())
+    import uuid
+    data = await state.get_data()
+    item_id = str(uuid.uuid4())[:8]
+    doc = {
+        "item_id": item_id,
+        "name": data["name"],
+        "description": data["description"],
+        "cost": data["cost"],
+        "btn_name": data.get("btn_name", data["name"][:25]),
+        "reward_text": message.text.strip(),
+        "active": True,
+        "created_at": now_local()
+    }
+    col_store_items.insert_one(doc)
+    await state.clear()
+    await message.answer(
+        f"✅ <b>Store Item Added!</b>\n────────────────────\n"
+        f"<b>{data['name']}</b>\n"
+        f"🔘 Button Label: <code>{doc['btn_name']}</code>\n"
+        f"💰 Cost: {data['cost']} MSA Credits\n"
+        f"🆔 Item ID: <code>{item_id}</code>\n"
+        f"✅ Status: Active (visible in 🛍️ REWARD STORE)",
+        reply_markup=get_store_menu(), parse_mode="HTML"
+    )
+
+@dp.message(F.text == "🗑️ DELETE STORE ITEM")
+async def delete_store_start(message: types.Message, state: FSMContext):
+    if not await check_authorization(message, "Delete Store Item", "can_add"):
+        return
+    docs = list(col_store_items.find().sort("cost", 1))
+    if not docs:
+        return await message.answer("⚠️ No store items to delete.", reply_markup=get_store_menu())
+    lines = ["<b>🗑️ DELETE STORE ITEM</b>\nType the <b>item number</b> to delete:\n────────────────────"]
+    for i, d in enumerate(docs, 1):
+        lines.append(f"<b>{i}.</b> {d.get('name','?')} — {d.get('cost',0)} Credits")
+    await state.update_data(store_docs=[str(d["_id"]) for d in docs])
+    await state.set_state(StoreStates.delete_select)
+    await message.answer("\n".join(lines), reply_markup=get_cancel_keyboard(), parse_mode="HTML")
+
+@dp.message(StoreStates.delete_select)
+async def delete_store_confirm(message: types.Message, state: FSMContext):
+    if message.text == "❌ CANCEL":
+        await state.clear(); return await message.answer("❌ Cancelled.", reply_markup=get_store_menu())
+    try:
+        idx = int(message.text.strip()) - 1
+        data = await state.get_data()
+        doc_ids = data.get("store_docs", [])
+        if idx < 0 or idx >= len(doc_ids): raise ValueError
+    except (ValueError, IndexError):
+        return await message.answer("⚠️ Enter a valid item number.", reply_markup=get_cancel_keyboard())
+    from bson.objectid import ObjectId
+    doc = col_store_items.find_one({"_id": ObjectId(doc_ids[idx])})
+    if not doc:
+        return await message.answer("❌ Item not found.", reply_markup=get_cancel_keyboard())
+    await state.update_data(del_oid=doc_ids[idx], del_name=doc.get("name","?"))
+    await state.set_state(StoreStates.delete_confirm)
+    await message.answer(
+        f"⚠️ Delete store item <b>{doc.get('name','?')}</b>?\nType <code>CONFIRM</code> to proceed.",
+        reply_markup=get_cancel_keyboard(), parse_mode="HTML"
+    )
+
+@dp.message(StoreStates.delete_confirm)
+async def delete_store_execute(message: types.Message, state: FSMContext):
+    if message.text == "❌ CANCEL":
+        await state.clear(); return await message.answer("❌ Cancelled.", reply_markup=get_store_menu())
+    if message.text.strip().upper() != "CONFIRM":
+        return await message.answer("Type exactly <code>CONFIRM</code>.", reply_markup=get_cancel_keyboard(), parse_mode="HTML")
+    from bson.objectid import ObjectId
+    data = await state.get_data()
+    col_store_items.delete_one({"_id": ObjectId(data["del_oid"])})
+    await state.clear()
+    await message.answer(f"✅ Store item <b>{data['del_name']}</b> deleted.", reply_markup=get_store_menu(), parse_mode="HTML")
+
+
+# ─────────── EDIT STORE ITEM ───────────
+
+_STORE_EDIT_FIELDS = {
+    "1": ("name",        "Item Name"),
+    "2": ("btn_name",    "Button Label"),
+    "3": ("description", "Description"),
+    "4": ("cost",        "Cost (Credits)"),
+    "5": ("reward_text", "Reward Text"),
+    "6": ("active",      "Toggle Active/Inactive"),
+}
+
+def _store_field_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(keyboard=[
+        [KeyboardButton(text="1. Name"),         KeyboardButton(text="2. Button Label")],
+        [KeyboardButton(text="3. Description"),  KeyboardButton(text="4. Cost")],
+        [KeyboardButton(text="5. Reward Text"),  KeyboardButton(text="6. Toggle Active")],
+        [KeyboardButton(text="❌ CANCEL")],
+    ], resize_keyboard=True)
+
+@dp.message(F.text == "✏️ EDIT STORE ITEM")
+async def edit_store_start(message: types.Message, state: FSMContext):
+    if not await check_authorization(message, "Edit Store Item", "can_add"):
+        return
+    docs = list(col_store_items.find().sort("cost", 1))
+    if not docs:
+        return await message.answer("⚠️ No store items yet. Add one first!", reply_markup=get_store_menu())
+    lines = ["<b>✏️ EDIT STORE ITEM</b>\nType the <b>item number</b> to edit:\n────────────────────"]
+    for i, d in enumerate(docs, 1):
+        status = "✅" if d.get("active") else "⛔"
+        lines.append(f"<b>{i}.</b> {d.get('name','?')} — {d.get('cost',0)} Credits  {status}")
+    await state.update_data(store_docs=[str(d["_id"]) for d in docs])
+    await state.set_state(StoreStates.edit_select)
+    await message.answer("\n".join(lines), reply_markup=get_cancel_keyboard(), parse_mode="HTML")
+
+@dp.message(StoreStates.edit_select)
+async def edit_store_select(message: types.Message, state: FSMContext):
+    if message.text == "❌ CANCEL":
+        await state.clear(); return await message.answer("❌ Cancelled.", reply_markup=get_store_menu())
+    try:
+        from bson.objectid import ObjectId
+        idx = int(message.text.strip()) - 1
+        data = await state.get_data()
+        doc_ids = data.get("store_docs", [])
+        if idx < 0 or idx >= len(doc_ids): raise ValueError
+    except (ValueError, IndexError):
+        return await message.answer("⚠️ Enter a valid item number.", reply_markup=get_cancel_keyboard())
+    from bson.objectid import ObjectId
+    doc = col_store_items.find_one({"_id": ObjectId(doc_ids[idx])})
+    if not doc:
+        return await message.answer("❌ Item not found.", reply_markup=get_cancel_keyboard())
+    await state.update_data(edit_oid=doc_ids[idx], edit_item_name=doc.get("name","?"), edit_active=doc.get("active", True))
+    status = "✅ Active" if doc.get("active") else "⛔ Inactive"
+    await message.answer(
+        f"<b>✏️ {doc.get('name','?')}</b>\n"
+        f"────────────────────\n"
+        f"💳 Cost: {doc.get('cost',0)} Credits\n"
+        f"🔘 Button: <code>{doc.get('btn_name','')}</code>\n"
+        f"📝 Desc: {doc.get('description','') or '—'}\n"
+        f"📦 Status: {status}\n\n"
+        f"Which field do you want to edit?\n"
+        f"<i>1=Name  2=Button Label  3=Desc  4=Cost  5=Reward Text  6=Toggle Active</i>",
+        reply_markup=_store_field_keyboard(), parse_mode="HTML"
+    )
+    await state.set_state(StoreStates.edit_field)
+
+@dp.message(StoreStates.edit_field)
+async def edit_store_field(message: types.Message, state: FSMContext):
+    if message.text == "❌ CANCEL":
+        await state.clear(); return await message.answer("❌ Cancelled.", reply_markup=get_store_menu())
+    # Map button text → field key
+    btn_map = {
+        "1. Name": "1", "2. Button Label": "2", "3. Description": "3",
+        "4. Cost": "4", "5. Reward Text": "5", "6. Toggle Active": "6",
+    }
+    choice = btn_map.get(message.text.strip(), message.text.strip())
+    if choice not in _STORE_EDIT_FIELDS:
+        return await message.answer("⚠️ Tap one of the field buttons.", reply_markup=_store_field_keyboard())
+    field_key, field_label = _STORE_EDIT_FIELDS[choice]
+    await state.update_data(edit_field_key=field_key, edit_field_label=field_label)
+
+    # Toggle is instant — no text input needed
+    if field_key == "active":
+        from bson.objectid import ObjectId
+        data = await state.get_data()
+        new_val = not data.get("edit_active", True)
+        col_store_items.update_one({"_id": ObjectId(data["edit_oid"])}, {"$set": {"active": new_val}})
+        await state.clear()
+        status = "✅ Active" if new_val else "⛔ Inactive"
+        return await message.answer(
+            f"✅ <b>{data['edit_item_name']}</b> is now <b>{status}</b>.",
+            reply_markup=get_store_menu(), parse_mode="HTML"
+        )
+
+    await state.set_state(StoreStates.edit_value)
+    await message.answer(
+        f"✏️ Enter the new <b>{field_label}</b>:"
+        + ("\n<i>Enter a positive number.</i>" if field_key == "cost" else ""),
+        reply_markup=get_cancel_keyboard(), parse_mode="HTML"
+    )
+
+@dp.message(StoreStates.edit_value)
+async def edit_store_value(message: types.Message, state: FSMContext):
+    if message.text == "❌ CANCEL":
+        await state.clear(); return await message.answer("❌ Cancelled.", reply_markup=get_store_menu())
+    from bson.objectid import ObjectId
+    data = await state.get_data()
+    field_key   = data.get("edit_field_key")
+    field_label = data.get("edit_field_label", "Field")
+    oid         = data.get("edit_oid")
+    item_name   = data.get("edit_item_name", "Item")
+    new_val     = message.text.strip()
+
+    if field_key == "cost":
+        try:
+            new_val = int(new_val)
+            if new_val < 1: raise ValueError
+        except ValueError:
+            return await message.answer("⚠️ Enter a positive number.", reply_markup=get_cancel_keyboard())
+    elif field_key == "btn_name":
+        new_val = new_val[:25]
+
+    col_store_items.update_one({"_id": ObjectId(oid)}, {"$set": {field_key: new_val}})
+    await state.clear()
+    await message.answer(
+        f"✅ <b>{item_name}</b> — <b>{field_label}</b> updated successfully.",
+        reply_markup=get_store_menu(), parse_mode="HTML"
+    )
+
+
+
 
 # ═════════════════════════════════════════════════════════════════════
-# SEARCH - PDF or IG CC with detailed info
+# SEARCH - PDF, IG CC, or REWARD with detailed info
 # ═════════════════════════════════════════════════════════════════════
 
 @dp.message(F.text == "🔍 SEARCH")
 async def search_menu_handler(message: types.Message):
     if not await check_authorization(message, "Search Menu", "can_list"):
         return
-    """Show search menu with PDF/IG CC options"""
+    """Show search menu with PDF/IG CC/Reward options"""
     kb = ReplyKeyboardMarkup(keyboard=[
         [KeyboardButton(text="🔍 SEARCH PDF"), KeyboardButton(text="🔍 SEARCH IG CC")],
+        [KeyboardButton(text="🔍 SEARCH REWARD")],
         [KeyboardButton(text="⬅️ BACK")]
     ], resize_keyboard=True)
     await message.answer("🔍 <b>SELECT SEARCH TYPE:</b>", reply_markup=kb, parse_mode="HTML")
@@ -6587,6 +7697,7 @@ async def search_pdf_start(message: types.Message, state: FSMContext):
     """Show available PDFs with pagination"""
     await state.set_state(SearchStates.viewing_pdf_list)
     await send_search_pdf_list(message, page=0)
+
 
 async def send_search_pdf_list(message: types.Message, page=0):
     """Display paginated PDF list for search (5 per page)"""
@@ -6829,6 +7940,75 @@ async def process_ig_search(message: types.Message, state: FSMContext):
                 await message.answer(part, parse_mode="HTML")
     else:
         await message.answer(text, reply_markup=get_cancel_keyboard(), parse_mode="HTML")
+
+
+# ─── SEARCH REWARD ────────────────────────────────────────────────────────────
+
+@dp.message(F.text == "🔍 SEARCH REWARD")
+async def search_reward_start(message: types.Message, state: FSMContext):
+    if not await check_authorization(message, "Search Reward", "can_list"):
+        return
+    total = col_rewards.count_documents({})
+    if total == 0:
+        await message.answer("⚠️ No rewards in pool yet.", reply_markup=get_cancel_keyboard())
+        return
+    all_rewards = list(col_rewards.find().sort("rw_number", 1))
+    lines = [f"{i}. <b>{r['rw_code']}</b>" for i, r in enumerate(all_rewards, start=1)]
+    index_text = "\n".join(lines)
+    await state.set_state(SearchStates.waiting_for_reward_input)
+    await message.answer(
+        f"🎁 <b>SEARCH REWARD</b>\n━━━━━━━━━━━━━━━━━━━━\n{index_text}\n━━━━━━━━━━━━━━━━━━━━\n"
+        f"⌨️ <b>Enter an index number (e.g. <code>2</code>) or RW code (e.g. <code>RW2</code>):</b>",
+        reply_markup=get_cancel_keyboard(),
+        parse_mode="HTML"
+    )
+
+@dp.message(SearchStates.waiting_for_reward_input)
+async def process_reward_search(message: types.Message, state: FSMContext):
+    if message.text == "❌ CANCEL":
+        await state.clear()
+        return await search_menu_handler(message)
+
+    query = message.text.strip()
+    all_rewards = list(col_rewards.find().sort("rw_number", 1))
+    reward = None
+    display_idx = None
+
+    if query.isdigit():
+        idx = int(query) - 1
+        if 0 <= idx < len(all_rewards):
+            reward = all_rewards[idx]
+            display_idx = int(query)
+    elif query.upper().startswith("RW"):
+        reward = col_rewards.find_one({"rw_code": {"$regex": f"^{query}$", "$options": "i"}})
+        if reward:
+            for i, r in enumerate(all_rewards, start=1):
+                if r["_id"] == reward["_id"]:
+                    display_idx = i
+                    break
+
+    if not reward:
+        await message.answer("❌ Reward not found. Enter a valid index or RW code, or ❌ CANCEL.", reply_markup=get_cancel_keyboard())
+        return
+
+    content = str(reward.get("content", ""))
+    created_at = reward.get("created_at")
+    created_str = created_at.strftime("%b %d, %Y  %I:%M %p") if hasattr(created_at, 'strftime') else str(created_at) if created_at else "N/A"
+
+    header = (
+        f"🎁 <b>REWARD DETAIL</b>\n━━━━━━━━━━━━━━━━━━━━\n"
+        f"<b>#{display_idx}  {reward['rw_code']}</b>\n"
+        f"📅 Added: {created_str}\n━━━━━━━━━━━━━━━━━━━━\n"
+        f"📝 <b>Content:</b>\n"
+    )
+    await state.set_state(SearchStates.waiting_for_reward_input)
+    if len(header + content) <= 4096:
+        await message.answer(header + content, parse_mode="HTML", reply_markup=get_cancel_keyboard())
+    else:
+        await message.answer(header, parse_mode="HTML")
+        chunks = [content[i:i + 4096] for i in range(0, len(content), 4096)]
+        for ci, chunk in enumerate(chunks):
+            await message.answer(chunk, reply_markup=get_cancel_keyboard() if ci == len(chunks) - 1 else None)
 
 
 def get_diagnosis_nav_keyboard(page: int, total_pages: int) -> ReplyKeyboardMarkup:
@@ -7461,7 +8641,7 @@ def get_recent_logs(lines_count=30):
                 content = content[-3500:]
                 content = "..." + content
             import html
-            return html.escape(content) if content.strip() else "No recent logs."
+            return _html.escape(content) if content.strip() else "No recent logs."
     except Exception as e:
         return f"Error reading logs: {e}"
 
@@ -7470,28 +8650,133 @@ async def terminal_handler(message: types.Message):
     if not await check_authorization(message, "Terminal", "can_view_analytics"):
         return
     log_user_action(message.from_user, "Viewed Terminal")
-    logs = get_recent_logs(lines_count=40)
-    text = f"🖥️ <b>LIVE TERMINAL OUTPUT</b>\n━━━━━━━━━━━━━━━━━━━━\n<pre><code class=\"language-python\">{logs}</code></pre>\n━━━━━━━━━━━━━━━━━━━━"
+
+    user        = message.from_user
+    user_name   = user.full_name or str(user.id)
+    username    = f"@{user.username}" if user.username else f"ID:{user.id}"
+    now_str     = now_local().strftime("%b %d, %Y  %I:%M:%S %p")
+    uptime_raw  = now_local() - health_monitor.system_metrics["uptime_start"]
+    h3 = int(uptime_raw.total_seconds() // 3600)
+    m3 = int((uptime_raw.total_seconds() % 3600) // 60)
+    started_str = health_monitor.system_metrics["uptime_start"].strftime("%b %d, %Y  %I:%M:%S %p")
+
+    # Build live action log from MongoDB (bot3 entries)
+    live_log_lines = []
+    live_log_count = 0
+    try:
+        docs = list(col_live_logs.find({"bot": "bot3"}, {"_id": 0}).sort("created_at", -1).limit(40))
+        live_log_count = col_live_logs.count_documents({"bot": "bot3"})
+        docs.reverse()
+        for doc in docs:
+            raw_ca = doc.get("created_at")
+            ts = raw_ca.strftime('%b %d  %I:%M:%S %p') if raw_ca and hasattr(raw_ca, "strftime") else doc.get("timestamp", "??")
+            action  = doc.get("action", "")
+            detail  = doc.get("details", "")
+            uid     = doc.get("user_id", "")
+            uname   = doc.get("user_name", "")
+            parts = []
+            if uname: parts.append(str(uname))
+            if uid:   parts.append(f"ID:{uid}")
+            tag = (" [" + " | ".join(parts) + "]") if parts else ""
+            line = f"[{ts}]{tag} {action}" + (f" > {detail}" if detail else "")
+            live_log_lines.append(line)
+    except Exception:
+        pass
+
+    live_logs_text = "\n".join(live_log_lines) if live_log_lines else ">> NO LIVE LOGS YET..."
+    sys_logs = get_recent_logs(lines_count=20)
+
+    header = (
+        f"🖥️ <b>BOT 3 — LIVE TERMINAL</b>\n"
+        f"<code>"
+        f"Triggered by : {user_name} ({username})\n"
+        f"User ID      : {user.id}\n"
+        f"Time         : {now_str}\n"
+        f"Bot 3 Started: {started_str}\n"
+        f"Bot 3 Uptime : {h3}h {m3}m\n"
+        f"Live DB Logs : {live_log_count} entries\n"
+        f"Format       : [Date  Time] [Name|ID] Action > Detail\n"
+        f"{'━'*42}\n"
+        f"</code>"
+    )
+    text = (
+        header
+        + "\n<b>📋 LIVE ACTION LOG (MongoDB):</b>\n"
+        + f"<pre>{live_logs_text}</pre>"
+        + "\n<b>🖥️ SYSTEM LOG (Process):</b>\n"
+        + f"<pre><code>{sys_logs}</code></pre>"
+    )
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔄 REFRESH", callback_data="refresh_terminal")]])
     await message.answer(text, parse_mode="HTML", reply_markup=kb)
 
 @dp.callback_query(F.data == "refresh_terminal")
 async def refresh_terminal_callback(callback: types.CallbackQuery):
-    # Use check_authorization_user so we check the human who clicked (callback.from_user),
-    # NOT callback.message.from_user which points to the bot itself.
     if not await check_authorization_user(callback.from_user, callback.message, "Refresh Terminal", "can_view_analytics"):
          await callback.answer("⛔ Access Denied", show_alert=True)
          return
-    logs = get_recent_logs(lines_count=40)
-    text = f"🖥️ <b>LIVE TERMINAL OUTPUT</b>\n━━━━━━━━━━━━━━━━━━━━\n<pre><code class=\"language-python\">{logs}</code></pre>\n━━━━━━━━━━━━━━━━━━━━"
+
+    user        = callback.from_user
+    user_name   = user.full_name or str(user.id)
+    username    = f"@{user.username}" if user.username else f"ID:{user.id}"
+    now_str     = now_local().strftime("%b %d, %Y  %I:%M:%S %p")
+    uptime_raw  = now_local() - health_monitor.system_metrics["uptime_start"]
+    h3 = int(uptime_raw.total_seconds() // 3600)
+    m3 = int((uptime_raw.total_seconds() % 3600) // 60)
+    started_str = health_monitor.system_metrics["uptime_start"].strftime("%b %d, %Y  %I:%M:%S %p")
+
+    live_log_lines = []
+    live_log_count = 0
+    try:
+        docs = list(col_live_logs.find({"bot": "bot3"}, {"_id": 0}).sort("created_at", -1).limit(40))
+        live_log_count = col_live_logs.count_documents({"bot": "bot3"})
+        docs.reverse()
+        for doc in docs:
+            raw_ca = doc.get("created_at")
+            ts = raw_ca.strftime('%b %d  %I:%M:%S %p') if raw_ca and hasattr(raw_ca, "strftime") else doc.get("timestamp", "??")
+            action  = doc.get("action", "")
+            detail  = doc.get("details", "")
+            uid     = doc.get("user_id", "")
+            uname   = doc.get("user_name", "")
+            parts = []
+            if uname: parts.append(str(uname))
+            if uid:   parts.append(f"ID:{uid}")
+            tag = (" [" + " | ".join(parts) + "]") if parts else ""
+            line = f"[{ts}]{tag} {action}" + (f" > {detail}" if detail else "")
+            live_log_lines.append(line)
+    except Exception:
+        pass
+
+    live_logs_text = "\n".join(live_log_lines) if live_log_lines else ">> NO LIVE LOGS YET..."
+    sys_logs = get_recent_logs(lines_count=20)
+
+    header = (
+        f"🖥️ <b>BOT 3 — LIVE TERMINAL</b>\n"
+        f"<code>"
+        f"Refreshed by : {user_name} ({username})\n"
+        f"User ID      : {user.id}\n"
+        f"Time         : {now_str}\n"
+        f"Bot 3 Started: {started_str}\n"
+        f"Bot 3 Uptime : {h3}h {m3}m\n"
+        f"Live DB Logs : {live_log_count} entries\n"
+        f"Format       : [Date  Time] [Name|ID] Action > Detail\n"
+        f"{'━'*42}\n"
+        f"</code>"
+    )
+    text = (
+        header
+        + "\n<b>📋 LIVE ACTION LOG (MongoDB):</b>\n"
+        + f"<pre>{live_logs_text}</pre>"
+        + "\n<b>🖥️ SYSTEM LOG (Process):</b>\n"
+        + f"<pre><code>{sys_logs}</code></pre>"
+    )
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔄 REFRESH", callback_data="refresh_terminal")]])
-    
     try:
         await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
     except Exception:
-        pass # Content identical or message not modified
-    
-    await callback.answer("Refreshing logs...")
+        pass
+    await callback.answer("Refreshed ✅")
+
+
 
 GUIDE_PAGES = [
     # ── PAGE 1 ── Overview + Main Menu buttons
@@ -7839,7 +9124,7 @@ async def analytics_overview_handler(message: types.Message):
     if top_5:
         text += "🏆 <b>TOP 5 PERFORMERS:</b>\n"
         for idx, item in enumerate(top_5, 1):
-            text += f"{idx}. {item['type']} <b>{item['name']}</b> - {item['clicks']:,} clicks\n"
+            text += f"{idx}. {item['type']} <b>{_html.escape(str(item['name']))}</b> - {item['clicks']:,} clicks\n"
         text += "\n"
     else:
         text += "📭 No clicks recorded yet.\n\n"
@@ -7855,6 +9140,22 @@ async def analytics_overview_handler(message: types.Message):
         })
         completion_rate = (complete_pdfs / total_pdfs * 100) if total_pdfs > 0 else 0
         text += f"✅ <b>Setup Completion:</b> {completion_rate:.1f}% ({complete_pdfs}/{total_pdfs} fully configured)\n"
+
+    # ── Referral stats from bot1_referrals ────────────────────────────────────
+    try:
+        _ref_col = db["bot1_referrals"]
+        _ref_confirmed = _ref_col.count_documents({"status": "confirmed"})
+        _ref_pending   = _ref_col.count_documents({"status": "pending"})
+        _ref_total     = _ref_col.count_documents({})
+        _ref_unique    = len(_ref_col.distinct("referrer_id"))
+        _recent_cutoff = now_local() - timedelta(days=7)
+        _ref_recent    = _ref_col.count_documents({"confirmed_at": {"$gte": _recent_cutoff}, "status": "confirmed"})
+        text += f"\n\n🤝 <b>REFERRAL SYSTEM:</b>\n"
+        text += f"├ ✅ Confirmed: {_ref_confirmed:,}  ⏳ Pending: {_ref_pending:,}\n"
+        text += f"├ 👥 Unique Referrers: {_ref_unique:,}  📌 Total Records: {_ref_total:,}\n"
+        text += f"└ 🕗 Last 7 days: {_ref_recent:,} new confirmations\n"
+    except Exception:
+        pass
     
     text += "\n═══════════════════════\n"
     text += "💡 Select a category below for detailed analytics."
@@ -8017,20 +9318,33 @@ async def send_analytics_view(message: types.Message, category: str, page: int =
         text += f"   🔢 Clicks: <b>{clicks:,}</b>"
         
         if last_clicked:
-            from datetime import datetime, timedelta
+            from datetime import datetime as _dt
             now = now_local()
-            time_diff = now - last_clicked
+            # Guard: DB may store timestamp as string (old records) — coerce safely
+            if isinstance(last_clicked, str):
+                try:
+                    from dateutil import parser as _dp
+                    last_clicked = _dp.parse(last_clicked)
+                except Exception:
+                    last_clicked = None
             
-            if time_diff.days > 0:
-                time_ago = f"{time_diff.days}d ago"
-            elif time_diff.seconds >= 3600:
-                time_ago = f"{time_diff.seconds // 3600}h ago"
-            elif time_diff.seconds >= 60:
-                time_ago = f"{time_diff.seconds // 60}m ago"
-            else:
-                time_ago = "just now"
-            
-            text += f" | 🕐 {time_ago}"
+            # Ensure last_clicked is naive before subtraction to prevent TypeError
+            if last_clicked and isinstance(last_clicked, _dt):
+                if last_clicked.tzinfo is not None:
+                    last_clicked = last_clicked.replace(tzinfo=None)
+                try:
+                    time_diff = now - last_clicked
+                    if time_diff.days > 0:
+                        time_ago = f"{time_diff.days}d ago"
+                    elif time_diff.seconds >= 3600:
+                        time_ago = f"{time_diff.seconds // 3600}h ago"
+                    elif time_diff.seconds >= 60:
+                        time_ago = f"{time_diff.seconds // 60}m ago"
+                    else:
+                        time_ago = "just now"
+                    text += f" | 🕐 {time_ago}"
+                except Exception:
+                    pass
         elif clicks > 0:
             text += f" | 🕐 timestamp missing"
         
@@ -8071,6 +9385,75 @@ async def send_analytics_view(message: types.Message, category: str, page: int =
                 await message.answer(part, parse_mode="HTML")
     else:
         await message.answer(text, reply_markup=reply_kb, parse_mode="HTML")
+
+@dp.message(F.text == "🤝 Referral Overview")
+async def referral_overview_handler(message: types.Message):
+    if not await check_authorization(message, "Referral Overview", "can_view_analytics"):
+        return
+    try:
+        _ref_col = db["bot1_referrals"]
+        _uv_col  = db["bot1_user_verification"]
+
+        _confirmed  = _ref_col.count_documents({"status": "confirmed"})
+        _pending    = _ref_col.count_documents({"status": "pending"})
+        _total      = _ref_col.count_documents({})
+        _referrers  = len(_ref_col.distinct("referrer_id"))
+        _referred   = len(_ref_col.distinct("referred_id"))
+
+        _now = now_local()
+        _7d  = _now - timedelta(days=7)
+        _30d = _now - timedelta(days=30)
+        _recent_7d  = _ref_col.count_documents({"confirmed_at": {"$gte": _7d},  "status": "confirmed"})
+        _recent_30d = _ref_col.count_documents({"confirmed_at": {"$gte": _30d}, "status": "confirmed"})
+
+        confirm_rate = (_confirmed / _total * 100) if _total > 0 else 0.0
+
+        # Top 5 referrers
+        pipeline = [
+            {"$group": {"_id": "$referrer_id",
+                "confirmed": {"$sum": {"$cond": [{"$eq": ["$status","confirmed"]}, 1, 0]}},
+                "pending":   {"$sum": {"$cond": [{"$eq": ["$status","pending"]},   1, 0]}}}},
+            {"$match": {"confirmed": {"$gt": 0}}},
+            {"$sort": {"confirmed": -1}},
+            {"$limit": 5}
+        ]
+        top_refs = list(_ref_col.aggregate(pipeline))
+
+        medals = ["🥇","🥈","🥉","4️⃣","5️⃣"]
+        top_lines = []
+        for m, r in zip(medals, top_refs):
+            uid = r["_id"]
+            u_doc = _uv_col.find_one({"user_id": uid}, {"first_name": 1})
+            uname = (u_doc or {}).get("first_name") or f"ID {uid}"
+            top_lines.append(f"   {m} <b>{_html.escape(str(uname))}</b> — {r['confirmed']} confirmed, {r['pending']} pending")
+
+        bar_filled = int(confirm_rate / 10)
+        bar = "█" * bar_filled + "░" * (10 - bar_filled)
+
+        text  = "🤝 <b>REFERRAL SYSTEM OVERVIEW</b>\n"
+        text += "═══════════════════════\n\n"
+        text += f"<b>📊 Live Totals:</b>\n"
+        text += f"├ ✅ Confirmed: <b>{_confirmed:,}</b>\n"
+        text += f"├ ⏳ Pending:   <b>{_pending:,}</b>\n"
+        text += f"├ 📌 Total records: <b>{_total:,}</b>\n"
+        text += f"├ 👤 Unique Referrers: <b>{_referrers:,}</b>\n"
+        text += f"└ 🎯 Unique Referred: <b>{_referred:,}</b>\n\n"
+        text += f"<b>📈 Conversion Rate:</b>\n"
+        text += f"[{bar}] {confirm_rate:.1f}%\n\n"
+        text += f"<b>🕗 Trends:</b>\n"
+        text += f"├ Last 7 days:  <b>{_recent_7d:,}</b> confirmed\n"
+        text += f"└ Last 30 days: <b>{_recent_30d:,}</b> confirmed\n\n"
+        if top_lines:
+            text += "<b>🏆 TOP REFERRERS:</b>\n"
+            text += "\n".join(top_lines) + "\n"
+        else:
+            text += "📭 No confirmed referrals yet.\n"
+        text += "\n═══════════════════════\n"
+        text += "<i>Live — no cache. Source: bot1_referrals</i>"
+
+        await message.answer(text, parse_mode="HTML", reply_markup=get_analytics_menu())
+    except Exception as e:
+        await message.answer(f"❌ Referral overview error: {str(e)[:200]}", reply_markup=get_analytics_menu())
 
 @dp.message(F.text == "📄 PDF Clicks")
 async def pdf_clicks_handler(message: types.Message, state: FSMContext):
@@ -9836,7 +11219,7 @@ async def send_role_admin_list(message: types.Message, page: int, mode: str = "r
         
         # Add to text list
         global_idx = start + i + 1
-        admin_list_text += f"{global_idx}. <b>{name}</b> (`{user_id}`) {status_str}\n"
+        admin_list_text += f"{global_idx}. <b>{_html_escape(name)}</b> (`{user_id}`) {status_str}\n"
         
         # Button Format changes based on mode
         if mode == "lock":
@@ -9964,7 +11347,7 @@ async def role_admin_selected(message: types.Message, state: FSMContext):
     await state.set_state(AdminRoleStates.waiting_for_role_selection)
     
     target_menu = get_roles_menu()
-    msg_text = f"👔 <b>SELECT ROLE FOR {admin_name}</b> (`{target_admin_id}`)\n\nChoose a role to apply permissions:"
+    msg_text = f"👔 <b>SELECT ROLE FOR {_html_escape(admin_name)}</b> (`{target_admin_id}`)\n\nChoose a role to apply permissions:"
     
     await message.answer(
         msg_text,
@@ -10326,7 +11709,7 @@ async def permission_admin_selected(message: types.Message, state: FSMContext):
 async def send_permission_toggles(message: types.Message, target_id: int, current_perms: list, admin_name: str):
     """Helper to send/update permission toggle UI (Reply Keyboard)"""
     
-    text = f"🔐 <b>CONFIGURING: {admin_name}</b> (`{target_id}`)\n\n"
+    text = f"🔐 <b>CONFIGURING: {_html_escape(admin_name)}</b> (`{target_id}`)\n\n"
     text += "Use the buttons below to toggle permissions.\n"
     text += "✅ = Allowed | ❌ = Denied\n\n"
     text += "Click <b>💾 SAVE CHANGES</b> to save and exit."
@@ -11049,15 +12432,34 @@ async def tutorial_pk_list(message: types.Message, state: FSMContext):
 
 # --- Smart PDF Selection ---
 
-@dp.message(lambda m: m.text and (m.text.isdigit() or len(m.text) > 2)) 
-async def smart_pdf_selection_handler(message: types.Message, state: FSMContext):
-    """Catches text that might be a PDF Index or Name"""
-    
-    # Ignore if in a specific state already (handled by FSM)
-    current_state = await state.get_state()
-    if current_state is not None:
-        return
+_PDF_EXCLUDED_BUTTONS = {
+    # ── Main menu ─────────────────────────────────────────────────────────────
+    "⚙️ ECONOMY SETTINGS", "📚 BOT GUIDE", "📋 LIST", "➕ ADD",
+    "🔍 SEARCH", "🔗 LINKS", "📊 ANALYTICS", "🩺 DIAGNOSIS",
+    "🖥️ TERMINAL", "💾 BACKUP DATA", "👥 ADMINS", "⚠️ RESET BOT DATA",
+    # ── Economy menu ──────────────────────────────────────────────────────────
+    "✏️ EDIT REFERRAL PTS", "✏️ EDIT BONUS PTS", "✏️ EDIT IGCC PTS",
+    "✏️ EDIT LB GOLD", "✏️ EDIT LB SILVER", "✏️ EDIT LB BRONZE",
+    # ── Store / Reward menus ───────────────────────────────────────────────────
+    "🛒 STORE MANAGER", "➕ ADD STORE ITEM", "✏️ EDIT STORE ITEM",
+    "🗑️ DELETE STORE ITEM", "📋 LIST STORE ITEMS",
+    "➕ ADD REWARD", "✏️ EDIT REWARD", "🗑️ DELETE REWARD", "📋 LIST REWARD",
+    "🎯 MILESTONES", "⬅️ BACK TO REWARD MENU", "⬅️ BACK TO ADD MENU",
+    # ── Navigation / Cancel ────────────────────────────────────────────────────
+    "⬅️ BACK", "❌ CANCEL", "❌ CANCEL",
+}
 
+@dp.message(
+    StateFilter(None),  # ONLY fires when no FSM state is active — never swallows FSM input
+    lambda m: (
+        m.text and
+        (m.text.isdigit() or len(m.text) > 2) and
+        m.text not in _PDF_EXCLUDED_BUTTONS and
+        m.text[0].isascii()
+    )
+)
+async def smart_pdf_selection_handler(message: types.Message, state: FSMContext):
+    """Catches text that might be a PDF Index or Name — only runs outside FSM states"""
     query = message.text
     pdf = None
     
@@ -11138,10 +12540,401 @@ async def general_cancel_handler(message: types.Message, state: FSMContext):
     if not await check_authorization(message, "Cancel button"):
         return
     await state.clear()
-    await message.answer("❌ Operation cancelled.", reply_markup=get_main_menu())
+    await message.answer("❌ Operation cancelled.", reply_markup=get_main_menu(message.from_user.id))
 
 
 # --- Debug Handler - Catch All with Authorization ---
+# ==========================================
+# ⚙️ ECONOMY SETTINGS MANAGER
+# ==========================================
+
+class EconomyStates(StatesGroup):
+    waiting_for_ref_pts    = State()
+    waiting_for_bonus_pts  = State()
+    waiting_for_igcc_pts   = State()
+    waiting_for_join_bonus = State()
+    waiting_for_lb_gold    = State()
+    waiting_for_lb_silver  = State()
+    waiting_for_lb_bronze  = State()
+    waiting_for_bc_msg     = State()
+    waiting_for_bc_amt     = State()
+    confirm_bc             = State()
+
+
+def get_economy_settings_doc():
+    doc = db["bot1_state_persistence"].find_one({"key": "economy_settings"})
+    if not doc:
+        doc = {"key": "economy_settings", "referral_pts": 25, "referred_bonus": 20, "igcc_default": 25, "leaderboard_rewards": [50, 40, 30]}
+        db["bot1_state_persistence"].insert_one(doc)
+    if "leaderboard_rewards" not in doc:
+        doc["leaderboard_rewards"] = [50, 40, 30]
+    return doc
+
+
+def get_economy_menu_kb():
+    keyboard = [
+        [KeyboardButton(text="👥 BROADCAST CREDITS (VAULT)")],
+        [KeyboardButton(text="✏️ EDIT REFERRAL PTS (REFERRER)")],
+        [KeyboardButton(text="✏️ EDIT BONUS PTS (NEW USER)")],
+        [KeyboardButton(text="✏️ EDIT IGCC PTS (BOUNTY)")],
+        [KeyboardButton(text="🏆 EDIT LB GOLD"), KeyboardButton(text="🏆 EDIT LB SILVER")],
+        [KeyboardButton(text="🏆 EDIT LB BRONZE")],
+        [KeyboardButton(text="⬅️ BACK")],
+    ]
+    return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
+
+
+def _econ_text(doc):
+    lb_rewards = doc.get("leaderboard_rewards", [50, 40, 30])
+    return (
+        "⚙️ *MSA ECONOMY SETTINGS*\n\n"
+        f"🔸 *Referral Bonus (Referrer):* `{doc.get('referral_pts', 25)} pts`\n"
+        f"🔸 *Referred Bonus (New User):* `{doc.get('referred_bonus', 20)} pts`\n"
+        f"🔸 *IGCC Default Bounty:*        `{doc.get('igcc_default', 25)} pts`\n\n"
+        f"🔸 *Weekly Top 1 (Gold):*      `{lb_rewards[0]} pts`\n"
+        f"🔸 *Weekly Top 2 (Silver):*    `{lb_rewards[1]} pts`\n"
+        f"🔸 *Weekly Top 3 (Bronze):*    `{lb_rewards[2]} pts`\n\n"
+        "Select a field to update:"
+    )
+
+
+@dp.message(F.text == "⚙️ ECONOMY SETTINGS")
+async def economy_menu(message: types.Message, state: FSMContext):
+    if message.from_user.id != MASTER_ADMIN_ID:
+        return await message.answer("❌ Master Admin only.")
+    await state.clear()
+    doc = get_economy_settings_doc()
+    await message.answer(_econ_text(doc), reply_markup=get_economy_menu_kb(), parse_mode="Markdown")
+
+
+# ── Edit Referral (Referrer) pts ─────────────────────────────────────────────
+@dp.message(F.text == "✏️ EDIT REFERRAL PTS")
+async def econ_edit_ref(message: types.Message, state: FSMContext):
+    if message.from_user.id != MASTER_ADMIN_ID: return
+    cancel_kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="⬅️ BACK")]], resize_keyboard=True)
+    await message.answer(
+        "Enter the new points to award the *Referrer* per confirmed referral:\n_(e.g. 25)_",
+        reply_markup=cancel_kb, parse_mode="Markdown"
+    )
+    await state.set_state(EconomyStates.waiting_for_ref_pts)
+
+
+@dp.message(EconomyStates.waiting_for_ref_pts)
+async def econ_save_ref(message: types.Message, state: FSMContext):
+    if message.text == "⬅️ BACK":
+        await state.clear()
+        doc = get_economy_settings_doc()
+        return await message.answer(_econ_text(doc), reply_markup=get_economy_menu_kb(), parse_mode="Markdown")
+    if not message.text or not message.text.strip().isdigit():
+        return await message.answer("❌ Please enter a valid whole number (e.g. 25).")
+    pts = int(message.text.strip())
+    db["bot1_state_persistence"].update_one(
+        {"key": "economy_settings"}, {"$set": {"referral_pts": pts}}, upsert=True
+    )
+    await state.clear()
+    doc = get_economy_settings_doc()
+    await message.answer(
+        f"✅ Referral Bonus updated to *{pts} pts*\n\n" + _econ_text(doc),
+        reply_markup=get_economy_menu_kb(), parse_mode="Markdown"
+    )
+
+
+# ── Edit Referred Bonus (New User) pts ───────────────────────────────────────
+@dp.message(F.text == "✏️ EDIT BONUS PTS")
+async def econ_edit_bonus(message: types.Message, state: FSMContext):
+    if message.from_user.id != MASTER_ADMIN_ID: return
+    cancel_kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="⬅️ BACK")]], resize_keyboard=True)
+    await message.answer(
+        "Enter the new starter bonus for *New Users* who join via a referral link:\n_(e.g. 20)_",
+        reply_markup=cancel_kb, parse_mode="Markdown"
+    )
+    await state.set_state(EconomyStates.waiting_for_bonus_pts)
+
+
+@dp.message(EconomyStates.waiting_for_bonus_pts)
+async def econ_save_bonus(message: types.Message, state: FSMContext):
+    if message.text == "⬅️ BACK":
+        await state.clear()
+        doc = get_economy_settings_doc()
+        return await message.answer(_econ_text(doc), reply_markup=get_economy_menu_kb(), parse_mode="Markdown")
+    if not message.text or not message.text.strip().isdigit():
+        return await message.answer("❌ Please enter a valid whole number (e.g. 20).")
+    pts = int(message.text.strip())
+    db["bot1_state_persistence"].update_one(
+        {"key": "economy_settings"}, {"$set": {"referred_bonus": pts}}, upsert=True
+    )
+    await state.clear()
+    doc = get_economy_settings_doc()
+    await message.answer(
+        f"✅ New User Bonus updated to *{pts} pts*\n\n" + _econ_text(doc),
+        reply_markup=get_economy_menu_kb(), parse_mode="Markdown"
+    )
+
+
+# ── Edit IGCC pts ─────────────────────────────────────────────────────────────
+@dp.message(F.text == "✏️ EDIT IGCC PTS")
+async def econ_edit_igcc(message: types.Message, state: FSMContext):
+    if message.from_user.id != MASTER_ADMIN_ID: return
+    cancel_kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="⬅️ BACK")]], resize_keyboard=True)
+    await message.answer(
+        "Enter the new default credits awarded for *IG Bounty* claims:\n_(e.g. 25)_",
+        reply_markup=cancel_kb, parse_mode="Markdown"
+    )
+    await state.set_state(EconomyStates.waiting_for_igcc_pts)
+
+
+@dp.message(EconomyStates.waiting_for_igcc_pts)
+async def econ_save_igcc(message: types.Message, state: FSMContext):
+    if message.text == "⬅️ BACK":
+        await state.clear()
+        doc = get_economy_settings_doc()
+        return await message.answer(_econ_text(doc), reply_markup=get_economy_menu_kb(), parse_mode="Markdown")
+    if not message.text or not message.text.strip().isdigit():
+        return await message.answer("❌ Please enter a valid whole number (e.g. 25).")
+    pts = int(message.text.strip())
+    db["bot1_state_persistence"].update_one(
+        {"key": "economy_settings"}, {"$set": {"igcc_default": pts}}, upsert=True
+    )
+    await state.clear()
+    doc = get_economy_settings_doc()
+    await message.answer(
+        f"✅ IGCC Bounty updated to *{pts} pts*\n\n" + _econ_text(doc),
+        reply_markup=get_economy_menu_kb(), parse_mode="Markdown"
+    )
+
+
+
+# ── Edit Leaderboard Rewards ─────────────────────────────────────────────────────────────
+@dp.message(F.text == "✏️ EDIT LB GOLD")
+async def econ_edit_lb_gold(message: types.Message, state: FSMContext):
+    if message.from_user.id != MASTER_ADMIN_ID: return
+    cancel_kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="⬅️ BACK")]], resize_keyboard=True)
+    await message.answer("Enter the weekly credits awarded to the *1st Place (Gold)* spender:\n_(e.g. 50)_", reply_markup=cancel_kb, parse_mode="Markdown")
+    await state.set_state(EconomyStates.waiting_for_lb_gold)
+
+@dp.message(EconomyStates.waiting_for_lb_gold)
+async def econ_save_lb_gold(message: types.Message, state: FSMContext):
+    if message.text == "⬅️ BACK":
+        await state.clear()
+        return await message.answer(_econ_text(get_economy_settings_doc()), reply_markup=get_economy_menu_kb(), parse_mode="Markdown")
+    if not message.text or not message.text.strip().isdigit():
+        return await message.answer("❌ Please enter a valid whole number.")
+    pts = int(message.text.strip())
+    doc = get_economy_settings_doc()
+    lb = doc.get("leaderboard_rewards", [50, 40, 30])
+    lb[0] = pts
+    db["bot1_state_persistence"].update_one({"key": "economy_settings"}, {"$set": {"leaderboard_rewards": lb}}, upsert=True)
+    await state.clear()
+    await message.answer(f"✅ Gold Rank reward updated to *{pts} pts*\n\n" + _econ_text(get_economy_settings_doc()), reply_markup=get_economy_menu_kb(), parse_mode="Markdown")
+
+@dp.message(F.text == "✏️ EDIT LB SILVER")
+async def econ_edit_lb_silver(message: types.Message, state: FSMContext):
+    if message.from_user.id != MASTER_ADMIN_ID: return
+    cancel_kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="⬅️ BACK")]], resize_keyboard=True)
+    await message.answer("Enter the weekly credits awarded to the *2nd Place (Silver)* spender:\n_(e.g. 40)_", reply_markup=cancel_kb, parse_mode="Markdown")
+    await state.set_state(EconomyStates.waiting_for_lb_silver)
+
+@dp.message(EconomyStates.waiting_for_lb_silver)
+async def econ_save_lb_silver(message: types.Message, state: FSMContext):
+    if message.text == "⬅️ BACK":
+        await state.clear()
+        return await message.answer(_econ_text(get_economy_settings_doc()), reply_markup=get_economy_menu_kb(), parse_mode="Markdown")
+    if not message.text or not message.text.strip().isdigit():
+        return await message.answer("❌ Please enter a valid whole number.")
+    pts = int(message.text.strip())
+    doc = get_economy_settings_doc()
+    lb = doc.get("leaderboard_rewards", [50, 40, 30])
+    lb[1] = pts
+    db["bot1_state_persistence"].update_one({"key": "economy_settings"}, {"$set": {"leaderboard_rewards": lb}}, upsert=True)
+    await state.clear()
+    await message.answer(f"✅ Silver Rank reward updated to *{pts} pts*\n\n" + _econ_text(get_economy_settings_doc()), reply_markup=get_economy_menu_kb(), parse_mode="Markdown")
+
+@dp.message(F.text == "✏️ EDIT LB BRONZE")
+async def econ_edit_lb_bronze(message: types.Message, state: FSMContext):
+    if message.from_user.id != MASTER_ADMIN_ID: return
+    cancel_kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="⬅️ BACK")]], resize_keyboard=True)
+    await message.answer("Enter the weekly credits awarded to the *3rd Place (Bronze)* spender:\n_(e.g. 30)_", reply_markup=cancel_kb, parse_mode="Markdown")
+    await state.set_state(EconomyStates.waiting_for_lb_bronze)
+
+@dp.message(EconomyStates.waiting_for_lb_bronze)
+async def econ_save_lb_bronze(message: types.Message, state: FSMContext):
+    if message.text == "⬅️ BACK":
+        await state.clear()
+        return await message.answer(_econ_text(get_economy_settings_doc()), reply_markup=get_economy_menu_kb(), parse_mode="Markdown")
+    if not message.text or not message.text.strip().isdigit():
+        return await message.answer("❌ Please enter a valid whole number.")
+    pts = int(message.text.strip())
+    doc = get_economy_settings_doc()
+    lb = doc.get("leaderboard_rewards", [50, 40, 30])
+    lb[2] = pts
+    db["bot1_state_persistence"].update_one({"key": "economy_settings"}, {"$set": {"leaderboard_rewards": lb}}, upsert=True)
+    await state.clear()
+    await message.answer(f"✅ Bronze Rank reward updated to *{pts} pts*\n\n" + _econ_text(get_economy_settings_doc()), reply_markup=get_economy_menu_kb(), parse_mode="Markdown")
+
+
+
+# ── Edit Vault Join Bonus ───────────────────────────────────────────────────
+@dp.message(F.text == "✏️ EDIT JOIN BONUS")
+async def econ_edit_join_bonus(message: types.Message, state: FSMContext):
+    if message.from_user.id != MASTER_ADMIN_ID: return
+    cancel_kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="⬅️ BACK")]], resize_keyboard=True)
+    await message.answer(
+        "Enter the credits awarded to a user the *first time they join the Vault*:\n_(e.g. 30)_",
+        reply_markup=cancel_kb, parse_mode="Markdown"
+    )
+    await state.set_state(EconomyStates.waiting_for_join_bonus)
+
+
+@dp.message(EconomyStates.waiting_for_join_bonus)
+async def econ_save_join_bonus(message: types.Message, state: FSMContext):
+    if message.text == "⬅️ BACK":
+        await state.clear()
+        doc = get_economy_settings_doc()
+        return await message.answer(_econ_text(doc), reply_markup=get_economy_menu_kb(), parse_mode="Markdown")
+    if not message.text or not message.text.strip().isdigit():
+        return await message.answer("❌ Please enter a valid whole number (e.g. 30).")
+    pts = int(message.text.strip())
+    db["bot1_state_persistence"].update_one(
+        {"key": "economy_settings"}, {"$set": {"vault_join_bonus": pts}}, upsert=True
+    )
+    await state.clear()
+    doc = get_economy_settings_doc()
+    await message.answer(
+        f"✅ Vault Join Bonus updated to *{pts} pts*\n\n" + _econ_text(doc),
+        reply_markup=get_economy_menu_kb(), parse_mode="Markdown"
+    )
+async def _process_credit_broadcast(msg_text: str, pts: int):
+    try:
+        from aiogram import Bot
+        bot1_token = os.environ.get("BOT_1_TOKEN")
+        if not bot1_token:
+            logger.error("[BROADCAST] BOT_1_TOKEN not set in bot3 environment.")
+            return
+        
+        b1_bot = Bot(token=bot1_token)
+        
+        # 1. Fetch all verified vault users
+        users = list(db["bot1_user_verification"].find({"vault_joined": True}, {"user_id": 1}))
+        if not users:
+            await b1_bot.session.close()
+            return
+            
+        success = 0
+        failed = 0
+        col_credits = db["bot1_msa_credits"]
+        
+        for u in users:
+            uid = u["user_id"]
+            # 2. Add credits securely (upsert pattern handles old users perfectly)
+            col_credits.update_one(
+                {"user_id": uid},
+                {"$inc": {"balance": pts}, "$set": {"last_updated": now_local()}},
+                upsert=True
+            )
+            
+            # 3. Send message
+            try:
+                # _html_escape prevents crashing if user sends bad characters in the text
+                msg = f"{msg_text}\n\n🎁 <b>+{pts} MSA Credits</b> have been added to your balance!"
+                await b1_bot.send_message(chat_id=uid, text=msg, parse_mode="HTML")
+                success += 1
+            except Exception:
+                failed += 1
+                
+            await asyncio.sleep(0.05) # Rate limit safety
+            
+        await b1_bot.session.close()
+        logger.info(f"[BROADCAST CREDITS] Finished: {success} delivered, {failed} failed.")
+        
+        # Send confirmation to master admin
+        await bot.send_message(
+            MASTER_ADMIN_ID, 
+            f"✅ <b>BROADCAST COMPLETE</b>\n\n💰 <b>Credits:</b> +{pts}\n👥 <b>Success:</b> {success} users\n❌ <b>Failed:</b> {failed} users",
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logger.error(f"[BROADCAST CREDITS] Error: {e}")
+
+@dp.message(F.text == "👥 BROADCAST CREDITS (VAULT)")
+async def econ_bc_start(message: types.Message, state: FSMContext):
+    if not await check_authorization(message, "broadcast_credits"): return
+    
+    # Get active vault members count
+    vault_count = db["bot1_user_verification"].count_documents({"vault_joined": True})
+    
+    await state.set_state(EconomyStates.waiting_for_bc_msg)
+    await message.answer(
+        f"📣 **BROADCAST CREDITS  —  Step 1 / 2**\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"👥 **Active Vault Members:** `{vault_count}` users\n\n"
+        f"Enter the message you want to broadcast to these vault members.\n"
+        f"_(HTML format is supported)_\n\n"
+        f"Type ❌ CANCEL to abort.",
+        reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="❌ CANCEL")]], resize_keyboard=True),
+        parse_mode="Markdown"
+    )
+
+@dp.message(EconomyStates.waiting_for_bc_msg)
+async def econ_bc_msg(message: types.Message, state: FSMContext):
+    if message.text == "❌ CANCEL":
+        await state.clear()
+        return await message.answer(_econ_text(get_economy_settings_doc()), reply_markup=get_economy_menu_kb(), parse_mode="Markdown")
+    
+    await state.update_data(bc_msg=message.text)
+    await state.set_state(EconomyStates.waiting_for_bc_amt)
+    await message.answer(
+        "💰 **CREDIT AMOUNT  —  Step 2 / 2**\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "How many credits should be awarded to each user? (Enter a number)",
+        parse_mode="Markdown"
+    )
+
+@dp.message(EconomyStates.waiting_for_bc_amt)
+async def econ_bc_amt(message: types.Message, state: FSMContext):
+    if message.text == "❌ CANCEL":
+        await state.clear()
+        return await message.answer(_econ_text(get_economy_settings_doc()), reply_markup=get_economy_menu_kb(), parse_mode="Markdown")
+        
+    if not message.text or not message.text.strip().isdigit():
+        return await message.answer("❌ Please enter a valid positive number.")
+        
+    pts = int(message.text.strip())
+    data = await state.get_data()
+    msg_text = data.get("bc_msg", "")
+    
+    await state.update_data(bc_amt=pts)
+    await state.set_state(EconomyStates.confirm_bc)
+    
+    preview = f"{msg_text}\n\n🎁 <b>+{pts} MSA Credits</b> have been added to your balance!"
+    
+    kb = ReplyKeyboardMarkup(keyboard=[
+        [KeyboardButton(text="✅ CONFIRM BROADCAST")], 
+        [KeyboardButton(text="❌ CANCEL")]
+    ], resize_keyboard=True)
+    
+    await message.answer(
+        f"<b>PREVIEW OF MESSAGE:</b>\n\n{preview}\n\nDo you want to send this to ALL verified Vault users and give them <b>{pts} credits</b>?",
+        reply_markup=kb,
+        parse_mode="HTML"
+    )
+
+@dp.message(EconomyStates.confirm_bc)
+async def econ_bc_confirm(message: types.Message, state: FSMContext):
+    if message.text == "❌ CANCEL":
+        await state.clear()
+        return await message.answer("Broadcast cancelled.", reply_markup=get_economy_menu_kb())
+        
+    if message.text == "✅ CONFIRM BROADCAST":
+        data = await state.get_data()
+        pts = data.get("bc_amt", 0)
+        msg_text = data.get("bc_msg", "")
+        
+        await message.answer("🚀 Broadcast started! This runs securely in the background.", reply_markup=get_economy_menu_kb())
+        await state.clear()
+        
+        asyncio.create_task(_process_credit_broadcast(msg_text, pts))
+
+
 @dp.message()
 async def debug_catch_all(message: types.Message):
     # Apply authorization check
@@ -11248,7 +13041,19 @@ async def main():
         else:
             print("ℹ️ No previous state found (fresh start)")
 
-    print("\n🔑 Verifying MSA code integrity...")
+    # ── Auto-detect bot username if not set in env ────────────────────────────────
+    global BOT_USERNAME
+    if not BOT_USERNAME:
+        try:
+            _me = await bot.get_me()
+            BOT_USERNAME = _me.username or ""
+            print(f"  \U0001f916 Bot username auto-detected: @{BOT_USERNAME}")
+        except Exception as _gu_err:
+            print(f"  \u26a0\ufe0f Could not auto-detect bot username: {_gu_err}")
+    else:
+        print(f"  \u2705 Bot username from env: @{BOT_USERNAME}")
+
+    print("\n\U0001f511 Verifying MSA code integrity...")
     try:
         repaired_count = await asyncio.to_thread(repair_missing_duplicate_msa_codes)
         await asyncio.to_thread(ensure_unique_msa_code_index)
@@ -11280,7 +13085,7 @@ async def main():
             weekly_backup_scheduler(
                 bot_instance=bot,
                 bot_name="bot3",
-                owner_id=OWNER_ID,
+                owner_id=MASTER_ADMIN_ID,  # Bot3 uses MASTER_ADMIN_ID; OWNER_ID is 0
                 mongo_uri=MONGO_URI,
                 db_name=MONGO_DB_NAME,
                 backup_mongo_uri=_backup_uri,
@@ -11288,14 +13093,14 @@ async def main():
             ),
             name="weekly_backup_bot3"
         )
-        print("  ✅ Weekly backup → Backup Cluster (every Sunday 23:59 UTC, TTL 90 days)")
+        print("  ✅ Weekly backup → Backup Cluster (daily 23:59 UTC, month-end → GDrive, TTL 90 days)")
 
     if monthly_export_scheduler:
         asyncio.create_task(
             monthly_export_scheduler(
                 bot_instance=bot,
                 bot_name="bot3",
-                owner_id=OWNER_ID,
+                owner_id=MASTER_ADMIN_ID,  # Bot3 uses MASTER_ADMIN_ID
                 mongo_uri=MONGO_URI,
                 db_name=MONGO_DB_NAME,
                 backup_mongo_uri=_backup_uri,
@@ -11303,7 +13108,7 @@ async def main():
             ),
             name="monthly_export_bot3"
         )
-        print("  ✅ Monthly export → ZIP to owner (last day of month 23:59 UTC)")
+        print("  ✅ Monthly export → GDrive (triggered by weekly_backup_scheduler on last day of month)")
 
     # ⚠️ DEPRECATED: Old monthly backup (auto_backup_task) is disabled and replaced
     # Startup backup check disabled — auto-backup runs on schedule (1st of month at 2 AM)
@@ -11537,3 +13342,4 @@ if __name__ == "__main__":
         traceback.print_exc()
         print("\n📝 Check bot3_errors.log for details")
         sys.exit(1)
+
