@@ -1329,7 +1329,6 @@ async def retry_operation(operation, max_retries=3, base_delay=1.0, operation_na
     # If we get here, all retries failed
     raise last_exception
 
-
 BOT_TOKEN = os.getenv("BOT_2_TOKEN")
 BOT_1_TOKEN = os.getenv("BOT_1_TOKEN")  # Bot 1 for delivery
 MASTER_ADMIN_ID = int(os.getenv("MASTER_ADMIN_ID", "0"))
@@ -5782,12 +5781,30 @@ async def process_find_search(message: types.Message, state: FSMContext):
             f"🆔 **MSA Allocated:** {assigned_at_str}\n"
             f"⏰ **Last Active:** {last_start_str}\n"
             f"🕐 **Member Since:** {time_since}\n\n"
+        )
 
+        credit_doc = db['bot1_msa_credits'].find_one({'user_id': user_id}) if user_id else None
+        credits_total = credit_doc.get('balance', 0) if credit_doc else 0
+        credits_breakdown = ""
+        if credit_doc and credit_doc.get("ledger"):
+            src_totals = {}
+            for entry in credit_doc["ledger"]:
+                pts = entry.get("pts", 0)
+                reason = entry.get("reason", "Unknown").replace("—", "-").strip()
+                if pts > 0:
+                    src_totals[reason] = src_totals.get(reason, 0) + pts
+            if src_totals:
+                credits_breakdown = "".join([f"\n   └─ {k}: +{v}" for k, v in src_totals.items()])
+
+        profile += (
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
             f"📊 **ACCOUNT DETAILS**\n\n"
 
             f"🎫 **Support Tickets:** {ticket_total} total ({ticket_open} open)\n"
             f"⏸️ **Suspended Features:** {len(susp_list) if susp_list else 0}\n"
+            f"👥 **Referrals:** {col_referrals.count_documents({'referrer_id': user_id}) if user_id else 0}\n"
+            f"💳 **Credits:** {credits_total}{credits_breakdown}\n"
+            f"⭐ **Review:** {str(col_reviews.find_one({'user_id': user_id})['stars']) + '⭐' if user_id and col_reviews.find_one({'user_id': user_id}) else 'None'}\n"
         )
 
         # List suspended features if any
@@ -6931,7 +6948,7 @@ async def diagnosis_menu(message: types.Message):
     
     keyboard = ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="📱 BOT 1 DIAGNOSIS"), KeyboardButton(text="🎛️ BOT 2 DIAGNOSIS")],
+            [KeyboardButton(text="🩺 BOT 1 DIAGNOSIS"), KeyboardButton(text="🩺 BOT 2 DIAGNOSIS")],
             [KeyboardButton(text="⬅️ MAIN MENU")]
         ],
         resize_keyboard=True
@@ -6945,7 +6962,7 @@ async def diagnosis_menu(message: types.Message):
         parse_mode="Markdown"
     )
 
-@dp.message(F.text == "📱 BOT 1 DIAGNOSIS")
+@dp.message(F.text == "🩺 BOT 1 DIAGNOSIS")
 async def bot1_diagnosis(message: types.Message):
     """Run comprehensive diagnosis on Bot 1 system"""
     if not await has_permission(message.from_user.id, "diagnosis"):
@@ -7029,7 +7046,7 @@ async def bot1_diagnosis(message: types.Message):
     try:
         # Exclude retired MSA IDs (from RESET USER DATA) so health check reflects real active users
         total_users = col_msa_ids.count_documents({"retired": {"$ne": True}})
-        pending_vers = col_user_verification.count_documents({})
+        pending_vers = col_user_verification.count_documents({"vault_joined": {"$ne": True}})
         banned_users = col_banned_users.count_documents({})
         suspended_users = col_suspended_features.count_documents({})
         
@@ -7266,7 +7283,7 @@ async def bot1_diagnosis(message: types.Message):
 
     await status_msg.edit_text(report, parse_mode="Markdown")
 
-@dp.message(F.text == "🎛️ BOT 2 DIAGNOSIS")
+@dp.message(F.text == "🩺 BOT 2 DIAGNOSIS")
 async def bot2_diagnosis(message: types.Message):
     """Run comprehensive diagnosis on Bot 2 admin system"""
     if not await has_permission(message.from_user.id, "diagnosis"):
@@ -8971,11 +8988,12 @@ def _build_suspend_keyboard(selected: list) -> ReplyKeyboardMarkup:
 
     return ReplyKeyboardMarkup(
         keyboard=[
-            [_lbl("SEARCH_CODE", "🔍", "SEARCH CODE"), _lbl("DASHBOARD", "📊", "DASHBOARD")],
+            [_lbl("DASHBOARD", "📊", "DASHBOARD"), _lbl("REFERRAL", "🤝", "REFERRAL")],
+            [_lbl("REWARD_STORE", "🛍️", "REWARD STORE"), _lbl("SEARCH_CODE", "🔍", "SEARCH CODE")],
+            [_lbl("GUIDE", "📖", "GUIDE"), _lbl("RATE_AGENT", "⭐", "RATE AGENT")],
             [_lbl("TUTORIAL", "📺", "WATCH TUTORIAL"), _lbl("RULES", "📜", "RULES")],
-            [_lbl("GUIDE", "📖", "GUIDE"), KeyboardButton(text="📎 SELECT ALL")],
-            [KeyboardButton(text="🚫 DESELECT ALL"), KeyboardButton(text="✅ DONE")],
-            [KeyboardButton(text="❌ CANCEL")],
+            [KeyboardButton(text="📎 SELECT ALL"), KeyboardButton(text="🚫 DESELECT ALL")],
+            [KeyboardButton(text="✅ DONE"), KeyboardButton(text="❌ CANCEL")],
         ],
         resize_keyboard=True,
     )
@@ -8991,6 +9009,8 @@ _FEATURE_MAP = {
     "RULES":          "RULES",
     "GUIDE":          "GUIDE",
     "RATE AGENT":     "RATE_AGENT",
+    "REWARD STORE":   "REWARD_STORE",
+    "REFERRAL":       "REFERRAL",
 }
 
 def _resolve_feature(text: str):
@@ -9063,9 +9083,12 @@ async def process_suspend_features(message: types.Message, state: FSMContext):
                 restr_btns = []
                 for feat, lbl in [
                     ("DASHBOARD",   "📊 DASHBOARD"),
+                    ("REFERRAL",    "🤝 REFERRAL"),
+                    ("REWARD_STORE","🛍️ REWARD STORE"),
                     ("SEARCH_CODE", "🔍 SEARCH CODE"),
-                    ("TUTORIAL",    "📺 WATCH TUTORIAL"),
                     ("GUIDE",       "📖 AGENT GUIDE"),
+                    ("RATE_AGENT",  "⭐ RATE AGENT"),
+                    ("TUTORIAL",    "📺 WATCH TUTORIAL"),
                     ("RULES",       "📜 RULES"),
                 ]:
                     if feat not in selected:
@@ -9098,7 +9121,7 @@ async def process_suspend_features(message: types.Message, state: FSMContext):
 
     # ── SELECT ALL ──────────────────────────────────────────────────
     if "SELECT ALL" in txt:
-        selected = ["SEARCH_CODE", "DASHBOARD", "TUTORIAL", "RULES", "GUIDE"]
+        selected = ["SEARCH_CODE", "DASHBOARD", "TUTORIAL", "RULES", "GUIDE", "RATE_AGENT", "REWARD_STORE", "REFERRAL"]
         await state.update_data(suspended_features=selected)
         feature_lines = "\n".join([f"  ✅ {f.replace('_', ' ')}" for f in selected])
         await message.answer(
@@ -9359,6 +9382,19 @@ async def process_shoot_search(message: types.Message, state: FSMContext):
         last_start_str = last_start.strftime("%b %d, %Y at %I:%M:%S %p") if hasattr(last_start, 'strftime') else str(last_start) if last_start else "N/A"
         
         # Build detailed report
+        credit_doc = db['bot1_msa_credits'].find_one({'user_id': user_id}) if user_id else None
+        credits_total = credit_doc.get('balance', 0) if credit_doc else 0
+        credits_breakdown = ""
+        if credit_doc and credit_doc.get("ledger"):
+            src_totals = {}
+            for entry in credit_doc["ledger"]:
+                pts = entry.get("pts", 0)
+                reason = entry.get("reason", "Unknown").replace("—", "-").strip()
+                if pts > 0:
+                    src_totals[reason] = src_totals.get(reason, 0) + pts
+            if src_totals:
+                credits_breakdown = "".join([f"\n   └─ {k}: +{v}" for k, v in src_totals.items()])
+
         report = (
             f"🔍 **DETAILED USER REPORT**\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -9373,7 +9409,10 @@ async def process_shoot_search(message: types.Message, state: FSMContext):
             f"📊 **STATUS**\n"
             f"🔒 Account: {ban_status}\n"
             f"⏸️ Suspended Features: {suspend_count}\n"
-            f"🎫 Support Tickets: {ticket_count} ({open_tickets} open)\n\n"
+            f"🎫 Support Tickets: {ticket_count} ({open_tickets} open)\n"
+            f"👥 Referrals: {col_referrals.count_documents({'referrer_id': user_id}) if user_id else 0}\n"
+            f"💳 Credits: {credits_total}{credits_breakdown}\n"
+            f"⭐ Review: {str(col_reviews.find_one({'user_id': user_id})['stars']) + '⭐' if user_id and col_reviews.find_one({'user_id': user_id}) else 'None'}\n\n"
             
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
             f"📍 **ACTIVITY**\n"
