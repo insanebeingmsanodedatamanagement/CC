@@ -34,6 +34,7 @@ import html as _html
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
 
+
 # ==========================================
 # ENTERPRISE CONFIGURATION
 # ==========================================
