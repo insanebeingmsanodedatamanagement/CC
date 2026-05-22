@@ -47,8 +47,6 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter, TelegramNetworkError, TelegramUnauthorizedError
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
-
-
 # ==========================================
 # ⚡ CONFIGURATION  — all values from env vars
 # ==========================================
@@ -591,11 +589,7 @@ def get_vault_member_count() -> int:
         return _vault_count_cache.get("count", 0)
 
 
-# ── Rating social proof: live average of 4★ & 5★ reviews only ────────────────
-# Baseline: 16 members · 4.8/5.0. 
-# Real data is seamlessly added to this baseline for an authentic dynamic score.
-_RATING_BASE_COUNT = 16
-_RATING_BASE_STARS = 16 * 4.8  # 76.8 stars
+# ── Rating social proof: live average ────────────────
 _rating_cache: dict = {"text": "", "fetched_at": 0.0}
 _RATING_CACHE_TTL = 1800  # 30-min cache — reviews don't change that often
 
@@ -603,17 +597,13 @@ def _get_rating_social_proof() -> str:
     """
     Returns a compact social-proof line like:
       ⭐ 4.8/5.0 · 18 members rated us
-    Uses only 4★ and 5★ reviews (no 1-3 star reviews count toward the score).
-    Merges real reviews with a base of 16 ratings at 4.8.
     Cached for 30 minutes to avoid per-message DB hits.
     """
     try:
         import time as _t
         now_ts = _t.time()
         if now_ts - _rating_cache["fetched_at"] > _RATING_CACHE_TTL:
-            # Only count high-quality reviews (4 & 5 stars)
             pipeline = [
-                {"$match": {"stars": {"$gte": 4}}},
                 {"$group": {
                     "_id": None,
                     "count": {"$sum": 1},
@@ -622,31 +612,20 @@ def _get_rating_social_proof() -> str:
             ]
             result = list(col_reviews.aggregate(pipeline))
             
-            real_count = 0
-            real_total = 0
             if result and result[0]["count"] >= 1:
-                real_count = result[0]["count"]
-                real_total = result[0]["total"]
-                
-            # Merge baseline and real reviews
-            total_count = _RATING_BASE_COUNT + real_count
-            total_stars = _RATING_BASE_STARS + real_total
+                total_count = result[0]["count"]
+                total_stars = result[0]["total"]
+                raw_avg = total_stars / total_count
+                display_avg = round(raw_avg, 1)
+                _rating_cache["text"] = f"⭐ *{display_avg:.1f}/5.0* · {total_count} members rated us"
+            else:
+                _rating_cache["text"] = "⭐ *5.0/5.0* · 0 members rated us"
             
-            raw_avg = total_stars / total_count
-            display_avg = round(raw_avg, 1)
-            
-            # Keep within authentic bounds (4.6 to 4.9)
-            if display_avg >= 5.0:
-                display_avg = 4.9
-            elif display_avg < 4.6:
-                display_avg = 4.6
-                
-            _rating_cache["text"] = f"⭐ *{display_avg:.1f}/5.0* · {total_count} members rated us"
             _rating_cache["fetched_at"] = now_ts
             
         return _rating_cache["text"]
     except Exception:
-        return f"⭐ *4.8/5.0* · {_RATING_BASE_COUNT} members rated us"
+        return "⭐ *5.0/5.0* · 0 members rated us"
 
 
 # ── Idea 2: Content streak — stamp access time on every delivery ───────────────
@@ -3445,15 +3424,15 @@ def get_user_msa_id(user_id: int) -> str | None:
 def get_verification_keyboard(user_id: int, user_data: dict, show_all: bool = True) -> InlineKeyboardMarkup:
     """Create inline keyboard - All 3 are URL buttons, no callbacks"""
     if show_all:
-        # For NEW users - show all buttons (all caps, without IG)
+        # For NEW users - show all buttons
         keyboard = [
-            [InlineKeyboardButton(text="📺 YOUTUBE — JOIN NOW", url=YOUTUBE_LINK)],
-            [InlineKeyboardButton(text="💎 MSA NODE VAULT — JOIN NOW", url=CHANNEL_LINK)]
+            [InlineKeyboardButton(text="📺 JOIN YT AND UNLOCK LINK", url=YOUTUBE_LINK)],
+            [InlineKeyboardButton(text="💎 JOIN VAULT AND UNLOCK LINK", url=CHANNEL_LINK)]
         ]
     else:
-        # For OLD users who left - show ONLY rejoin button (all caps)
+        # For OLD users who left - show ONLY rejoin button
         keyboard = [
-            [InlineKeyboardButton(text="💎 MSA NODE VAULT — REJOIN NOW", url=CHANNEL_LINK)]
+            [InlineKeyboardButton(text="💎 JOIN VAULT AND UNLOCK LINK", url=CHANNEL_LINK)]
         ]
     
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
@@ -3579,28 +3558,32 @@ def get_user_menu(user_id: int):
         
         # Build flat list of available buttons in professional logical order
         avail = []
+        user_rec = col_user_verification.find_one({"user_id": user_id}, {"vault_joined": 1})
+        is_vault = user_rec and user_rec.get("vault_joined")
+        
         if "DASHBOARD" not in suspended:
             avail.append("📊 DASHBOARD")
             
-        # Referral — always show for vault members even if other features suspended
-        user_rec = col_user_verification.find_one({"user_id": user_id}, {"vault_joined": 1})
-        if user_rec and user_rec.get("vault_joined"):
+        if is_vault and "REFERRAL" not in suspended:
             avail.append("🤝 REFERRAL")
             
-        if "GUIDE" not in suspended:
-            avail.append("📖 AGENT GUIDE")
+        if is_vault and "REWARD_STORE" not in suspended:
+            avail.append("🛍️ REWARD STORE")
             
         if "SEARCH_CODE" not in suspended:
             avail.append("🔍 SEARCH CODE")
             
-        if user_rec and user_rec.get("vault_joined") and "RATE_AGENT" not in suspended:
-            avail.append("⭐ RATE AGENT")
+        if "GUIDE" not in suspended:
+            avail.append("📖 AGENT GUIDE")
             
-        if "RULES" not in suspended:
-            avail.append("📜 RULES")
+        if is_vault and "RATE_AGENT" not in suspended:
+            avail.append("⭐ RATE AGENT")
             
         if "TUTORIAL" not in suspended:
             avail.append("📺 WATCH TUTORIAL")
+            
+        if "RULES" not in suspended:
+            avail.append("📜 RULES")
         
         # Always show SUPPORT
         avail.append("📞 SUPPORT")
@@ -4201,6 +4184,16 @@ async def handle_msa_credits(message: types.Message, state: FSMContext):
     uid = message.from_user.id
     logger.info(f"[REWARD STORE] Handler triggered for user {uid}")
     if not await _require_vault(message): return  # 🔒 Vault guard
+    
+    # Check suspended features
+    suspend_doc = col_suspended_features.find_one({"user_id": uid})
+    if suspend_doc and "REWARD_STORE" in suspend_doc.get("bot1_suspended_features", []):
+        await message.answer(
+            "⚠️ **FEATURE SUSPENDED**\n\nReward Store access has been suspended for your account.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
     if _is_processing(uid):
         await message.answer("⏳")
         return
@@ -4822,6 +4815,15 @@ async def rate_agent_handler(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
     logger.info(f"[RATE_AGENT] Button pressed by user {user_id}")
     if not await _require_vault(message): return  # 🔒 Vault guard
+
+    # Check suspended features
+    suspend_doc = col_suspended_features.find_one({"user_id": user_id})
+    if suspend_doc and "RATE_AGENT" in suspend_doc.get("bot1_suspended_features", []):
+        await message.answer(
+            "⚠️ **FEATURE SUSPENDED**\n\nRate Agent access has been suspended for your account.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
 
     if await check_maintenance_mode(message):
         return
@@ -5545,6 +5547,16 @@ async def referral_handler(message: types.Message):
     """Shows referral link, live confirmed/pending tracking, and reward info."""
     user_id = message.from_user.id
     if not await _require_vault(message): return  # 🔒 Vault guard
+    
+    # Check suspended features
+    suspend_doc = col_suspended_features.find_one({"user_id": user_id})
+    if suspend_doc and "REFERRAL" in suspend_doc.get("bot1_suspended_features", []):
+        await message.answer(
+            "⚠️ **FEATURE SUSPENDED**\n\nReferral access has been suspended for your account.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
     if await check_maintenance_mode(message):
         return
 
@@ -6823,28 +6835,19 @@ async def cmd_start(message: types.Message, state: FSMContext):
             join_text = f"""
 ✨ **{user_name}, The System Awaits.**
 
-You have just activated the **MSA NODE Agent V2**. This isn't just a bot — it's your personal gateway to elite-level automation, blueprints, and strategies.
+You've triggered the **MSA NODE Agent V2**. 
+Your requested files, premium blueprints, and AI tools are secured and ready for extraction.
 
 ━━━━━━━━━━━━━━━━━━━━
 
-🌟 **UNLOCK THE FULL ARSENAL FOR FREE:**
+🔒 **STATUS: ACCESS RESTRICTED**
+_You must be an exclusive member to bypass the firewall._
 
-📂 **Unlimited Blueprints**: Instant delivery of all premium guides.
-🤖 **Powerful AI Tools**: Access secret automation scripts.
-🛍️ **Full Agent Power**: Search codes, dash, and priority updates.
+**🔑 UNLOCK FULL ACCESS INSTANTLY:**
+Tap **💎 JOIN VAULT AND UNLOCK LINK** below. 
+It's 100% free, instant, and permanent.
 
-━━━━━━━━━━━━━━━━━━━━
-
-**🔑 How to Get Instant Access:**
-
-1️⃣ Follow us on **YouTube** for the latest MSA Codes.
-2️⃣ Tap **💎 JOIN MSA VAULT** below to enter our exclusive circle.
-3️⃣ Return here → Your agent will automatically unlock all features.
-
-━━━━━━━━━━━━━━━━━━━━
-
-🚀 **Your integration starts now.**
-*Join the Vault to turn on full agent power.*
+🚀 *Join the Vault, return here, and your agent will automatically deliver your items.*
 """
             verification_msg = await msg.edit_text(
                 join_text,
