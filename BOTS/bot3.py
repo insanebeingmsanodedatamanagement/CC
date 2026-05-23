@@ -34,7 +34,6 @@ import html as _html
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
 
-
 # ==========================================
 # ENTERPRISE CONFIGURATION
 # ==========================================
@@ -3612,7 +3611,7 @@ def get_main_menu(user_id: int):
             [KeyboardButton(text="📊 ANALYTICS"), KeyboardButton(text="🩺 DIAGNOSIS")],
             [KeyboardButton(text="🖥️ TERMINAL"), KeyboardButton(text="💾 BACKUP DATA")],
             [KeyboardButton(text="👥 ADMINS"), KeyboardButton(text="⚠️ RESET BOT DATA")],
-            [KeyboardButton(text="⚙️ ECONOMY SETTINGS"), KeyboardButton(text="📚 BOT GUIDE")]
+            [KeyboardButton(text="💳 CREDIT MANAGEMENT"), KeyboardButton(text="📚 BOT GUIDE")]
         ]
         return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
 
@@ -12434,7 +12433,7 @@ async def tutorial_pk_list(message: types.Message, state: FSMContext):
 
 _PDF_EXCLUDED_BUTTONS = {
     # ── Main menu ─────────────────────────────────────────────────────────────
-    "⚙️ ECONOMY SETTINGS", "📚 BOT GUIDE", "📋 LIST", "➕ ADD",
+    "💳 CREDIT MANAGEMENT", "📚 BOT GUIDE", "📋 LIST", "➕ ADD",
     "🔍 SEARCH", "🔗 LINKS", "📊 ANALYTICS", "🩺 DIAGNOSIS",
     "🖥️ TERMINAL", "💾 BACKUP DATA", "👥 ADMINS", "⚠️ RESET BOT DATA",
     # ── Economy menu ──────────────────────────────────────────────────────────
@@ -12559,6 +12558,10 @@ class EconomyStates(StatesGroup):
     waiting_for_bc_msg     = State()
     waiting_for_bc_amt     = State()
     confirm_bc             = State()
+    waiting_for_info_id    = State()
+    waiting_for_target_id  = State()
+    waiting_for_target_action_amt = State()
+    waiting_for_target_amount_input = State()
 
 
 def get_economy_settings_doc():
@@ -12574,6 +12577,7 @@ def get_economy_settings_doc():
 def get_economy_menu_kb():
     keyboard = [
         [KeyboardButton(text="👥 BROADCAST CREDITS (VAULT)")],
+        [KeyboardButton(text="ℹ️ INFO USER"), KeyboardButton(text="🎯 TARGET SPECIFIC USER")],
         [KeyboardButton(text="✏️ EDIT REFERRAL PTS (REFERRER)")],
         [KeyboardButton(text="✏️ EDIT BONUS PTS (NEW USER)")],
         [KeyboardButton(text="✏️ EDIT IGCC PTS (BOUNTY)")],
@@ -12587,7 +12591,7 @@ def get_economy_menu_kb():
 def _econ_text(doc):
     lb_rewards = doc.get("leaderboard_rewards", [50, 40, 30])
     return (
-        "⚙️ *MSA ECONOMY SETTINGS*\n\n"
+        "💳 *MSA CREDIT MANAGEMENT*\n\n"
         f"🔸 *Referral Bonus (Referrer):* `{doc.get('referral_pts', 25)} pts`\n"
         f"🔸 *Referred Bonus (New User):* `{doc.get('referred_bonus', 20)} pts`\n"
         f"🔸 *IGCC Default Bounty:*        `{doc.get('igcc_default', 25)} pts`\n\n"
@@ -12598,7 +12602,7 @@ def _econ_text(doc):
     )
 
 
-@dp.message(F.text == "⚙️ ECONOMY SETTINGS")
+@dp.message(F.text == "💳 CREDIT MANAGEMENT")
 async def economy_menu(message: types.Message, state: FSMContext):
     if message.from_user.id != MASTER_ADMIN_ID:
         return await message.answer("❌ Master Admin only.")
@@ -12934,6 +12938,191 @@ async def econ_bc_confirm(message: types.Message, state: FSMContext):
         
         asyncio.create_task(_process_credit_broadcast(msg_text, pts))
 
+
+@dp.message(F.text == "ℹ️ INFO USER")
+async def econ_info_user_start(message: types.Message, state: FSMContext):
+    if not await check_authorization(message, "info_user"): return
+    await state.set_state(EconomyStates.waiting_for_info_id)
+    await message.answer(
+        "ℹ️ **USER INFO**\n\n"
+        "Enter the User ID or MSA ID of the user you want to check:\n"
+        "Type ❌ CANCEL to abort.",
+        reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="❌ CANCEL")]], resize_keyboard=True),
+        parse_mode="Markdown"
+    )
+
+@dp.message(EconomyStates.waiting_for_info_id)
+async def econ_info_user_id(message: types.Message, state: FSMContext):
+    if message.text == "❌ CANCEL":
+        await state.clear()
+        return await message.answer(_econ_text(get_economy_settings_doc()), reply_markup=get_economy_menu_kb(), parse_mode="Markdown")
+    
+    uid_str = message.text.strip().upper()
+    if uid_str.startswith("MSA"):
+        msa_doc = db["bot1_msa_ids"].find_one({"msa_id": uid_str})
+        if not msa_doc:
+            return await message.answer(f"❌ MSA ID `{uid_str}` not found.")
+        uid = msa_doc["user_id"]
+        msa_id = uid_str
+    else:
+        if not uid_str.isdigit():
+            return await message.answer("❌ Please enter a valid numerical User ID or MSA ID.")
+        uid = int(uid_str)
+        msa_doc = db["bot1_msa_ids"].find_one({"user_id": uid})
+        msa_id = msa_doc["msa_id"] if msa_doc else "Unknown"
+    
+    user_doc = db["bot1_user_verification"].find_one({"user_id": uid})
+    if not user_doc:
+        return await message.answer(f"❌ User `{uid}` not found in the vault.", parse_mode="Markdown")
+    
+    credits_doc = db["bot1_msa_credits"].find_one({"user_id": uid})
+    curr_credits = credits_doc.get("balance", 0) if credits_doc else 0
+    
+    ledger = credits_doc.get("ledger", []) if credits_doc else []
+    
+    source_totals = {}
+    total_earned = 0
+    for entry in ledger:
+        pts = entry.get("pts", 0)
+        reason = entry.get("reason", "Unknown").strip()
+        if pts > 0:
+            total_earned += pts
+            source_totals[reason] = source_totals.get(reason, 0) + pts
+            
+    source_text = "\n".join([f"  • {reason}: `{pts}` pts" for reason, pts in source_totals.items()])
+    if not source_text:
+        source_text = "  • _No earnings recorded_"
+        
+    purchased = credits_doc.get("purchased_items", []) if credits_doc else []
+    
+    await state.clear()
+    await message.answer(
+        f"ℹ️ **USER CREDIT INFO**\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"👤 **Name:** `{user_doc.get('first_name', 'Unknown')}`\n"
+        f"🆔 **User ID:** `{uid}`\n"
+        f"🏷️ **MSA ID:** `{msa_id}`\n\n"
+        f"💰 **Current Balance:** `{curr_credits}` pts\n"
+        f"📈 **Total Earned:** `{total_earned}` pts\n\n"
+        f"**Earnings Breakdown:**\n"
+        f"{source_text}\n\n"
+        f"🛒 **Purchased Items:** `{len(purchased)}` items\n",
+        reply_markup=get_economy_menu_kb(),
+        parse_mode="Markdown"
+    )
+
+@dp.message(F.text == "🎯 TARGET SPECIFIC USER")
+async def econ_target_user_start(message: types.Message, state: FSMContext):
+    if not await check_authorization(message, "target_user"): return
+    await state.set_state(EconomyStates.waiting_for_target_id)
+    await message.answer(
+        "🎯 **TARGET SPECIFIC USER**\n\n"
+        "Enter the User ID or MSA ID of the user you want to manage:\n"
+        "Type ❌ CANCEL to abort.",
+        reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="❌ CANCEL")]], resize_keyboard=True),
+        parse_mode="Markdown"
+    )
+
+@dp.message(EconomyStates.waiting_for_target_id)
+async def econ_target_user_id(message: types.Message, state: FSMContext):
+    if message.text == "❌ CANCEL":
+        await state.clear()
+        return await message.answer(_econ_text(get_economy_settings_doc()), reply_markup=get_economy_menu_kb(), parse_mode="Markdown")
+    
+    uid_str = message.text.strip().upper()
+    if uid_str.startswith("MSA"):
+        msa_doc = db["bot1_msa_ids"].find_one({"msa_id": uid_str})
+        if not msa_doc:
+            return await message.answer(f"❌ MSA ID `{uid_str}` not found.")
+        uid = msa_doc["user_id"]
+    else:
+        if not uid_str.isdigit():
+            return await message.answer("❌ Please enter a valid numerical User ID or MSA ID.")
+        uid = int(uid_str)
+    
+    user_doc = db["bot1_user_verification"].find_one({"user_id": uid})
+    if not user_doc:
+        return await message.answer(f"❌ User `{uid}` not found in the vault.", parse_mode="Markdown")
+    
+    credits_doc = db["bot1_msa_credits"].find_one({"user_id": uid})
+    curr_credits = credits_doc.get("balance", 0) if credits_doc else 0
+    
+    await state.update_data(target_uid=uid, curr_credits=curr_credits)
+    await state.set_state(EconomyStates.waiting_for_target_action_amt)
+    
+    kb = ReplyKeyboardMarkup(keyboard=[
+        [KeyboardButton(text="➕ ADD CREDITS"), KeyboardButton(text="➖ CUT CREDITS")],
+        [KeyboardButton(text="✂️ SET CREDITS EXACTLY")],
+        [KeyboardButton(text="⬅️ BACK TO ECONOMY")]
+    ], resize_keyboard=True)
+    
+    await message.answer(
+        f"👤 **USER TARGETED**\n"
+        f"Name: `{user_doc.get('first_name', 'Unknown')}`\n"
+        f"ID: `{uid}`\n"
+        f"Current Credits: `{curr_credits}`\n\n"
+        "Select an action to perform, or tap a button to proceed:",
+        reply_markup=kb,
+        parse_mode="Markdown"
+    )
+
+@dp.message(EconomyStates.waiting_for_target_action_amt)
+async def econ_target_action_select(message: types.Message, state: FSMContext):
+    text = message.text
+    if text == "⬅️ BACK TO ECONOMY":
+        await state.clear()
+        return await message.answer(_econ_text(get_economy_settings_doc()), reply_markup=get_economy_menu_kb(), parse_mode="Markdown")
+    
+    data = await state.get_data()
+    uid = data["target_uid"]
+    
+    if text in ["➕ ADD CREDITS", "➖ CUT CREDITS", "✂️ SET CREDITS EXACTLY"]:
+        await state.update_data(action_type=text)
+        await state.set_state(EconomyStates.waiting_for_target_amount_input)
+        
+        await message.answer(
+            f"Enter the amount for **{text}**:\n"
+            "Type ❌ CANCEL to abort.",
+            reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="❌ CANCEL")]], resize_keyboard=True),
+            parse_mode="Markdown"
+        )
+    else:
+        await message.answer("⚠️ Please select an action from the menu.")
+
+@dp.message(EconomyStates.waiting_for_target_amount_input)
+async def econ_target_action_amt(message: types.Message, state: FSMContext):
+    if message.text == "❌ CANCEL":
+        await state.clear()
+        return await message.answer(_econ_text(get_economy_settings_doc()), reply_markup=get_economy_menu_kb(), parse_mode="Markdown")
+        
+    amt = message.text.strip()
+    if not amt.lstrip('-').isdigit():
+        return await message.answer("❌ Please enter a valid number.")
+    amt = int(amt)
+    
+    data = await state.get_data()
+    uid = data["target_uid"]
+    action_type = data["action_type"]
+    
+    if action_type == "➕ ADD CREDITS":
+        db["bot1_msa_credits"].update_one({"user_id": uid}, {"$inc": {"balance": amt}, "$set": {"last_updated": datetime.now()}}, upsert=True)
+    elif action_type == "➖ CUT CREDITS":
+        db["bot1_msa_credits"].update_one({"user_id": uid}, {"$inc": {"balance": -amt}, "$set": {"last_updated": datetime.now()}}, upsert=True)
+    elif action_type == "✂️ SET CREDITS EXACTLY":
+        db["bot1_msa_credits"].update_one({"user_id": uid}, {"$set": {"balance": amt, "last_updated": datetime.now()}}, upsert=True)
+        
+    new_doc = db["bot1_msa_credits"].find_one({"user_id": uid})
+    new_bal = new_doc.get("balance", 0) if new_doc else 0
+    
+    await state.clear()
+    await message.answer(
+        f"✅ **USER CREDITS UPDATED**\n\n"
+        f"User ID: `{uid}`\n"
+        f"Action: `{action_type}` (Amt: {amt})\n"
+        f"New Balance: `{new_bal}`",
+        reply_markup=get_economy_menu_kb(),
+        parse_mode="Markdown"
+    )
 
 @dp.message()
 async def debug_catch_all(message: types.Message):
