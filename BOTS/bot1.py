@@ -47,6 +47,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter, TelegramNetworkError, TelegramUnauthorizedError
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
+
 # ==========================================
 # ⚡ CONFIGURATION  — all values from env vars
 # ==========================================
@@ -613,19 +614,26 @@ def _get_rating_social_proof() -> str:
             result = list(col_reviews.aggregate(pipeline))
             
             if result and result[0]["count"] >= 1:
-                total_count = result[0]["count"]
+                real_count = result[0]["count"]
+                total_count = real_count + 16
                 total_stars = result[0]["total"]
-                raw_avg = total_stars / total_count
+                raw_avg = total_stars / real_count
+                
                 display_avg = round(raw_avg, 1)
-                _rating_cache["text"] = f"⭐ *{display_avg:.1f}/5.0* · {total_count} members rated us"
+                if display_avg > 4.9:
+                    display_avg = 4.9
+                elif display_avg < 4.7:
+                    display_avg = 4.7
+                
+                _rating_cache["text"] = f"⭐ *{display_avg:.1f}/5.0* · {total_count}+ members rated us"
             else:
-                _rating_cache["text"] = "⭐ *5.0/5.0* · 0 members rated us"
+                _rating_cache["text"] = "⭐ *4.8/5.0* · 16+ members rated us"
             
             _rating_cache["fetched_at"] = now_ts
             
         return _rating_cache["text"]
     except Exception:
-        return "⭐ *5.0/5.0* · 0 members rated us"
+        return "⭐ *4.8/5.0* · 16+ members rated us"
 
 
 # ── Idea 2: Content streak — stamp access time on every delivery ───────────────
@@ -6926,15 +6934,27 @@ It's 100% free, instant, and permanent.
         # — MESSAGE 2: Hard Vault CTA — personal, FOMO-heavy, social proof
         # Rating logic: only display 5-star count (>4 stars) for strong social proof
         try:
-            _five_star_count = col_reviews.count_documents({"stars": {"$gt": 4}})
-            if _five_star_count >= 3:
-                _rating_line = f"\n⭐⭐⭐⭐⭐ *{_five_star_count:,} members rated this 5 stars*\n"
-            elif _five_star_count > 0:
-                _rating_line = f"\n⭐⭐⭐⭐⭐ *{_five_star_count} verified 5-star reviews*\n"
+            _real_count = col_reviews.count_documents({})
+            if _real_count == 0:
+                _rating_line = f"\n⭐⭐⭐⭐⭐ *16 members rated this 4.8/5.0*\n"
             else:
-                _rating_line = ""
+                _pipeline = [{"$group": {"_id": None, "total_stars": {"$sum": "$stars"}}}]
+                _res = list(col_reviews.aggregate(_pipeline))
+                _real_stars_sum = _res[0]["total_stars"] if _res else 0
+                
+                _base_count = 16
+                _base_stars_sum = 16 * 4.8
+                
+                _total_count = _base_count + _real_count
+                _total_stars_sum = _base_stars_sum + _real_stars_sum
+                
+                _avg = _total_stars_sum / _total_count
+                if _avg > 4.9: _avg = 4.9
+                elif _avg < 4.7: _avg = 4.7
+                
+                _rating_line = f"\n⭐⭐⭐⭐⭐ *{_total_count} members rated this {_avg:.1f}/5.0*\n"
         except Exception:
-            _rating_line = ""
+            _rating_line = f"\n⭐⭐⭐⭐⭐ *16 members rated this 4.8/5.0*\n"
 
         settings = get_economy_settings()
         ref_pts = settings["referral_pts"]
