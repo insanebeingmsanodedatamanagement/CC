@@ -1131,7 +1131,7 @@ PERMISSIONS = {
     "can_terminal": "🖥️ TERMINAL",
     "can_backup": "💾 BACKUP DATA",
     "can_manage_admins": "👥 ADMINS",
-    "can_reset": "⚠️ RESET BOT DATA"
+    "can_credit": "💳 CREDIT MANAGEMENT"
 }
 
 # Reverse map for easy lookup
@@ -1148,7 +1148,8 @@ ROLES = {
     "OWNER": list(PERMISSIONS.keys()), # Full Access
     "MANAGER": [
         "can_list", "can_add", "can_search", "can_links", 
-        "can_analytics", "can_manage_admins", "can_backup" 
+        "can_analytics", "can_manage_admins", "can_backup",
+        "can_credit"
         # No Reset, No Diagnosis, No Terminal
     ],
     "ADMIN": [
@@ -3610,8 +3611,8 @@ def get_main_menu(user_id: int):
             [KeyboardButton(text="🔍 SEARCH"), KeyboardButton(text="🔗 LINKS")],
             [KeyboardButton(text="📊 ANALYTICS"), KeyboardButton(text="🩺 DIAGNOSIS")],
             [KeyboardButton(text="🖥️ TERMINAL"), KeyboardButton(text="💾 BACKUP DATA")],
-            [KeyboardButton(text="👥 ADMINS"), KeyboardButton(text="⚠️ RESET BOT DATA")],
-            [KeyboardButton(text="💳 CREDIT MANAGEMENT"), KeyboardButton(text="📚 BOT GUIDE")]
+            [KeyboardButton(text="👥 ADMINS"), KeyboardButton(text="💳 CREDIT MANAGEMENT")],
+            [KeyboardButton(text="📚 BOT GUIDE")]
         ]
         return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
 
@@ -3649,7 +3650,7 @@ def get_main_menu(user_id: int):
     
     # Row 5 (Admins / Reset)
     if "can_manage_admins" in perms: buttons.append("👥 ADMINS")
-    if "can_reset" in perms: buttons.append("⚠️ RESET BOT DATA")
+    if "can_credit" in perms: buttons.append("💳 CREDIT MANAGEMENT")
     
     # Always add Guide
     buttons.append("📚 BOT GUIDE")
@@ -8800,7 +8801,6 @@ GUIDE_PAGES = [
         "│ 🖥️ TERMINAL    — Run shell commands (Master only)\n"
         "│ 💾 BACKUP DATA — Export/backup the database\n"
         "│ 👥 ADMINS     — Manage admin accounts\n"
-        "│ ⚠️ RESET BOT DATA — Wipe data (Master only)\n"
         "│ 📚 BOT GUIDE  — This guide\n"
         "└─────────────────────────────\n\n"
 
@@ -8885,7 +8885,6 @@ GUIDE_PAGES = [
         "├ Output streamed back to chat\n"
         "└ Use with caution — no restrictions applied\n\n"
 
-        "⚠️ <b>RESET BOT DATA</b> *(Master Admin only)*\n"
         "└ Wipes selected collections — irreversible!\n"
         "   Requires double confirmation before executing"
     ),
@@ -9599,248 +9598,6 @@ async def msa_id_pool_handler(message: types.Message):
             parse_mode="HTML",
             reply_markup=get_analytics_menu()
         )
-
-# --- DATA RESET HANDLER ---
-@dp.message(F.text == "⚠️ RESET BOT DATA")
-async def start_reset_data(message: types.Message, state: FSMContext):
-    # Security Check — Master Admin only (NEVER allow sub-admins to reset)
-    if message.from_user.id != MASTER_ADMIN_ID:
-        await message.answer("⛔ <b>ACCESS DENIED.</b> Only the Master Admin can perform this action.", parse_mode="HTML")
-        return
-
-    await state.set_state(ResetStates.waiting_for_confirm_button)
-
-    keyboard = [
-        [KeyboardButton(text="🔴 CONFIRM RESET")],
-        [KeyboardButton(text="❌ CANCEL")]
-    ]
-    await message.answer(
-        "🚨 <b>🚨 CRITICAL WARNING — BOT3 DATA PERMANENT DELETION 🚨</b> 🚨\n\n"
-        "You are about to PERMANENTLY DELETE most of Bot3 data. This is a 2-step confirmation.\n\n"
-        "⚠️ <b>WILL BE DELETED:</b>\n"
-        "🗑️ All PDFs and Links (Collections)\n"
-        "🗑️ All IG Content\n"
-        "🗑️ All System Logs\n"
-        "🗑️ All Settings\n"
-        "🗑️ All Admins except you\n"
-        "🗑️ All Banned Users\n"
-        "🗑️ All Click Tracking & Activity\n"
-        "🗑️ All FSM States\n\n"
-        "✅ <b>WILL BE PRESERVED:</b>\n"
-        "✅ Emergency backup (auto-created immediately)\n"
-        "✅ Backup history in MongoDB\n"
-        "✅ Local ZIP backups in /backups folder\n"
-        "✅ Your master admin account\n\n"
-        "🔴 <b>THIS IS IRREVERSIBLE!</b>\n"
-        "After deletion, you CAN recover from the emergency backup.\n"
-        "But if you don't have it, the data is GONE FOREVER.\n\n"
-        "<b>STEP 1 OF 2:</b> Click the red button ONLY if you understand the consequences:",
-        reply_markup=ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True),
-        parse_mode="HTML"
-    )
-
-@dp.message(ResetStates.waiting_for_confirm_button)
-async def process_reset_step1(message: types.Message, state: FSMContext):
-    # Any message other than the exact button cancels the reset
-    if message.text != "🔴 CONFIRM RESET":
-        await state.clear()
-        return await message.answer("✅ Reset Cancelled.", reply_markup=get_main_menu(message.from_user.id))
-
-    # Generate a one-time random PIN — must be typed exactly to proceed
-    reset_pin = "".join(str(random.randint(0, 9)) for _ in range(8))
-    await state.update_data(reset_pin=reset_pin)
-    await state.set_state(ResetStates.waiting_for_confirm_text)
-
-    keyboard = [[KeyboardButton(text="❌ CANCEL")]]
-    await message.answer(
-        "🛑 <b>STEP 2 OF 2 — ENTER THE SECURITY PIN</b> 🛑\n\n"
-        "This one-time PIN confirms intentional Bot3 data reset.\n\n"
-        f"Type this PIN exactly (no spaces):\n\n"
-        f"<code>{reset_pin}</code>\n\n"
-        "⚠️ This PIN is valid for this session only.\n"
-        "Any other input or ❌ CANCEL will abort the operation.",
-        reply_markup=ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True),
-        parse_mode="HTML"
-    )
-
-@dp.message(ResetStates.waiting_for_confirm_text)
-async def process_reset_final(message: types.Message, state: FSMContext):
-    # Retrieve stored PIN from FSM state
-    data = await state.get_data()
-    expected_pin = data.get("reset_pin", "")
-
-    # Any message that does not exactly match the PIN cancels the process
-    if message.text.strip() != expected_pin:
-        await state.clear()
-        return await message.answer(
-            "✅ Reset Cancelled. PIN did not match — no data was erased.",
-            reply_markup=get_main_menu(message.from_user.id)
-        )
-
-    # PIN matched — execute Bot3 data reset (2-step confirm complete)
-    await state.clear()
-    await message.answer("🧨 <b>INITIATING BOT3 DATA RESET...</b>\n\n⏳ Creating emergency backup first...", reply_markup=types.ReplyKeyboardRemove(), parse_mode="HTML")
-
-    try:
-        # ⭐ CRITICAL: AUTO-BACKUP BEFORE RESET — stores to MSANodeBackups (separate cluster)
-        # STRICTLY bot3 only — bot1 and bot2 collections are never touched here.
-        _reset_backup_uri = os.environ.get("BACKUP_MONGO_URI") or MONGO_URI
-        _reset_backup_db  = os.environ.get("BACKUP_MONGO_DB_NAME", "MSANodeBackups")
-
-        cluster_backup_ok   = False
-        local_backup_ok     = False
-        cluster_backup_info = ""
-        local_backup_info   = ""
-
-        # --- Tier 1: Push full snapshot to MSANodeBackups cluster (bot3 ONLY) ---
-        try:
-            if force_backup_to_cluster is None:
-                raise RuntimeError("backup_schedulers not available — cluster backup skipped")
-            loop = asyncio.get_event_loop()
-            cluster_result = await loop.run_in_executor(
-                None,
-                force_backup_to_cluster,
-                "bot3",          # ← bot3 strictly; only bot3_* collections
-                MONGO_URI,
-                MONGO_DB_NAME,
-                _reset_backup_uri,
-                _reset_backup_db,
-            )
-            if cluster_result.get("status") == "ok":
-                cluster_backup_ok = True
-                cluster_backup_info = (
-                    f"☁️ Cluster snapshot → <code>{_reset_backup_db}</code> "
-                    f"({cluster_result.get('collections', 0)} collections, "
-                    f"{cluster_result.get('docs', 0):,} docs)"
-                )
-                logger.warning(f"[BOT3 RESET] Cluster backup OK → {_reset_backup_db}: {cluster_result}")
-            else:
-                logger.error(f"[BOT3 RESET] Cluster backup FAILED: {cluster_result.get('error')}")
-                cluster_backup_info = f"❌ Cluster backup failed: {cluster_result.get('error', 'unknown')}"
-        except Exception as cluster_err:
-            logger.error(f"[BOT3 RESET] Cluster backup exception: {cluster_err}")
-            cluster_backup_info = f"❌ Cluster backup error: {cluster_err}"
-
-        # --- Tier 2: Local ZIP fallback (always attempt regardless of cluster result) ---
-        try:
-            backup_before_reset = await create_backup_file(auto=False)
-            local_backup_ok = True
-            local_backup_info = "💾 Local ZIP backup created"
-            logger.warning(f"[BOT3 RESET] Local backup created BEFORE reset: {backup_before_reset}")
-        except Exception as backup_err:
-            logger.error(f"[BOT3 RESET] Local backup FAILED: {backup_err}")
-            local_backup_info = f"❌ Local ZIP failed: {backup_err}"
-
-        # Abort reset if BOTH backup tiers failed (safety gate)
-        if not cluster_backup_ok and not local_backup_ok:
-            await state.clear()
-            await message.answer(
-                "🚨 <b>RESET ABORTED — BACKUP FAILED</b>\n\n"
-                "Neither the cluster backup nor the local ZIP could be created.\n"
-                f"{cluster_backup_info}\n{local_backup_info}\n\n"
-                "⚠️ No data was deleted. Fix the backup issue and try again.",
-                reply_markup=get_main_menu(message.from_user.id),
-                parse_mode="HTML"
-            )
-            return
-
-        # Log the reset attempt with admin info
-        reset_timestamp = now_local()
-        admin_name = message.from_user.full_name or message.from_user.username or f"ID:{message.from_user.id}"
-        logger.warning(f"[BOT3 RESET] ⚠️ BOT3 DATA RESET initiated by {admin_name} ({message.from_user.id}) at {reset_timestamp} - Collections will be WIPED")
-        
-        # ── AUTO-SAVE LINK REGISTRY before wiping ───────────────────────────
-        # Snapshots url→cc_number for IG and url→index for PDFs so they can be
-        # restored after re-upload even after multiple consecutive resets.
-        try:
-            ig_map  = {}  # name → {cc_number, start_code}
-            pdf_map = {}  # link → {index, msa_code, name}
-            
-            # IG CC uses "name" as its reliable unique identifier (no url field exists)
-            for doc in col_ig_content.find({}, {"name": 1, "cc_number": 1, "start_code": 1}):
-                if doc.get("name") and doc.get("cc_number"):
-                    ig_map[doc["name"]] = {
-                        "cc_number": doc["cc_number"],
-                        "start_code": doc.get("start_code", "")
-                    }
-                    
-            # PDFs use "link" (not "url") as their download/access URL field
-            for doc in col_pdfs.find({}, {"link": 1, "index": 1, "msa_code": 1, "name": 1}):
-                if doc.get("link") and doc.get("index") is not None:
-                    pdf_map[doc["link"]] = {
-                        "index":    doc["index"],
-                        "msa_code": doc.get("msa_code", ""),
-                        "name":     doc.get("name", ""),
-                    }
-            settings_snap = {d["key"]: d.get("value") for d in col_settings.find() if "key" in d}
-            col_bot3_link_registry.insert_one({
-                "saved_at":       now_local(),
-                "admin_id":       message.from_user.id,
-                "ig_url_map":     ig_map,
-                "pdf_url_map":    pdf_map,
-                "settings_snap":  settings_snap,
-                "ig_count":       len(ig_map),
-                "pdf_count":      len(pdf_map),
-            })
-            logger.info(f"[BOT3 REGISTRY] Saved link registry: {len(ig_map)} IG, {len(pdf_map)} PDF entries")
-        except Exception as reg_err:
-            logger.warning(f"[BOT3 REGISTRY] Failed to save link registry: {reg_err}")
-        # ──────────────────────────────────────────────────────────────────
-
-        collections_to_wipe = [
-            "bot3_pdfs",
-            "bot3_ig_content",
-            "bot3_logs",
-            "bot3_settings",
-            "bot3_admins",
-            "bot3_banned_users",
-            "bot3_user_activity",
-            "bot3_state",
-        ]
-        wiped = []
-        for coll_name in collections_to_wipe:
-            db.drop_collection(coll_name)
-            wiped.append(coll_name)
-            logger.warning(f"[BOT3 RESET] Dropped collection: {coll_name}")
-
-        # Truncate log file if exists
-        for log_file in ["bot3.log", "logs/bot3.log"]:
-            if os.path.exists(log_file):
-                with open(log_file, "w"):
-                    pass
-
-        # Re-seed master admin so the bot stays usable after wipe
-        col_admins.update_one(
-            {"user_id": MASTER_ADMIN_ID},
-            {"$set": {
-                "user_id": MASTER_ADMIN_ID,
-                "is_owner": True,
-                "is_locked": False,
-                "permissions": list(PERMISSIONS.keys()),
-                "full_name": message.from_user.full_name or "Master Admin",
-                "username": message.from_user.username or "owner",
-                "added_at": now_local(),
-            }},
-            upsert=True
-        )
-
-        logger.warning(f"[BOT3 RESET] ✅ RESET COMPLETE - All {len(wiped)} collections dropped")
-        
-        wiped_str = "\n".join([f"• <code>{c}</code>" for c in wiped])
-        await message.answer(
-            f"✅ <b>BOT3 DATA RESET COMPLETE</b>\n\n"
-            f"🗑 <b>Wiped collections:</b>\n{wiped_str}\n\n"
-            f"💾 <b>Pre-reset backups (bot3 only):</b>\n"
-            f"{cluster_backup_info}\n{local_backup_info}\n\n"
-            f"🔒 Backups stored in <b>MSANodeBackups</b> (separate cluster — bot1/bot2 untouched)\n"
-            f"🔄 Master Admin account re-seeded.\n"
-            f"🤖 System is clean and ready.",
-            reply_markup=get_main_menu(message.from_user.id),
-            parse_mode="HTML"
-        )
-        logger.warning(f"⚠️ BOT3 DATA RESET executed by MASTER_ADMIN {message.from_user.id} (backups preserved)")
-    except Exception as e:
-        await message.answer(f"❌ <b>RESET FAILED:</b> <code>{e}</code>", reply_markup=get_main_menu(message.from_user.id), parse_mode="HTML")
 
 # 5. IG AFFILIATE MANAGEMENT HANDLERS
 # ==========================================
@@ -12435,7 +12192,7 @@ _PDF_EXCLUDED_BUTTONS = {
     # ── Main menu ─────────────────────────────────────────────────────────────
     "💳 CREDIT MANAGEMENT", "📚 BOT GUIDE", "📋 LIST", "➕ ADD",
     "🔍 SEARCH", "🔗 LINKS", "📊 ANALYTICS", "🩺 DIAGNOSIS",
-    "🖥️ TERMINAL", "💾 BACKUP DATA", "👥 ADMINS", "⚠️ RESET BOT DATA",
+    "🖥️ TERMINAL", "💾 BACKUP DATA", "👥 ADMINS",
     # ── Economy menu ──────────────────────────────────────────────────────────
     "✏️ EDIT REFERRAL PTS (REFERRER)", "✏️ EDIT BONUS PTS (NEW USER)", "✏️ EDIT IGCC PTS (BOUNTY)",
     "🏆 EDIT LB GOLD", "🏆 EDIT LB SILVER", "🏆 EDIT LB BRONZE",
@@ -12604,8 +12361,7 @@ def _econ_text(doc):
 
 @dp.message(F.text == "💳 CREDIT MANAGEMENT")
 async def economy_menu(message: types.Message, state: FSMContext):
-    if message.from_user.id != MASTER_ADMIN_ID:
-        return await message.answer("❌ Master Admin only.")
+    if not await check_authorization(message, "credit_management", "can_credit"): return
     await state.clear()
     doc = get_economy_settings_doc()
     await message.answer(_econ_text(doc), reply_markup=get_economy_menu_kb(), parse_mode="Markdown")
@@ -12614,7 +12370,7 @@ async def economy_menu(message: types.Message, state: FSMContext):
 # ── Edit Referral (Referrer) pts ─────────────────────────────────────────────
 @dp.message(F.text == "✏️ EDIT REFERRAL PTS (REFERRER)")
 async def econ_edit_ref(message: types.Message, state: FSMContext):
-    if message.from_user.id != MASTER_ADMIN_ID: return
+    if not await check_authorization(message, "credit_management", "can_credit"): return
     cancel_kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="⬅️ BACK")]], resize_keyboard=True)
     await message.answer(
         "Enter the new points to award the *Referrer* per confirmed referral:\n_(e.g. 25)_",
@@ -12646,7 +12402,7 @@ async def econ_save_ref(message: types.Message, state: FSMContext):
 # ── Edit Referred Bonus (New User) pts ───────────────────────────────────────
 @dp.message(F.text == "✏️ EDIT BONUS PTS (NEW USER)")
 async def econ_edit_bonus(message: types.Message, state: FSMContext):
-    if message.from_user.id != MASTER_ADMIN_ID: return
+    if not await check_authorization(message, "credit_management", "can_credit"): return
     cancel_kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="⬅️ BACK")]], resize_keyboard=True)
     await message.answer(
         "Enter the new starter bonus for *New Users* who join via a referral link:\n_(e.g. 20)_",
@@ -12678,7 +12434,7 @@ async def econ_save_bonus(message: types.Message, state: FSMContext):
 # ── Edit IGCC pts ─────────────────────────────────────────────────────────────
 @dp.message(F.text == "✏️ EDIT IGCC PTS (BOUNTY)")
 async def econ_edit_igcc(message: types.Message, state: FSMContext):
-    if message.from_user.id != MASTER_ADMIN_ID: return
+    if not await check_authorization(message, "credit_management", "can_credit"): return
     cancel_kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="⬅️ BACK")]], resize_keyboard=True)
     await message.answer(
         "Enter the new default credits awarded for *IG Bounty* claims:\n_(e.g. 25)_",
@@ -12711,7 +12467,7 @@ async def econ_save_igcc(message: types.Message, state: FSMContext):
 # ── Edit Leaderboard Rewards ─────────────────────────────────────────────────────────────
 @dp.message(F.text == "🏆 EDIT LB GOLD")
 async def econ_edit_lb_gold(message: types.Message, state: FSMContext):
-    if message.from_user.id != MASTER_ADMIN_ID: return
+    if not await check_authorization(message, "credit_management", "can_credit"): return
     cancel_kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="⬅️ BACK")]], resize_keyboard=True)
     await message.answer("Enter the weekly credits awarded to the *1st Place (Gold)* spender:\n_(e.g. 50)_", reply_markup=cancel_kb, parse_mode="Markdown")
     await state.set_state(EconomyStates.waiting_for_lb_gold)
@@ -12733,7 +12489,7 @@ async def econ_save_lb_gold(message: types.Message, state: FSMContext):
 
 @dp.message(F.text == "🏆 EDIT LB SILVER")
 async def econ_edit_lb_silver(message: types.Message, state: FSMContext):
-    if message.from_user.id != MASTER_ADMIN_ID: return
+    if not await check_authorization(message, "credit_management", "can_credit"): return
     cancel_kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="⬅️ BACK")]], resize_keyboard=True)
     await message.answer("Enter the weekly credits awarded to the *2nd Place (Silver)* spender:\n_(e.g. 40)_", reply_markup=cancel_kb, parse_mode="Markdown")
     await state.set_state(EconomyStates.waiting_for_lb_silver)
@@ -12755,7 +12511,7 @@ async def econ_save_lb_silver(message: types.Message, state: FSMContext):
 
 @dp.message(F.text == "🏆 EDIT LB BRONZE")
 async def econ_edit_lb_bronze(message: types.Message, state: FSMContext):
-    if message.from_user.id != MASTER_ADMIN_ID: return
+    if not await check_authorization(message, "credit_management", "can_credit"): return
     cancel_kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="⬅️ BACK")]], resize_keyboard=True)
     await message.answer("Enter the weekly credits awarded to the *3rd Place (Bronze)* spender:\n_(e.g. 30)_", reply_markup=cancel_kb, parse_mode="Markdown")
     await state.set_state(EconomyStates.waiting_for_lb_bronze)
@@ -12780,7 +12536,7 @@ async def econ_save_lb_bronze(message: types.Message, state: FSMContext):
 # ── Edit Vault Join Bonus ───────────────────────────────────────────────────
 @dp.message(F.text == "✏️ EDIT JOIN BONUS")
 async def econ_edit_join_bonus(message: types.Message, state: FSMContext):
-    if message.from_user.id != MASTER_ADMIN_ID: return
+    if not await check_authorization(message, "credit_management", "can_credit"): return
     cancel_kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="⬅️ BACK")]], resize_keyboard=True)
     await message.answer(
         "Enter the credits awarded to a user the *first time they join the Vault*:\n_(e.g. 30)_",
