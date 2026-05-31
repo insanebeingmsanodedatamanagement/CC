@@ -48,6 +48,7 @@ from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter, TelegramNet
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
 
+
 # ==========================================
 # ⚡ CONFIGURATION  — all values from env vars
 # ==========================================
@@ -468,7 +469,23 @@ try:
             expireAfterSeconds=90 * 24 * 3600,  # 90 days
             name="backup_ttl_90d"
         )
-        logger.info("✅ Database indexes created/verified (including TTL: ban_expires, backup_date)")
+        # ── TTL: auto-expire stale feature suspensions after 90 days ──────────────
+        # Suspensions are admin-created; this safety net prevents forgotten ones from persisting forever.
+        # Uses suspended_at field (set by bot2 when suspensions are created).
+        try:
+            try:
+                col_suspended_features.drop_index("suspended_at_ttl_90d")
+            except Exception:
+                pass
+            col_suspended_features.create_index(
+                [("suspended_at", 1)],
+                expireAfterSeconds=90 * 24 * 3600,  # 90 days
+                sparse=True,
+                name="suspended_at_ttl_90d"
+            )
+        except Exception:
+            pass  # Non-critical — admin can manually unsuspend
+        logger.info("✅ Database indexes created/verified (including TTL: ban_expires, backup_date, suspended_at)")
     except Exception as idx_error:
         logger.warning(f"⚠️ Index creation warning: {idx_error}")
 
@@ -573,21 +590,41 @@ def log_to_terminal(action_type: str, user_id: int, details: str = "", user_name
 # 📈 GROWTH ENGINE — Helper Functions
 # ==========================================
 
-# ── Idea 7: Vault member count cache (social proof in every message) ──────────
+# ── Idea 7: Vault member count — LIVE from Telegram, 2-min cache ──────────────
 _vault_count_cache: dict = {"count": 0, "fetched_at": 0.0}
-_VAULT_COUNT_TTL = 3600  # Refresh every 1 hour
+_VAULT_COUNT_TTL = 120  # Refresh every 2 minutes — keep counts accurate
+
+async def get_vault_member_count_async() -> int:
+    """Return live vault member count from Telegram API, cached for 2 minutes.
+    Primary: Telegram get_chat_member_count (real Telegram channel count).
+    Fallback: MongoDB count_documents (DB-tracked members).
+    """
+    import time as _t
+    now_ts = _t.time()
+    if now_ts - _vault_count_cache["fetched_at"] > _VAULT_COUNT_TTL:
+        try:
+            _vault_count_cache["count"] = await bot.get_chat_member_count(CHANNEL_ID)
+        except Exception:
+            try:
+                _vault_count_cache["count"] = col_user_verification.count_documents({"vault_joined": True})
+            except Exception:
+                pass  # Keep previous cached value
+        _vault_count_cache["fetched_at"] = now_ts
+    return _vault_count_cache["count"]
 
 def get_vault_member_count() -> int:
-    """Return live vault member count, cached for 1 hour to avoid per-message DB hits."""
-    try:
-        import time as _t
-        now_ts = _t.time()
-        if now_ts - _vault_count_cache["fetched_at"] > _VAULT_COUNT_TTL:
+    """Sync fallback — returns the latest cached count (refreshed by async version).
+    If cache is empty, performs a one-time DB query.
+    """
+    import time as _t
+    now_ts = _t.time()
+    if _vault_count_cache["count"] == 0 or now_ts - _vault_count_cache["fetched_at"] > _VAULT_COUNT_TTL:
+        try:
             _vault_count_cache["count"] = col_user_verification.count_documents({"vault_joined": True})
             _vault_count_cache["fetched_at"] = now_ts
-        return _vault_count_cache["count"]
-    except Exception:
-        return _vault_count_cache.get("count", 0)
+        except Exception:
+            pass
+    return _vault_count_cache["count"]
 
 
 # ── Rating social proof: live average ────────────────
@@ -683,7 +720,7 @@ async def check_and_fire_milestone(new_user_id: int, new_user_name: str) -> None
                     {"$set": {"setting": key, "fired_at": now_local(), "total_at_fire": total}},
                     upsert=True
                 )
-                vault_count = get_vault_member_count()
+                vault_count = await get_vault_member_count_async()
                 msg = (
                     f"🎉 *A moment worth marking.*\n\n"
                     f"*{milestone:,} people* have now used MSA NODE.\n\n"
@@ -749,7 +786,7 @@ async def instant_onboarding_nudge_scheduler():
         try:
             await asyncio.sleep(5 * 60)
             now = now_local()
-            vault_count = get_vault_member_count()
+            vault_count = await get_vault_member_count_async()
 
             # Candidates: started 15-30 mins ago, still not in vault, haven't got instant nudge
             candidates = col_user_verification.find(
@@ -817,7 +854,7 @@ async def onboarding_sequence_scheduler():
         try:
             await asyncio.sleep(6 * 3600)
             now = now_local()
-            vault_count = get_vault_member_count()
+            vault_count = await get_vault_member_count_async()
 
             # Step 1 candidates: started 24h+ ago, still on step 0, not in vault
             step1_candidates = col_user_verification.find(
@@ -951,7 +988,7 @@ async def content_streak_monitor():
         try:
             await asyncio.sleep(24 * 3600)
             now = now_local()
-            vault_count = get_vault_member_count()
+            vault_count = await get_vault_member_count_async()
 
             candidates = col_user_verification.find(
                 {
@@ -1022,7 +1059,7 @@ async def blocked_user_reengagement_scheduler():
         try:
             await asyncio.sleep(24 * 3600)
             now = now_local()
-            vault_count = get_vault_member_count()
+            vault_count = await get_vault_member_count_async()
 
             candidates = col_user_verification.find(
                 {
@@ -1180,7 +1217,7 @@ async def deliver_vault_join_reward(user_id: int, user_name: str) -> None:
         source_via   = (doc.get("grace_consumed_via") or "").upper()
         raw_code     = (doc.get("grace_item_code")   or "")
         name         = doc.get("first_name") or user_name or "there"
-        vault_count  = get_vault_member_count()
+        vault_count  = await get_vault_member_count_async()
 
         reward_doc  = None
         reward_type = None  # "pdf" or "igcc"
@@ -3819,13 +3856,16 @@ async def show_access_denied_animation(message: types.Message, user_id: int, pay
 # ==========================================
 
 def _award_msa_credits(user_id: int, points: int, reason: str = "") -> int:
-    """Award MSA Credits to a user. Returns new balance. Atomic $inc."""
+    """Award MSA Credits to a user. Returns new balance. Atomic $inc.
+    Stamps last_earned_at on every award for expiry tracking (Feature #1).
+    """
     try:
         result = col_msa_credits.find_one_and_update(
             {"user_id": user_id},
             {
                 "$inc": {"balance": points},
                 "$push": {"ledger": {"pts": points, "reason": reason, "at": now_local()}},
+                "$set":  {"last_earned_at": now_local()},  # ← expiry tracker
                 "$setOnInsert": {"user_id": user_id, "purchased_items": []}
             },
             upsert=True,
@@ -4667,6 +4707,20 @@ async def _check_and_fire_referral_tier(referrer_id: int, referrer_name: str, co
                     parse_mode=ParseMode.MARKDOWN
                 )
                 log_to_terminal("TIER_UNLOCK", referrer_id, f"Tier '{tier['tier']}' at {confirmed_count} refs", referrer_name)
+                # ── Feature #4-adjacent: notify owner of milestone hit ───────
+                try:
+                    owner_id = int(os.getenv("OWNER_ID", 0))
+                    if owner_id:
+                        await bot.send_message(
+                            owner_id,
+                            f"🏆 <b>Referral Tier Unlocked!</b>\n"
+                            f"👤 <b>{referrer_name}</b> (ID: <code>{referrer_id}</code>)\n"
+                            f"🎖 Tier: <b>{tier['badge']}</b>\n"
+                            f"📊 Referrals: <b>{confirmed_count}</b>",
+                            parse_mode="HTML"
+                        )
+                except Exception:
+                    pass
                 await asyncio.sleep(0.5)
     except Exception as _te:
         logger.warning(f"[REFERRAL TIER] {referrer_id}: {_te}")
@@ -5511,7 +5565,7 @@ async def vault_member_reengagement_scheduler():
                         {"user_id": uid},
                         {"$set": {"vault_reengagement_sent": True}}
                     )
-                    vault_count = get_vault_member_count()
+                    vault_count = await get_vault_member_count_async()
                     ig_kb = InlineKeyboardMarkup(inline_keyboard=[
                         [InlineKeyboardButton(text="📊 Open My Dashboard", callback_data="open_dashboard")],
                         [InlineKeyboardButton(text="📸 Instagram", url=INSTAGRAM_LINK),
@@ -5765,7 +5819,14 @@ async def handle_referral_noop(callback: types.CallbackQuery):
 @rate_limit(cooldown=2.0)
 @anti_spam("start")
 async def cmd_start(message: types.Message, state: FSMContext):
-    
+
+    # ── Reset FSM screen state ONLY — does NOT bypass any business logic ────────
+    # state.clear() only wipes "which menu screen is active" (store/guide/support).
+    # It does NOT touch: ban checks, vault membership, user DB data, or any payload.
+    # All those checks run below, completely unchanged.
+    # Without this: user trapped in store → opens IGCC link → bot ignores it (wrong state).
+    await state.clear()
+
     # Check Maintenance Mode
     if await check_maintenance_mode(message):
         return
@@ -12009,11 +12070,17 @@ async def _build_daily_report(period: str) -> str:
 
         # Atlas M0 storage monitoring (512 MB free tier cap)
         try:
-            db_stats = db.command("dbStats", scale=1024 * 1024)  # returns MB
-            db_size_mb = round(db_stats.get("dataSize", 0), 1)
-            storage_mb = round(db_stats.get("storageSize", 0), 1)
-            atlas_pct = round(db_size_mb / 512 * 100, 1)
-            db_size_str = f"{db_size_mb} MB data / {storage_mb} MB storage ({atlas_pct}% of 512 MB free tier)"
+            db_stats    = db.command("dbStats", scale=1024 * 1024)  # values in MB
+            db_size_mb  = round(db_stats.get("dataSize",    0), 2)
+            storage_mb  = round(db_stats.get("storageSize", 0), 2)
+            index_mb    = round(db_stats.get("indexSize",   0), 2)
+            # Atlas M0: totalSize / fsTotalSize are 0. Use dataSize+indexSize (both real).
+            used_mb     = round(db_size_mb + index_mb, 2)
+            atlas_pct   = round(used_mb / 512 * 100, 1)
+            db_size_str = (
+                f"{db_size_mb} MB data / {index_mb} MB indexes = "
+                f"{used_mb} MB used ({atlas_pct}% of 512 MB free tier)"
+            )
             if atlas_pct >= 80:
                 db_size_str = "⚠️ " + db_size_str + " — NEARING LIMIT"
         except Exception:
@@ -12191,6 +12258,639 @@ def restore_health_stats_from_db():
 
 
 # ==========================================
+# FEATURE #1 — CREDIT EXPIRY WARNING SYSTEM
+# ==========================================
+# Credits inactive for 150 days → warning DM
+# Credits inactive for 180 days → expiry notification + zero balance
+async def credit_expiry_warning_scheduler():
+    """
+    Runs every 24 hours.
+    - At 150 days since last_earned_at → warn user credits will expire in 30 days.
+    - At 180 days since last_earned_at → notify user credits have expired, zero balance.
+    Dedup: stamps credit_expiry_warned / credit_expiry_notified to never re-fire.
+    Only fires for users with balance > 0.
+    """
+    while True:
+        try:
+            now = now_local()
+            warn_cutoff   = now - timedelta(days=150)
+            expire_cutoff = now - timedelta(days=180)
+
+            # ── EXPIRY: 180+ days inactive with balance > 0 ──────────────────
+            expired_docs = list(col_msa_credits.find({
+                "last_earned_at": {"$lte": expire_cutoff},
+                "balance":        {"$gt": 0},
+                "credit_expiry_notified": {"$ne": True},
+            }, {"user_id": 1, "balance": 1}))
+
+            for doc in expired_docs:
+                uid, bal = doc["user_id"], doc.get("balance", 0)
+                try:
+                    # Zero out balance + stamp flag
+                    col_msa_credits.update_one(
+                        {"user_id": uid},
+                        {
+                            "$set":  {"balance": 0, "credit_expiry_notified": True,
+                                      "credit_expiry_warned": True},
+                            "$push": {"ledger": {"pts": -bal, "reason": "Credits expired (180 days inactive)", "at": now}}
+                        }
+                    )
+                    await bot.send_message(
+                        uid,
+                        f"⏰ <b>Your MSA Credits Have Expired</b>\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                        f"Your <b>{bal} MSA Credits</b> have been zeroed because your "
+                        f"account was inactive for 180 days.\n\n"
+                        f"💡 <b>Earn new credits by:</b>\n"
+                        f"  • Confirming referrals\n"
+                        f"  • Clicking content links\n"
+                        f"  • Re-joining the Vault\n\n"
+                        f"Start fresh — open the bot to get back on track!",
+                        parse_mode="HTML"
+                    )
+                    log_to_terminal("CREDIT_EXPIRED", uid, f"Zeroed {bal} credits (180d inactive)")
+                    await asyncio.sleep(0.3)
+                except Exception as _ex:
+                    logger.warning(f"[CREDIT_EXPIRY] Expire notify failed for {uid}: {_ex}")
+
+            # ── WARNING: 150-179 days inactive with balance > 0 ──────────────
+            warn_docs = list(col_msa_credits.find({
+                "last_earned_at":       {"$lte": warn_cutoff, "$gt": expire_cutoff},
+                "balance":              {"$gt": 0},
+                "credit_expiry_warned": {"$ne": True},
+            }, {"user_id": 1, "balance": 1}))
+
+            for doc in warn_docs:
+                uid, bal = doc["user_id"], doc.get("balance", 0)
+                try:
+                    col_msa_credits.update_one(
+                        {"user_id": uid},
+                        {"$set": {"credit_expiry_warned": True}}
+                    )
+                    await bot.send_message(
+                        uid,
+                        f"⚠️ <b>Credit Expiry Warning</b>\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                        f"You have <b>{bal} MSA Credits</b> that will expire in "
+                        f"<b>~30 days</b> if your account stays inactive.\n\n"
+                        f"💡 <b>Use them before they're gone:</b>\n"
+                        f"  • Open the <b>🏪 REWARD STORE</b>\n"
+                        f"  • Refer someone to earn more\n"
+                        f"  • Click any content link\n\n"
+                        f"Don't let your credits go to waste!",
+                        parse_mode="HTML"
+                    )
+                    log_to_terminal("CREDIT_WARN", uid, f"Warned {bal} credits expire in ~30d")
+                    await asyncio.sleep(0.3)
+                except Exception as _wx:
+                    logger.warning(f"[CREDIT_EXPIRY] Warn failed for {uid}: {_wx}")
+
+            logger.info(f"[CREDIT_EXPIRY] Ran: {len(expired_docs)} expired, {len(warn_docs)} warned")
+
+        except asyncio.CancelledError:
+            break
+        except Exception as _se:
+            logger.error(f"[CREDIT_EXPIRY] Scheduler error: {_se}")
+
+        await asyncio.sleep(24 * 3600)  # Run once every 24 hours
+
+
+# ==========================================
+# SMART ENGAGEMENT SYSTEM — AUTOMATED PSYCHOLOGY-DRIVEN MESSAGES
+# ==========================================
+# Uses sales psychology (FOMO, reciprocity, social proof, scarcity) to
+# nudge vault members toward store purchases, referrals, and leaderboard climbs.
+# All schedulers respect a 24h per-user cooldown to prevent message fatigue.
+# ==========================================
+
+# ── Global 24h anti-spam guard ────────────────────────────────────────────────
+# Tracks the last automated engagement message sent to each user.
+# ALL 3 schedulers check this BEFORE sending. Maximum 1 auto-msg per user per day.
+
+async def _can_send_auto_msg(uid: int) -> bool:
+    """Return True if user hasn't received an automated engagement message in 24h."""
+    import time as _t
+    doc = col_user_verification.find_one({"user_id": uid}, {"last_auto_promo_at": 1})
+    if not doc:
+        return False  # user doesn't exist
+    last = doc.get("last_auto_promo_at")
+    if not last:
+        return True
+    # Handle both datetime and timestamp
+    if hasattr(last, 'timestamp'):
+        last_ts = last.timestamp()
+    else:
+        last_ts = float(last)
+    return (_t.time() - last_ts) > 86400  # 24 hours
+
+
+async def _stamp_auto_msg(uid: int):
+    """Record that an auto-engagement message was sent to this user."""
+    col_user_verification.update_one(
+        {"user_id": uid},
+        {"$set": {"last_auto_promo_at": now_local()}}
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1️⃣ STORE PROMO SCHEDULER — "You can afford this right now"
+# ─────────────────────────────────────────────────────────────────────────────
+# Psychology: Availability heuristic + Endowment effect + Low-friction CTA.
+# If user has credits AND there's an item they can afford → tell them.
+# If store is empty → silence. No spam, no disappointment.
+# Runs every 8 hours. Max 5 users per run to avoid Telegram rate limits.
+
+async def store_promo_scheduler():
+    """
+    Every 8 hours: Find vault members whose credit balance ≥ the cheapest
+    active store item. Send them a personalized "you can unlock X" message.
+
+    Dedup: stamps `store_promo_item_{item_id}` so the same item is never
+    promoted twice to the same user. Also respects the 24h global cooldown.
+    """
+    logger.info("[STORE_PROMO] Scheduler started")
+    await asyncio.sleep(120)  # Let bot fully boot before first run
+
+    while True:
+        try:
+            # ── Skip if store is empty ────────────────────────────────────
+            items = list(col_store_items.find({"active": True}).sort("cost", 1))
+            if not items:
+                logger.info("[STORE_PROMO] Store empty — skipping this cycle")
+                await asyncio.sleep(8 * 3600)
+                continue
+
+            cheapest_cost = items[0].get("cost", 0)
+            if cheapest_cost <= 0:
+                await asyncio.sleep(8 * 3600)
+                continue
+
+            # ── Find users with enough credits ────────────────────────────
+            candidates = list(col_msa_credits.find(
+                {"balance": {"$gte": cheapest_cost}},
+                {"user_id": 1, "balance": 1, "purchased_items": 1}
+            ).limit(50))  # Pool of candidates
+
+            sent = 0
+            for cred_doc in candidates:
+                if sent >= 5:
+                    break
+
+                uid = cred_doc["user_id"]
+                balance = cred_doc.get("balance", 0)
+                purchased = cred_doc.get("purchased_items", [])
+
+                # ── Skip non-vault members or unreachable users ───────────
+                uv = col_user_verification.find_one(
+                    {"user_id": uid},
+                    {"vault_joined": 1, "bot_unreachable": 1, "first_name": 1}
+                )
+                if not uv or not uv.get("vault_joined") or uv.get("bot_unreachable"):
+                    continue
+
+                # ── 24h global cooldown ───────────────────────────────────
+                if not await _can_send_auto_msg(uid):
+                    continue
+
+                # ── Find the best item this user can afford but hasn't bought ─
+                best_item = None
+                for item in items:
+                    item_id = str(item.get("item_id", str(item.get("_id"))))
+                    cost = item.get("cost", 0)
+                    if cost <= balance and item_id not in purchased:
+                        # Check dedup flag
+                        promo_key = f"store_promo_item_{item_id}"
+                        if not uv.get(promo_key):
+                            best_item = item
+                            break
+
+                if not best_item:
+                    continue
+
+                # ── Send the promo message ────────────────────────────────
+                name = uv.get("first_name") or "Agent"
+                item_name = best_item.get("name", "Exclusive Item")
+                item_cost = best_item.get("cost", 0)
+                item_id = str(best_item.get("item_id", str(best_item.get("_id"))))
+                remaining = balance - item_cost
+
+                try:
+                    await bot.send_message(
+                        uid,
+                        f"🛍️ <b>{name}, you have enough credits</b>\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                        f"💳 Your balance: <b>{balance} MSA Credits</b>\n\n"
+                        f"🎁 Right now you can unlock:\n"
+                        f"  <b>→ {item_name}</b> — costs <b>{item_cost} credits</b>\n\n"
+                        f"After redeeming, you'd still have <b>{remaining} credits</b> left.\n\n"
+                        f"📌 <i>Tap</i> <b>🏪 REWARD STORE</b> <i>in your menu to claim it.</i>\n\n"
+                        f"<i>Credits expire after 180 days of inactivity. Use them while they're yours.</i>",
+                        parse_mode="HTML"
+                    )
+                    # Stamp dedup + cooldown
+                    col_user_verification.update_one(
+                        {"user_id": uid},
+                        {"$set": {f"store_promo_item_{item_id}": True}}
+                    )
+                    await _stamp_auto_msg(uid)
+                    sent += 1
+                    log_to_terminal("STORE_PROMO", uid, f"Promoted '{item_name}' (cost={item_cost}, bal={balance})")
+                    await asyncio.sleep(1)
+                except Exception as _e:
+                    _e_str = str(_e).lower()
+                    if "forbidden" in _e_str or "chat not found" in _e_str or "bot can't initiate" in _e_str:
+                        col_user_verification.update_one(
+                            {"user_id": uid},
+                            {"$set": {"bot_unreachable": True, "bot_unreachable_reason": str(_e)[:200]}}
+                        )
+
+            if sent:
+                logger.info(f"[STORE_PROMO] Sent {sent} store promo messages this cycle")
+
+        except asyncio.CancelledError:
+            break
+        except Exception as _se:
+            logger.error(f"[STORE_PROMO] Scheduler error: {_se}")
+
+        await asyncio.sleep(8 * 3600)  # Every 8 hours
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2️⃣ REFERRAL NUDGE SCHEDULER — "You haven't used your invite link yet"
+# ─────────────────────────────────────────────────────────────────────────────
+# Psychology: Social proof + Loss aversion + Minimal effort CTA.
+# Target: Users who joined 3+ days ago but have ZERO referrals.
+# Sent ONCE per user (dedup via `referral_nudge_sent` flag).
+# Runs every 24 hours. Max 8 users per run.
+
+async def referral_nudge_scheduler():
+    """
+    Every 24 hours: Find vault members with 0 referrals who joined 3+ days ago.
+    Send them a single, friendly reminder that they can earn credits by referring.
+    Fires at most ONCE per user lifetime (stamps referral_nudge_sent=True).
+    """
+    logger.info("[REFERRAL_NUDGE] Scheduler started")
+    await asyncio.sleep(300)  # 5 min delay after boot
+
+    while True:
+        try:
+            cutoff = now_local() - timedelta(days=3)
+
+            # Users who: are in vault, joined 3+ days ago, haven't been nudged
+            candidates = list(col_user_verification.find(
+                {
+                    "vault_joined": True,
+                    "vault_joined_at": {"$lte": cutoff},
+                    "referral_nudge_sent": {"$ne": True},
+                    "bot_unreachable": {"$ne": True},
+                },
+                {"user_id": 1, "first_name": 1}
+            ).limit(30))
+
+            # Filter to those with 0 confirmed referrals
+            sent = 0
+            settings = get_economy_settings()
+            ref_pts = settings["referral_pts"]
+            vault_count = await get_vault_member_count_async()
+
+            for doc in candidates:
+                if sent >= 8:
+                    break
+
+                uid = doc["user_id"]
+                ref_count = col_referrals.count_documents({"referrer_id": uid})
+                if ref_count > 0:
+                    # Already referred someone — skip and mark
+                    col_user_verification.update_one(
+                        {"user_id": uid}, {"$set": {"referral_nudge_sent": True}}
+                    )
+                    continue
+
+                # ── 24h global cooldown ───────────────────────────────────
+                if not await _can_send_auto_msg(uid):
+                    continue
+
+                name = doc.get("first_name") or "Agent"
+                try:
+                    await bot.send_message(
+                        uid,
+                        f"🤝 <b>{name} — Did you know?</b>\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                        f"Every friend you bring into the Vault earns you "
+                        f"<b>+{ref_pts} MSA Credits</b> — automatically.\n\n"
+                        f"No extra steps. They join through your link, stay 48 hours, "
+                        f"and you get credited.\n\n"
+                        f"📊 <b>{vault_count:,} members</b> are already here.\n"
+                        f"Some of them got in through a friend's link — "
+                        f"and that friend earned credits for it.\n\n"
+                        f"📌 <i>Tap</i> <b>🤝 REFERRAL</b> <i>in your menu to get your invite link.</i>\n\n"
+                        f"<i>One share is all it takes.</i>",
+                        parse_mode="HTML"
+                    )
+                    col_user_verification.update_one(
+                        {"user_id": uid},
+                        {"$set": {"referral_nudge_sent": True}}
+                    )
+                    await _stamp_auto_msg(uid)
+                    sent += 1
+                    log_to_terminal("REFERRAL_NUDGE", uid, f"First-time referral reminder sent")
+                    await asyncio.sleep(1)
+                except Exception as _e:
+                    _e_str = str(_e).lower()
+                    if "forbidden" in _e_str or "chat not found" in _e_str or "bot can't initiate" in _e_str:
+                        col_user_verification.update_one(
+                            {"user_id": uid},
+                            {"$set": {"bot_unreachable": True, "bot_unreachable_reason": str(_e)[:200]}}
+                        )
+
+            if sent:
+                logger.info(f"[REFERRAL_NUDGE] Sent {sent} referral nudge messages")
+
+        except asyncio.CancelledError:
+            break
+        except Exception as _se:
+            logger.error(f"[REFERRAL_NUDGE] Scheduler error: {_se}")
+
+        await asyncio.sleep(24 * 3600)  # Once every 24 hours
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3️⃣ LEADERBOARD MOTIVATOR SCHEDULER — Weekly FOMO + Progress Awareness
+# ─────────────────────────────────────────────────────────────────────────────
+# Psychology: Social comparison theory + FOMO + Gamification.
+# Sends a mini-leaderboard and the user's rank to active members weekly.
+# Only targets users who have credits (shows they're engaged in the economy).
+# Runs once per week (every Sunday at ~20:00 UTC).
+
+async def leaderboard_motivator_scheduler():
+    """
+    Weekly (Sunday ~20:00 UTC): Send a mini-leaderboard snippet to engaged members.
+    Shows top 3 + user's own rank. Creates healthy competition and FOMO.
+    Dedup: one message per user per week (tracked via leaderboard_last_week).
+    """
+    logger.info("[LEADERBOARD_MOTIVE] Scheduler started")
+    await asyncio.sleep(600)  # 10 min delay after boot
+
+    while True:
+        try:
+            now = now_local()
+            # Wait until Sunday 20:00 UTC
+            days_ahead = (6 - now.weekday()) % 7  # 6 = Sunday
+            if days_ahead == 0 and now.hour >= 20:
+                days_ahead = 7  # Already past Sunday 20:00, wait for next week
+            target = now.replace(hour=20, minute=0, second=0, microsecond=0) + timedelta(days=days_ahead)
+            wait_secs = (target - now).total_seconds()
+            if wait_secs > 0:
+                await asyncio.sleep(wait_secs)
+
+            # ── Build top-5 leaderboard ───────────────────────────────────
+            run_now = now_local()
+            week_iso = run_now.isocalendar()[1]  # ISO week number
+
+            top_pipeline = [
+                {"$match": {"balance": {"$gt": 0}}},
+                {"$sort": {"balance": -1}},
+                {"$limit": 5}
+            ]
+            top_5 = list(col_msa_credits.aggregate(top_pipeline))
+            if not top_5:
+                logger.info("[LEADERBOARD_MOTIVE] No users with credits — skipping")
+                await asyncio.sleep(3600)  # Re-check in 1 hour
+                continue
+
+            # Build top-5 text
+            medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
+            top_lines = []
+            for i, entry in enumerate(top_5):
+                t_uid = entry["user_id"]
+                t_bal = entry["balance"]
+                t_doc = col_user_verification.find_one({"user_id": t_uid}, {"first_name": 1})
+                t_name = (t_doc or {}).get("first_name") or "Agent"
+                badge = (t_doc or {}).get("referral_tier_badge", "")
+                top_lines.append(f"  {medals[i]} <b>{t_name}</b>{' ' + badge if badge else ''} — {t_bal:,} credits")
+
+            top_text = "\n".join(top_lines)
+
+            # ── Send to engaged users ─────────────────────────────────────
+            # Target: users with balance > 0 who haven't got this week's message
+            recipients = list(col_msa_credits.find(
+                {"balance": {"$gt": 0}},
+                {"user_id": 1, "balance": 1}
+            ).limit(100))
+
+            sent = 0
+            vault_count = await get_vault_member_count_async()
+
+            for cred_doc in recipients:
+                if sent >= 10:
+                    break
+
+                uid = cred_doc["user_id"]
+                balance = cred_doc["balance"]
+
+                uv = col_user_verification.find_one(
+                    {"user_id": uid},
+                    {"vault_joined": 1, "bot_unreachable": 1, "first_name": 1, "leaderboard_last_week": 1}
+                )
+                if not uv or not uv.get("vault_joined") or uv.get("bot_unreachable"):
+                    continue
+
+                # Already sent this week
+                if uv.get("leaderboard_last_week") == week_iso:
+                    continue
+
+                # 24h global cooldown
+                if not await _can_send_auto_msg(uid):
+                    continue
+
+                name = uv.get("first_name") or "Agent"
+
+                # Calculate user's rank
+                rank = col_msa_credits.count_documents({"balance": {"$gt": balance}}) + 1
+
+                # Find next person above them
+                above = col_msa_credits.find_one(
+                    {"balance": {"$gt": balance}},
+                    {"balance": 1},
+                    sort=[("balance", 1)]  # Closest person above
+                )
+                gap_text = ""
+                if above:
+                    gap = above["balance"] - balance
+                    gap_text = f"\n\n📈 You're <b>{gap}</b> credits away from climbing one spot."
+
+                try:
+                    await bot.send_message(
+                        uid,
+                        f"🏆 <b>Weekly Leaderboard — {name}</b>\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                        f"<b>🔥 Top 5 This Week:</b>\n"
+                        f"{top_text}\n\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                        f"📊 <b>Your Position:</b> #{rank}\n"
+                        f"💳 <b>Your Balance:</b> {balance:,} credits"
+                        f"{gap_text}\n\n"
+                        f"👥 <b>{vault_count:,} members</b> in the vault.\n\n"
+                        f"<i>Earn more via referrals, link drops, and IG bounties.</i>",
+                        parse_mode="HTML"
+                    )
+                    col_user_verification.update_one(
+                        {"user_id": uid},
+                        {"$set": {"leaderboard_last_week": week_iso}}
+                    )
+                    await _stamp_auto_msg(uid)
+                    sent += 1
+                    log_to_terminal("LEADERBOARD_MOTIVE", uid, f"Rank #{rank}, bal={balance}")
+                    await asyncio.sleep(1)
+                except Exception as _e:
+                    _e_str = str(_e).lower()
+                    if "forbidden" in _e_str or "chat not found" in _e_str or "bot can't initiate" in _e_str:
+                        col_user_verification.update_one(
+                            {"user_id": uid},
+                            {"$set": {"bot_unreachable": True, "bot_unreachable_reason": str(_e)[:200]}}
+                        )
+
+            if sent:
+                logger.info(f"[LEADERBOARD_MOTIVE] Sent {sent} weekly leaderboard messages (week {week_iso})")
+
+        except asyncio.CancelledError:
+            break
+        except Exception as _se:
+            logger.error(f"[LEADERBOARD_MOTIVE] Scheduler error: {_se}")
+
+        await asyncio.sleep(3600)  # After run, sleep 1h before recalculating
+
+
+# ==========================================
+# FEATURE #4 — VAULT ANNIVERSARY DM SYSTEM
+# ==========================================
+# Sends personalized anniversary DMs at 1, 3, and 6 months of vault membership.
+# Bonus credits awarded at each milestone. Fires exactly once per milestone.
+
+_ANNIVERSARY_MILESTONES = [
+    {
+        "days":    30,
+        "key":     "ann_1m",
+        "label":   "1 Month",
+        "emoji":   "🥉",
+        "message": (
+            "You've been in the Vault for <b>1 month</b> — and that's already more commitment "
+            "than 90% of people who try. That matters.\n\n"
+            "Keep building. The compounding starts here."
+        ),
+        "credits": 15,
+    },
+    {
+        "days":    90,
+        "key":     "ann_3m",
+        "label":   "3 Months",
+        "emoji":   "🥈",
+        "message": (
+            "<b>3 months in the Vault.</b> Quarter milestone — the point where most people "
+            "either commit fully or drift. You're still here.\n\n"
+            "That's a signal worth rewarding."
+        ),
+        "credits": 30,
+    },
+    {
+        "days":    180,
+        "key":     "ann_6m",
+        "label":   "6 Months",
+        "emoji":   "🥇",
+        "message": (
+            "<b>6 months. Half a year inside the Vault.</b>\n\n"
+            "You're part of the core — the group that shows up consistently. "
+            "That puts you in rare company. This bonus is a small recognition of that."
+        ),
+        "credits": 60,
+    },
+]
+
+async def vault_anniversary_scheduler():
+    """
+    Runs every 6 hours.
+    Finds vault members who have reached 1/3/6 month anniversaries since MSA ID allocation.
+    Sends personalized DM + awards bonus credits. Fires exactly once per milestone (deduped).
+    """
+    while True:
+        try:
+            now = now_local()
+            for milestone in _ANNIVERSARY_MILESTONES:
+                cutoff_date = now - timedelta(days=milestone["days"])
+                key         = milestone["key"]
+
+                # Find MSA IDs allocated on or before the cutoff (milestone day reached)
+                # that haven't had this anniversary fired yet
+                msa_docs = list(col_msa_ids.find(
+                    {
+                        "allocated_at":    {"$lte": cutoff_date},
+                        f"anniversary.{key}": {"$exists": False},
+                    },
+                    {"user_id": 1, "msa_id": 1, "allocated_at": 1}
+                ).limit(50))  # Process max 50 per run to avoid long blocks
+
+                for msa in msa_docs:
+                    uid    = msa["user_id"]
+                    msa_id = msa.get("msa_id", "")
+                    # Only send to current vault members
+                    uv = col_user_verification.find_one(
+                        {"user_id": uid, "vault_joined": True},
+                        {"first_name": 1}
+                    )
+                    if not uv:
+                        # Mark so we skip non-members silently and don't re-check
+                        col_msa_ids.update_one(
+                            {"user_id": uid},
+                            {"$set": {f"anniversary.{key}": False}}
+                        )
+                        continue
+
+                    first_name = uv.get("first_name") or "Member"
+                    credits    = milestone["credits"]
+
+                    try:
+                        # Award bonus credits
+                        new_bal = _award_msa_credits(uid, credits, f"Anniversary bonus — {milestone['label']}")
+
+                        # Send anniversary DM
+                        await bot.send_message(
+                            uid,
+                            f"{milestone['emoji']} <b>{first_name}, Happy {milestone['label']} Anniversary!</b>\n"
+                            f"━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                            f"{milestone['message']}\n\n"
+                            f"━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                            f"🎁 <b>Anniversary Bonus:</b> +{credits} MSA Credits added to your account\n"
+                            f"💳 <b>New Balance:</b> <code>{new_bal} MSA Credits</code>\n\n"
+                            f"Your MSA ID: <code>{msa_id}</code>",
+                            parse_mode="HTML"
+                        )
+
+                        # Stamp dedup flag
+                        col_msa_ids.update_one(
+                            {"user_id": uid},
+                            {"$set": {f"anniversary.{key}": True, f"anniversary.{key}_fired_at": now}}
+                        )
+                        log_to_terminal("ANNIVERSARY", uid, f"{milestone['label']} — +{credits} credits — {first_name}")
+                        await asyncio.sleep(0.4)
+
+                    except Exception as _dm_err:
+                        logger.warning(f"[ANNIVERSARY] DM failed for {uid}: {_dm_err}")
+                        col_msa_ids.update_one(
+                            {"user_id": uid},
+                            {"$set": {f"anniversary.{key}": False}}  # retry next run
+                        )
+
+            logger.info("[ANNIVERSARY] Scheduler run complete")
+
+        except asyncio.CancelledError:
+            break
+        except Exception as _ae:
+            logger.error(f"[ANNIVERSARY] Scheduler error: {_ae}")
+
+        await asyncio.sleep(6 * 3600)  # Run every 6 hours
+
+
+# ==========================================
 # AUTO-BACKUP SYSTEM
 # ==========================================
 _BOT1_LAST_BACKUP_KEY = "bot1_last_auto_backup"
@@ -12210,17 +12910,25 @@ async def auto_backup_bot1():
                 continue
             logger.info("BOT 1 AUTO-BACKUP STARTING")
             collections_to_backup = [
-                ("bot1_user_verification",  col_user_verification),
-                ("bot1_msa_ids",            col_msa_ids),
-                ("bot1_support_tickets",    col_support_tickets),
-                ("bot1_banned_users",       col_banned_users),
-                ("bot1_suspended_features", col_suspended_features),
-                # ── Economy & Credits (critical — must never be lost) ──────────────────
-                ("bot1_referrals",          col_referrals),
-                ("bot1_msa_credits",        col_msa_credits),
-                ("bot1_state_persistence",  db["bot1_state_persistence"]),  # economy_settings doc
-                ("bot3_store_items",        col_store_items),               # Vault Shop inventory
-                ("bot1_reviews",            col_reviews),                   # ⭐ Agent Ratings & Social Proof
+                ("bot1_user_verification",       col_user_verification),
+                ("bot1_msa_ids",                 col_msa_ids),
+                ("bot1_support_tickets",         col_support_tickets),
+                ("bot1_banned_users",            col_banned_users),
+                ("bot1_suspended_features",      col_suspended_features),
+                # ── Global settings & permanent bans (critical — must never be lost) ──
+                ("bot1_settings",                col_bot1_settings),                    # Maintenance mode, flags
+                ("bot1_permanently_banned_msa",  db["bot1_permanently_banned_msa"]),    # Permanent ban registry
+                # ── Economy & Credits (critical — must never be lost) ─────────────────
+                ("bot1_referrals",               col_referrals),
+                ("bot1_msa_credits",             col_msa_credits),
+                ("bot1_state_persistence",       db["bot1_state_persistence"]),         # economy_settings doc
+                ("bot1_reviews",                 col_reviews),                          # ⭐ Agent Ratings & Social Proof
+                # ── Bot 3 cross-collections used by Bot 1 (not auto-discovered by bot2) ──
+                ("bot3_store_items",             col_store_items),                      # Vault Shop inventory
+                ("bot3_milestones",              col_milestones),                       # Referral milestone tiers
+                ("bot3_rewards",                 col_rewards),                          # Referral reward pool
+                # ── Source attribution (critical for analytics & reward delivery) ──────
+                ("bot2_user_tracking",           db["bot2_user_tracking"]),             # User IG/YT/IGCC source lock
             ]
 
             collection_counts: dict[str, int] = {}
@@ -12955,6 +13663,92 @@ async def vault_nudge_scheduler():
 
 
 
+async def weekly_referral_channel_leaderboard_scheduler():
+    """
+    Every Sunday at 10:00 local time — post a public referral leaderboard
+    to the VAULT CHANNEL (not DM'd to members).
+    Shows top 5 referrers of the past 7 days with referral counts.
+    Dedup: one post per ISO-week, tracked in-memory.
+    """
+    _sent_weeks: set = set()
+    logger.info("[REF LEADERBOARD] Sunday channel post scheduler started — runs at 10:00 AM")
+
+    while True:
+        try:
+            now = now_local()
+            # Sunday = weekday 6
+            days_until_sunday = (6 - now.weekday()) % 7 or 7
+            next_run = now.replace(hour=10, minute=0, second=0, microsecond=0) + timedelta(days=days_until_sunday)
+            wait_secs = (next_run - now).total_seconds()
+            await asyncio.sleep(max(wait_secs, 60))
+
+            now = now_local()
+            week_key = f"refboard_{now.isocalendar()[0]}_W{now.isocalendar()[1]}"
+            if week_key in _sent_weeks:
+                await asyncio.sleep(3600)
+                continue
+
+            week_start = now - timedelta(days=7)
+
+            # ── Top 5 referrers (by confirmed refs in last 7 days) ────────────
+            try:
+                pipeline = [
+                    {"$match": {"status": "confirmed", "confirmed_at": {"$gte": week_start}}},
+                    {"$group": {"_id": "$referrer_id", "count": {"$sum": 1}}},
+                    {"$sort": {"count": -1}},
+                    {"$limit": 5},
+                ]
+                top_refs = list(col_referrals.aggregate(pipeline))
+            except Exception as _pe:
+                logger.error(f"[REF LEADERBOARD] Pipeline error: {_pe}")
+                await asyncio.sleep(3600)
+                continue
+
+            if not top_refs:
+                logger.info("[REF LEADERBOARD] No confirmed referrals this week — skipping post")
+                _sent_weeks.add(week_key)
+                continue
+
+            medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
+            board_lines = []
+            for idx, row in enumerate(top_refs):
+                uid   = row["_id"]
+                cnt   = row["count"]
+                doc   = col_user_verification.find_one({"user_id": uid}, {"first_name": 1})
+                fname = (doc or {}).get("first_name") or f"Agent {str(uid)[-4:]}"
+                board_lines.append(f"{medals[idx]} *{_escape_md(fname)}* — {cnt} referral{'s' if cnt != 1 else ''} this week")
+
+            board_text = "\n".join(board_lines)
+            week_label  = week_start.strftime("%b %d") + " – " + now.strftime("%b %d")
+
+            post = (
+                f"🏆 *WEEKLY REFERRAL LEADERBOARD*\n\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"📅 Week of {week_label}\n\n"
+                f"Top agents who brought the most people into the Vault this week:\n\n"
+                f"{board_text}\n\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"🎯 *Want to be on this list next Sunday?*\n"
+                f"Every person you invite earns you MSA Credits.\n"
+                f"Tap 🤝 REFERRAL in the bot menu to get your link."
+            )
+
+            try:
+                await bot.send_message(CHANNEL_ID, post, parse_mode="Markdown")
+                _sent_weeks.add(week_key)
+                logger.info(f"[REF LEADERBOARD] Week {week_key} — posted to vault channel. Top: {top_refs[0]['_id']} ({top_refs[0]['count']} refs)")
+                log_to_terminal("REF_LEADERBOARD", 0, f"Sunday referral leaderboard posted to channel. Top referrer: {top_refs[0]['count']} refs.")
+            except Exception as _send_err:
+                logger.error(f"[REF LEADERBOARD] Channel post failed: {_send_err}")
+
+        except asyncio.CancelledError:
+            logger.info("[REF LEADERBOARD] Scheduler stopping...")
+            raise
+        except Exception as _le:
+            logger.error(f"[REF LEADERBOARD] Scheduler error: {_le}")
+            await asyncio.sleep(3600)
+
+
 async def weekly_leaderboard_scheduler():
     """
     Runs every Sunday at 09:00 local time.
@@ -13467,6 +14261,13 @@ async def main():
             asyncio.create_task(blocked_user_reengagement_scheduler(), name="block_reengagement"),
             asyncio.create_task(vault_member_reengagement_scheduler(), name="vault_reengagement"),
             asyncio.create_task(referral_payout_scheduler(),           name="referral_payout"),
+            asyncio.create_task(credit_expiry_warning_scheduler(),     name="credit_expiry"),       # Feature #1
+            asyncio.create_task(vault_anniversary_scheduler(),         name="vault_anniversary"),   # Feature #4
+            # ── Smart Engagement System ─────────────────────────────────────────
+            asyncio.create_task(store_promo_scheduler(),               name="store_promo"),         # Store credit nudges
+            asyncio.create_task(referral_nudge_scheduler(),            name="referral_nudge"),      # One-time referral reminder
+            asyncio.create_task(leaderboard_motivator_scheduler(),     name="leaderboard_motive"),  # Weekly FOMO leaderboard
+            asyncio.create_task(weekly_referral_channel_leaderboard_scheduler(), name="ref_channel_leaderboard"),  # Sunday public referral board → vault channel
         ]
         
         # ── NEW: Unified weekly backup (reads PROD → writes to BACKUP cluster) ──
