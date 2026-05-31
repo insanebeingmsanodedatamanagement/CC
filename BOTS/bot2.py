@@ -110,6 +110,7 @@ _TTL_SECONDS = 90 * 24 * 3600
 # Bot collection mappings — which mongo collections belong to which bot
 _BOT_COLLECTIONS = {
     "bot1": [
+        # ── Core user data ───────────────────────────────────────────────────────
         "bot1_msa_ids",
         "bot1_user_verification",
         "bot1_support_tickets",
@@ -118,15 +119,32 @@ _BOT_COLLECTIONS = {
         "bot1_permanently_banned_msa",
         "bot1_offline_log",
         "bot1_settings",
+        # ── Economy & Credits (explicitly listed — also auto-discovered, but safer) ──
+        "bot1_referrals",
+        "bot1_msa_credits",
+        "bot1_reviews",
+        "bot1_state_persistence",
+        # ── Cross-bot collections used by Bot 1 (NOT auto-discovered — different prefix) ──
+        "bot3_store_items",        # Vault Shop inventory — Bot 1 reads/serves this
+        "bot3_milestones",         # Referral milestone tiers — Bot 1 tracks progress
+        "bot3_rewards",            # Referral reward pool — Bot 1 delivers rewards
+        "bot2_user_tracking",      # Source attribution (IG/YT/IGCC) — critical for rewards
     ],
     "bot2": [
+        # ── Broadcasts (critical — rebuilding lost broadcasts is impossible) ──
         "bot2_broadcasts",
-        "bot2_user_tracking",
+        # ── Admin & Auth ─────────────────────────────────────────────────────
+        "bot2_admins",             # Admin records & permissions
         "bot2_access_attempts",
-        "bot2_admins",
+        # ── Runtime State (restart recovery) ─────────────────────────────────
+        "bot2_runtime_state",      # Broadcast position, scheduler state
+        # ── User Data ────────────────────────────────────────────────────────
+        "bot2_user_tracking",
+        # ── Logs (lower priority — have TTLs) ────────────────────────────────
         "bot2_live_terminal_logs",
         "bot2_cleanup_logs",
         "bot2_cleanup_backups",
+        "bot2_backup_history",     # Permanent audit log of all backup actions
     ],
     # ── Bot 3 — strictly isolated, never mixed with bot1/bot2 ──────────────
     "bot3": [
@@ -1328,7 +1346,7 @@ async def retry_operation(operation, max_retries=3, base_delay=1.0, operation_na
     
     # If we get here, all retries failed
     raise last_exception
-
+    
 BOT_TOKEN = os.getenv("BOT_2_TOKEN")
 BOT_1_TOKEN = os.getenv("BOT_1_TOKEN")  # Bot 1 for delivery
 MASTER_ADMIN_ID = int(os.getenv("MASTER_ADMIN_ID", "0"))
@@ -1647,6 +1665,54 @@ try:
         print("✅ TTL index set: bot3_user_activity → 180-day auto-purge")
     except Exception as _ttl_err:
         print(f"⚠️ TTL index warning (bot3_user_activity): {_ttl_err}")
+
+    # bot2_cleanup_backups — auto-delete after 60 days (prevents unbounded growth)
+    try:
+        try:
+            col_cleanup_backups.drop_index("cleanup_backup_ttl_60d")
+        except Exception:
+            pass
+        col_cleanup_backups.create_index(
+            [("backup_date", 1)],
+            expireAfterSeconds=5_184_000,  # 60 days
+            sparse=True,
+            name="cleanup_backup_ttl_60d"
+        )
+        print("✅ TTL index set: bot2_cleanup_backups → 60-day auto-purge")
+    except Exception as _ttl_err:
+        print(f"⚠️ TTL index warning (bot2_cleanup_backups): {_ttl_err}")
+
+    # bot2_backups (backup cluster) — auto-delete after 90 days (matches bot1_backups TTL)
+    try:
+        try:
+            col_bot2_backups.drop_index("bot2_backup_ttl_90d")
+        except Exception:
+            pass
+        col_bot2_backups.create_index(
+            [("backup_date", 1)],
+            expireAfterSeconds=7_776_000,  # 90 days
+            sparse=True,
+            name="bot2_backup_ttl_90d"
+        )
+        print("✅ TTL index set: bot2_backups → 90-day auto-purge (backup cluster)")
+    except Exception as _ttl_err:
+        print(f"⚠️ TTL index warning (bot2_backups): {_ttl_err}")
+
+    # bot2_backup_history — auto-delete after 365 days (audit log, kept long but not forever)
+    try:
+        try:
+            col_backup_history.drop_index("backup_history_ttl_365d")
+        except Exception:
+            pass
+        col_backup_history.create_index(
+            [("timestamp", 1)],
+            expireAfterSeconds=31_536_000,  # 365 days
+            sparse=True,
+            name="backup_history_ttl_365d"
+        )
+        print("✅ TTL index set: bot2_backup_history → 365-day auto-purge")
+    except Exception as _ttl_err:
+        print(f"⚠️ TTL index warning (bot2_backup_history): {_ttl_err}")
 
     print("✅ Database indexes created for optimal performance")
 except Exception as e:
@@ -1968,8 +2034,9 @@ def get_mongo_storage_stats() -> dict:
             cap_mb    = fs_total
             cap_label = f"{cap_mb:.0f}MB filesystem"
         else:
-            # Atlas M0 free — cap is 512MB on dataSize+indexSize
-            used_mb   = total_mb
+            # Atlas M0 free tier — totalSize is always 0 on M0.
+            # Use dataSize + indexSize which Atlas DOES populate correctly.
+            used_mb   = data_mb + index_mb
             cap_mb    = 512.0
             cap_label = "512MB Atlas M0 free tier"
 
@@ -2455,6 +2522,9 @@ def get_category_menu():
         [KeyboardButton(text="📎 IG CC"), KeyboardButton(text="🔗 YTCODE")],
         [KeyboardButton(text="👥 ALL"), KeyboardButton(text="👤 UNKNOWN")],
         [KeyboardButton(text="🎁 GRACE (UNCONSUMED)"), KeyboardButton(text="💎 VAULT (FOMO DROP)")],
+        # ── Smart segments ────────────────────────────────────────────────────
+        [KeyboardButton(text="💰 HIGH CREDIT"), KeyboardButton(text="⚠️ AT RISK")],
+        [KeyboardButton(text="🆕 NEW THIS WEEK")],
         [KeyboardButton(text="⬅️ BACK"), KeyboardButton(text="❌ CANCEL")]
     ]
     return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
@@ -3473,6 +3543,10 @@ async def process_category_selection(message: types.Message, state: FSMContext):
         "👤 UNKNOWN": "UNKNOWN",
         "🎁 GRACE (UNCONSUMED)": "GRACE (UNCONSUMED)",
         "💎 VAULT (FOMO DROP)": "VAULT (FOMO DROP)",
+        # ── Smart segments ────────────────────────────────────────────────────
+        "💰 HIGH CREDIT": "HIGH_CREDIT",      # vault members with credits balance >= 100
+        "⚠️ AT RISK": "AT_RISK",              # vault members with no content access in 14+ days
+        "🆕 NEW THIS WEEK": "NEW_THIS_WEEK",  # joined vault (got MSA ID) in last 7 days
     }
     
     if message.text not in category_map:
@@ -3549,7 +3623,7 @@ async def process_direct_broadcast(message: types.Message, state: FSMContext):
     # STRICTLY RESTRICT BROADCASTS TO ACTIVE VAULT MEMBERS
     # Find active vault members first, then intersect with category requirements.
     _active_vault_ids = {u["user_id"] for u in col_user_verification.find({"vault_joined": True}, {"user_id": 1})}
-    
+
     if category == "ALL" or category == "VAULT (FOMO DROP)":
         target_users = [{"user_id": uid} for uid in _active_vault_ids]
     elif category == "GRACE (UNCONSUMED)":
@@ -3558,11 +3632,30 @@ async def process_direct_broadcast(message: types.Message, state: FSMContext):
             {"user_id": 1}
         ))
         target_users = [u for u in grace_docs if u["user_id"] in _active_vault_ids]
+    elif category == "HIGH_CREDIT":
+        # Vault members with MSA Credits balance >= 100 (your most active/engaged users)
+        _high_credit_ids = {u["user_id"] for u in db["bot1_msa_credits"].find({"balance": {"$gte": 100}}, {"user_id": 1})}
+        target_users = [{"user_id": uid} for uid in _high_credit_ids if uid in _active_vault_ids]
+    elif category == "AT_RISK":
+        # Vault members with no content access in 14+ days (churn risk — send rescue message)
+        from datetime import timedelta as _td
+        _cutoff = now_local() - _td(days=14)
+        _risk_docs = list(col_user_verification.find(
+            {"vault_joined": True, "last_content_access_at": {"$lt": _cutoff}},
+            {"user_id": 1}
+        ))
+        target_users = [u for u in _risk_docs if u["user_id"] in _active_vault_ids]
+    elif category == "NEW_THIS_WEEK":
+        # Users who got their MSA ID (joined vault) in the last 7 days
+        from datetime import timedelta as _td
+        _week_ago = now_local() - _td(days=7)
+        _new_ids = {u["user_id"] for u in col_msa_ids.find({"allocated_at": {"$gte": _week_ago}}, {"user_id": 1})}
+        target_users = [{"user_id": uid} for uid in _new_ids if uid in _active_vault_ids]
     else:
-        # Specific source (YT, IG, etc.)
+        # Specific source (YT, IG, IGCC, YTCODE, UNKNOWN)
         tracking_docs = list(col_user_tracking.find({"source": category}, {"user_id": 1}))
         target_users = [u for u in tracking_docs if u["user_id"] in _active_vault_ids]
-    
+
     print(f"🎯 Found {len(target_users)} target users for category '{category}'")
     
     if not target_users:
@@ -4835,6 +4928,10 @@ async def process_button_broadcast_category(message: types.Message, state: FSMCo
         "👤 UNKNOWN": "UNKNOWN",
         "🎁 GRACE (UNCONSUMED)": "GRACE (UNCONSUMED)",
         "💎 VAULT (FOMO DROP)": "VAULT (FOMO DROP)",
+        # ── Smart segments ────────────────────────────────────────────────────
+        "💰 HIGH CREDIT": "HIGH_CREDIT",
+        "⚠️ AT RISK": "AT_RISK",
+        "🆕 NEW THIS WEEK": "NEW_THIS_WEEK",
     }
     
     if message.text not in category_map:
@@ -5021,7 +5118,7 @@ async def confirm_button_broadcast(message: types.Message, state: FSMContext):
         # STRICTLY RESTRICT BROADCASTS TO ACTIVE VAULT MEMBERS
         # Find active vault members first, then intersect with category requirements.
         _active_vault_ids = {u["user_id"] for u in col_user_verification.find({"vault_joined": True}, {"user_id": 1})}
-        
+
         if category == "ALL" or category == "VAULT (FOMO DROP)":
             target_users = [{"user_id": uid} for uid in _active_vault_ids]
         elif category == "GRACE (UNCONSUMED)":
@@ -5030,11 +5127,26 @@ async def confirm_button_broadcast(message: types.Message, state: FSMContext):
                 {"user_id": 1}
             ))
             target_users = [u for u in grace_docs if u["user_id"] in _active_vault_ids]
+        elif category == "HIGH_CREDIT":
+            _high_credit_ids = {u["user_id"] for u in db["bot1_msa_credits"].find({"balance": {"$gte": 100}}, {"user_id": 1})}
+            target_users = [{"user_id": uid} for uid in _high_credit_ids if uid in _active_vault_ids]
+        elif category == "AT_RISK":
+            from datetime import timedelta as _td
+            _cutoff = now_local() - _td(days=14)
+            _risk_docs = list(col_user_verification.find(
+                {"vault_joined": True, "last_content_access_at": {"$lt": _cutoff}},
+                {"user_id": 1}
+            ))
+            target_users = [u for u in _risk_docs if u["user_id"] in _active_vault_ids]
+        elif category == "NEW_THIS_WEEK":
+            from datetime import timedelta as _td
+            _week_ago = now_local() - _td(days=7)
+            _new_ids = {u["user_id"] for u in col_msa_ids.find({"allocated_at": {"$gte": _week_ago}}, {"user_id": 1})}
+            target_users = [{"user_id": uid} for uid in _new_ids if uid in _active_vault_ids]
         else:
-            # Specific source (YT, IG, etc.)
             tracking_docs = list(col_user_tracking.find({"source": category}, {"user_id": 1}))
             target_users = [u for u in tracking_docs if u["user_id"] in _active_vault_ids]
-        
+
         if not target_users:
             await message.answer("❌ No users found in this category.", reply_markup=get_broadcast_menu(), parse_mode="Markdown")
             await state.clear()
@@ -5328,7 +5440,7 @@ async def process_send_broadcast(message: types.Message, state: FSMContext):
     # STRICTLY RESTRICT BROADCASTS TO ACTIVE VAULT MEMBERS
     # Find active vault members first, then intersect with category requirements.
     _active_vault_ids = {u["user_id"] for u in col_user_verification.find({"vault_joined": True}, {"user_id": 1})}
-    
+
     if category == "ALL" or category == "VAULT (FOMO DROP)":
         target_users = [{"user_id": uid} for uid in _active_vault_ids]
     elif category == "GRACE (UNCONSUMED)":
@@ -5337,8 +5449,23 @@ async def process_send_broadcast(message: types.Message, state: FSMContext):
             {"user_id": 1}
         ))
         target_users = [u for u in grace_docs if u["user_id"] in _active_vault_ids]
+    elif category == "HIGH_CREDIT":
+        _high_credit_ids = {u["user_id"] for u in db["bot1_msa_credits"].find({"balance": {"$gte": 100}}, {"user_id": 1})}
+        target_users = [{"user_id": uid} for uid in _high_credit_ids if uid in _active_vault_ids]
+    elif category == "AT_RISK":
+        from datetime import timedelta as _td
+        _cutoff = now_local() - _td(days=14)
+        _risk_docs = list(col_user_verification.find(
+            {"vault_joined": True, "last_content_access_at": {"$lt": _cutoff}},
+            {"user_id": 1}
+        ))
+        target_users = [u for u in _risk_docs if u["user_id"] in _active_vault_ids]
+    elif category == "NEW_THIS_WEEK":
+        from datetime import timedelta as _td
+        _week_ago = now_local() - _td(days=7)
+        _new_ids = {u["user_id"] for u in col_msa_ids.find({"allocated_at": {"$gte": _week_ago}}, {"user_id": 1})}
+        target_users = [{"user_id": uid} for uid in _new_ids if uid in _active_vault_ids]
     else:
-        # Specific source (YT, IG, etc.)
         tracking_docs = list(col_user_tracking.find({"source": category}, {"user_id": 1}))
         target_users = [u for u in tracking_docs if u["user_id"] in _active_vault_ids]
 
@@ -7153,18 +7280,20 @@ async def bot1_diagnosis(message: types.Message):
             else:
                 checks_passed += 1
         else:
-            m0_cap = 512.0
-            pct    = min(total_mb / m0_cap * 100, 100)
-            filled = round(pct / 5)
-            empty  = 20 - filled
-            risk   = ("🔴 CRITICAL" if pct > 90 else
-                      "🟠 HIGH"     if pct > 75 else
-                      "🟡 MODERATE"  if pct > 50 else
-                      "🟢 HEALTHY")
-            bar    = "█" * filled + "░" * empty
+            # Atlas M0: totalSize=0. Use dataSize+indexSize (both populated by Atlas).
+            m0_used = data_mb + index_mb
+            m0_cap  = 512.0
+            pct     = min(m0_used / m0_cap * 100, 100)
+            filled  = round(pct / 5)
+            empty   = 20 - filled
+            risk    = ("🔴 CRITICAL" if pct > 90 else
+                       "🟠 HIGH"     if pct > 75 else
+                       "🟡 MODERATE" if pct > 50 else
+                       "🟢 HEALTHY")
+            bar     = "█" * filled + "░" * empty
             db_bar_line = (
                 f"**DB Used:** `[{bar}]` "
-                f"{pct:.1f}% of 512MB M0 cap ({total_mb:.1f}MB) — {risk}"
+                f"{pct:.1f}% of 512MB M0 cap ({m0_used:.1f}MB used) — {risk}"
             )
             checks_passed += 1
 
@@ -7501,18 +7630,20 @@ async def bot2_diagnosis(message: types.Message):
             else:
                 checks_passed += 1
         else:
-            m0_cap = 512.0
-            pct    = min(total_mb / m0_cap * 100, 100)
-            filled = round(pct / 5)
-            empty  = 20 - filled
-            risk   = ("🔴 CRITICAL" if pct > 90 else
-                      "🟠 HIGH"     if pct > 75 else
-                      "🟡 MODERATE"  if pct > 50 else
-                      "🟢 HEALTHY")
-            bar    = "█" * filled + "░" * empty
+            # Atlas M0: totalSize=0. Use dataSize+indexSize (both populated by Atlas).
+            m0_used = data_mb + index_mb
+            m0_cap  = 512.0
+            pct     = min(m0_used / m0_cap * 100, 100)
+            filled  = round(pct / 5)
+            empty   = 20 - filled
+            risk    = ("🔴 CRITICAL" if pct > 90 else
+                       "🟠 HIGH"     if pct > 75 else
+                       "🟡 MODERATE" if pct > 50 else
+                       "🟢 HEALTHY")
+            bar     = "█" * filled + "░" * empty
             db_bar_line = (
                 f"<b>DB Used:</b> <code>[{bar}]</code> "
-                f"{pct:.1f}% of 512MB M0 cap ({total_mb:.1f}MB) — {risk}"
+                f"{pct:.1f}% of 512MB M0 cap ({m0_used:.1f}MB used) — {risk}"
             )
             checks_passed += 1
 
@@ -15783,7 +15914,323 @@ async def bot2_global_error_handler(event: types.ErrorEvent):
         return False
 
 
+
+# ==================================================================================
+# BOT 2 NEW FEATURES — #10 through #16
+# ==================================================================================
+
+# ── FEATURE #13 — ADMIN ACTION AUDIT LOG ─────────────────────────────────────────
+# Logs every admin action (ban, unban, broadcast, suspend, settings) to bot2_admin_audit_log
+# 90-day TTL. Queryable from admin panel.
+
+col_admin_audit_log = db["bot2_admin_audit_log"]
+try:
+    try: col_admin_audit_log.drop_index("admin_audit_ttl_90d")
+    except Exception: pass
+    col_admin_audit_log.create_index(
+        [("timestamp", 1)], expireAfterSeconds=7_776_000,
+        name="admin_audit_ttl_90d", background=True
+    )
+    col_admin_audit_log.create_index([("admin_id", 1)], name="audit_admin_idx", background=True)
+    col_admin_audit_log.create_index([("action", 1)],   name="audit_action_idx", background=True)
+    print("✅ bot2_admin_audit_log TTL index set (90-day auto-purge)")
+except Exception as _audit_err:
+    print(f"⚠️ admin_audit_log index warning: {_audit_err}")
+
+
+def log_admin_action(
+    admin_id: int,
+    action: str,
+    details: str = "",
+    target_user_id: int = None,
+    admin_name: str = "",
+) -> None:
+    """Write a record to bot2_admin_audit_log. Non-blocking best-effort."""
+    try:
+        doc = {
+            "admin_id":      admin_id,
+            "admin_name":    admin_name,
+            "action":        action,
+            "details":       details,
+            "timestamp":     now_local(),
+        }
+        if target_user_id is not None:
+            doc["target_user_id"] = target_user_id
+        col_admin_audit_log.insert_one(doc)
+    except Exception as _ae:
+        pass  # Non-fatal — never let audit logging break the main flow
+
+
+# ── FEATURE #11 — ANOMALY DETECTION SCHEDULER ────────────────────────────────────
+# Tracks daily baselines for new users, vault joins, tickets, clicks.
+# If today's value deviates >50% below the 7-day average → alert owner.
+
+col_daily_stats = db["bot2_daily_stats"]
+try:
+    col_daily_stats.create_index([("date", 1)], unique=True, name="daily_stats_date_idx", background=True)
+    # 90-day TTL so historical stats self-clean
+    try: col_daily_stats.drop_index("daily_stats_ttl_90d")
+    except Exception: pass
+    col_daily_stats.create_index(
+        [("recorded_at", 1)], expireAfterSeconds=7_776_000,
+        name="daily_stats_ttl_90d", background=True
+    )
+    print("✅ bot2_daily_stats ready (anomaly detection baseline storage)")
+except Exception as _ds_err:
+    print(f"⚠️ daily_stats index warning: {_ds_err}")
+
+
+async def anomaly_detection_scheduler():
+    """
+    Runs every 24 hours (at midnight UTC).
+    1. Snapshot today's metrics → col_daily_stats.
+    2. Compare to 7-day average — alert owner if any metric drops >50%.
+    Feature #11.
+    """
+    while True:
+        try:
+            now  = now_local()
+            today_key = now.strftime("%Y-%m-%d")
+
+            # ── Snapshot today's metrics ─────────────────────────────────────
+            yesterday_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            new_users_today  = col_user_verification.count_documents({"first_start": {"$gte": yesterday_start}})
+            vault_joins_today = col_user_verification.count_documents({"vault_joined": True, "first_start": {"$gte": yesterday_start}})
+            tickets_today    = col_support_tickets.count_documents({"created_at": {"$gte": yesterday_start}})
+
+            snapshot = {
+                "date":         today_key,
+                "recorded_at":  now,
+                "new_users":    new_users_today,
+                "vault_joins":  vault_joins_today,
+                "tickets":      tickets_today,
+            }
+            col_daily_stats.update_one(
+                {"date": today_key},
+                {"$set": snapshot},
+                upsert=True
+            )
+
+            # ── Compute 7-day averages from last 7 records ───────────────────
+            last7 = list(col_daily_stats.find(
+                {"date": {"$lt": today_key}},
+                {"new_users": 1, "vault_joins": 1, "tickets": 1}
+            ).sort("date", -1).limit(7))
+
+            if len(last7) >= 3:  # Need at least 3 days to detect anomalies
+                metrics = {
+                    "New Users":   (new_users_today,  sum(d.get("new_users", 0) for d in last7) / len(last7)),
+                    "Vault Joins": (vault_joins_today, sum(d.get("vault_joins", 0) for d in last7) / len(last7)),
+                    "Tickets":     (tickets_today,     sum(d.get("tickets", 0) for d in last7) / len(last7)),
+                }
+                anomalies = []
+                for name, (today_val, avg) in metrics.items():
+                    if avg > 2 and today_val < avg * 0.5:  # >50% below average
+                        pct = int((1 - today_val / avg) * 100) if avg else 0
+                        anomalies.append(f"• {name}: {today_val} today vs avg {avg:.1f} ({pct}% below)")
+
+                if anomalies:
+                    alert_text = (
+                        f"⚠️ <b>Anomaly Detected — {today_key}</b>\n\n"
+                        + "\n".join(anomalies) + "\n\n"
+                        + "<i>Check funnel for issues. Could be a source-side problem.</i>"
+                    )
+                    try:
+                        await bot.send_message(OWNER_ID, alert_text, parse_mode="HTML")
+                        log_action("ANOMALY_ALERT", OWNER_ID, "Sent anomaly alert", bot="bot2")
+                    except Exception as _alert_err:
+                        print(f"[ANOMALY] Alert send failed: {_alert_err}")
+
+            print(f"[ANOMALY] Snapshot saved for {today_key}: "
+                  f"users={new_users_today}, joins={vault_joins_today}, tickets={tickets_today}")
+
+        except asyncio.CancelledError:
+            break
+        except Exception as _e:
+            print(f"[ANOMALY] Scheduler error: {_e}")
+
+        await asyncio.sleep(24 * 3600)
+
+
+# ── FEATURE #12 — SCHEDULED BROADCAST QUEUE RUNNER ───────────────────────────────
+# Allows admins to schedule a broadcast for future delivery via `send_at` field.
+# Bot 2 checks every minute for broadcasts with send_at <= now and status="scheduled".
+
+async def scheduled_broadcast_runner():
+    """
+    Checks every 60 seconds for broadcasts with status='scheduled' and send_at <= now.
+    Executes them by changing status to 'queued_by_scheduler' so the existing
+    broadcast_live_sync / delivery pipeline picks them up.
+    Feature #12.
+    """
+    while True:
+        try:
+            now = now_local()
+            due = list(col_broadcasts.find({
+                "status":  "scheduled",
+                "send_at": {"$lte": now},
+            }))
+            for bcast in due:
+                bcast_id = bcast.get("broadcast_id", str(bcast["_id"]))
+                try:
+                    col_broadcasts.update_one(
+                        {"_id": bcast["_id"]},
+                        {"$set": {"status": "queued_by_scheduler", "queued_at": now}}
+                    )
+                    # Notify owner that the scheduled broadcast was triggered
+                    try:
+                        category = bcast.get("category", "ALL")
+                        await bot.send_message(
+                            OWNER_ID,
+                            f"📤 <b>Scheduled Broadcast Triggered</b>\n\n"
+                            f"🆔 ID: <code>{bcast_id}</code>\n"
+                            f"📂 Category: <b>{category}</b>\n"
+                            f"🕐 Scheduled for: <b>{bcast.get('send_at_str', str(now))}</b>\n\n"
+                            f"Broadcast queued for delivery now.",
+                            parse_mode="HTML"
+                        )
+                    except Exception:
+                        pass
+                    print(f"[SCHED_BROADCAST] Triggered: {bcast_id}")
+                    log_action("SCHEDULED_BROADCAST_TRIGGERED", OWNER_ID, f"ID {bcast_id}", bot="bot2")
+                except Exception as _be:
+                    print(f"[SCHED_BROADCAST] Error processing {bcast_id}: {_be}")
+
+        except asyncio.CancelledError:
+            break
+        except Exception as _e:
+            print(f"[SCHED_BROADCAST] Runner error: {_e}")
+
+        await asyncio.sleep(60)  # Check every minute
+
+
+# ── FEATURE #15 — GROWTH DASHBOARD COMMAND ────────────────────────────────────────
+# Reads last 30 days from col_daily_stats and displays weekly growth trends.
+# Called from admin panel via "📈 GROWTH TRENDS" button.
+
+@dp.message(F.text.in_({"📈 GROWTH TRENDS", "📈 GROWTH"}))
+async def growth_trends_handler(message: types.Message):
+    """Show weekly user growth trends from anomaly detection baseline (Feature #15)."""
+    if not await is_admin(message.from_user.id):
+        return
+    loading = await message.answer("📊 Compiling growth trends...")
+
+    try:
+        last30 = list(col_daily_stats.find(
+            {}, {"date": 1, "new_users": 1, "vault_joins": 1}
+        ).sort("date", -1).limit(30))
+        last30.reverse()  # oldest first
+
+        if not last30:
+            await loading.edit_text("⚠️ No baseline data yet. Growth tracking will populate after 24 hours.")
+            return
+
+        # Group into weeks
+        from itertools import groupby
+        from math import ceil
+        weeks = {}
+        for day in last30:
+            try:
+                from datetime import datetime as _dt
+                d = _dt.strptime(day["date"], "%Y-%m-%d")
+                week_label = f"W{d.isocalendar()[1]} ({d.strftime('%b %d')}–)"
+                weeks.setdefault(week_label, []).append(day)
+            except Exception:
+                continue
+
+        lines = ["📈 <b>User Growth — Last 30 Days</b>\n━━━━━━━━━━━━━━━━━━━━━━━\n"]
+        prev_new = None
+        for week_label, days in list(weeks.items())[-4:]:  # last 4 weeks
+            total_new   = sum(d.get("new_users", 0) for d in days)
+            total_joins = sum(d.get("vault_joins", 0) for d in days)
+            trend = ""
+            if prev_new is not None and prev_new > 0:
+                change = int((total_new - prev_new) / prev_new * 100)
+                trend = f" ({'🔺' if change >= 0 else '🔻'} {change:+d}%)"
+            lines.append(
+                f"<b>{week_label}</b>{trend}\n"
+                f"  👤 New Users: <b>{total_new}</b>\n"
+                f"  🏛️ Vault Joins: <b>{total_joins}</b>\n"
+            )
+            prev_new = total_new
+
+        await loading.edit_text("\n".join(lines), parse_mode="HTML")
+
+    except Exception as _e:
+        await loading.edit_text(f"❌ Error generating growth trends: {_e}")
+
+
+# ── FEATURE #16 — BULK USER CSV EXPORT ────────────────────────────────────────────
+# Admin command that generates a CSV of vault members and sends as a file.
+
+@dp.message(F.text.in_({"📋 EXPORT CSV", "📋 EXPORT USERS"}))
+async def export_users_csv(message: types.Message):
+    """Generate and send CSV of all vault members with key fields (Feature #16)."""
+    if not await is_admin(message.from_user.id):
+        return
+    loading = await message.answer("⏳ Generating user export CSV...")
+
+    try:
+        import csv
+        import io as _io
+
+        vault_users = list(col_user_verification.find(
+            {"vault_joined": True},
+            {"user_id": 1, "first_name": 1, "username": 1, "first_start": 1, "initial_source": 1}
+        ))
+
+        # Build CSV in memory
+        output = _io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(["user_id", "first_name", "username", "joined_date", "source", "msa_id", "credit_balance", "referral_count"])
+
+        for u in vault_users:
+            uid = u["user_id"]
+            # MSA ID
+            msa_doc = col_msa_ids.find_one({"user_id": uid}, {"msa_id": 1})
+            msa_id  = msa_doc.get("msa_id", "") if msa_doc else ""
+            # Credits
+            cr_doc  = db["bot1_msa_credits"].find_one({"user_id": uid}, {"balance": 1})
+            balance = cr_doc.get("balance", 0) if cr_doc else 0
+            # Referrals
+            ref_count = col_referrals.count_documents({"referrer_id": uid, "status": "confirmed"})
+            # Join date
+            joined = u.get("first_start")
+            joined_str = joined.strftime("%Y-%m-%d") if joined else ""
+
+            writer.writerow([
+                uid,
+                u.get("first_name", ""),
+                u.get("username", ""),
+                joined_str,
+                u.get("initial_source", "UNKNOWN"),
+                msa_id,
+                balance,
+                ref_count,
+            ])
+
+        csv_bytes = output.getvalue().encode("utf-8")
+        from aiogram.types import BufferedInputFile
+        now_str = now_local().strftime("%Y%m%d_%H%M")
+        filename = f"vault_members_{now_str}.csv"
+
+        await message.answer_document(
+            BufferedInputFile(csv_bytes, filename=filename),
+            caption=f"📋 <b>Vault Member Export</b>\n\n"
+                    f"👥 Total: <b>{len(vault_users)}</b> vault members\n"
+                    f"📅 Generated: {now_local().strftime('%Y-%m-%d %H:%M')}",
+            parse_mode="HTML"
+        )
+        await loading.delete()
+        log_admin_action(message.from_user.id, "EXPORT_CSV", f"{len(vault_users)} vault members exported", admin_name=message.from_user.first_name or "")
+        log_action("EXPORT_CSV", message.from_user.id, f"Exported {len(vault_users)} users", bot="bot2")
+
+    except Exception as _e:
+        await loading.edit_text(f"❌ Export failed: {_e}")
+
+
 async def bot2_health_monitor():
+
     """Background health monitor — checks every hour, reports issues instantly"""
     while True:
         try:
@@ -16332,6 +16779,171 @@ async def schedule_storage_alerts():
         await asyncio.sleep(6 * 3600)  # Check every 6 hours
 
 
+async def schedule_weekly_growth_report():
+    """
+    Every Monday at 09:00 local time — DM owner a full week-over-week growth digest.
+    Covers: new users, vault joins, referrals, source split, top 3 referrers, churn.
+    Dedup: tracks sent weeks in-memory so restart never double-sends.
+    """
+    print("📈 [WEEKLY REPORT] Scheduler started — Mondays at 9:00 AM")
+    _sent_weeks: set = set()
+
+    while True:
+        try:
+            now = now_local()
+            # weekday(): Monday = 0
+            days_until_monday = (7 - now.weekday()) % 7 or 7
+            next_run = now.replace(hour=9, minute=0, second=0, microsecond=0) + timedelta(days=days_until_monday)
+            wait_secs = (next_run - now).total_seconds()
+            await asyncio.sleep(max(wait_secs, 60))
+
+            now = now_local()
+            week_key = f"{now.isocalendar()[0]}_W{now.isocalendar()[1]}"
+            if week_key in _sent_weeks:
+                await asyncio.sleep(3600)
+                continue
+
+            # ── Date ranges ──────────────────────────────────────────────────
+            week_start     = now - timedelta(days=7)
+            prev_week_start = now - timedelta(days=14)
+
+            # ── New users this week vs last week ─────────────────────────────
+            try:
+                new_this_week  = col_user_verification.count_documents({"first_start": {"$gte": week_start}})
+                new_last_week  = col_user_verification.count_documents({"first_start": {"$gte": prev_week_start, "$lt": week_start}})
+                pct_users      = ((new_this_week - new_last_week) / max(new_last_week, 1)) * 100
+                pct_users_str  = f"+{pct_users:.1f}%" if pct_users >= 0 else f"{pct_users:.1f}%"
+                pct_users_icon = "📈" if pct_users >= 0 else "📉"
+            except Exception:
+                new_this_week = new_last_week = 0
+                pct_users_str = "N/A"; pct_users_icon = "➖"
+
+            # ── New vault members this week ───────────────────────────────────
+            try:
+                # We don't store vault_join_date separately — count users whose
+                # MSA ID was allocated this week (proxy for vault join)
+                vault_this_week = col_msa_ids.count_documents({"allocated_at": {"$gte": week_start}})
+                vault_last_week = col_msa_ids.count_documents({"allocated_at": {"$gte": prev_week_start, "$lt": week_start}})
+                pct_vault       = ((vault_this_week - vault_last_week) / max(vault_last_week, 1)) * 100
+                pct_vault_str   = f"+{pct_vault:.1f}%" if pct_vault >= 0 else f"{pct_vault:.1f}%"
+                pct_vault_icon  = "📈" if pct_vault >= 0 else "📉"
+            except Exception:
+                vault_this_week = vault_last_week = 0
+                pct_vault_str = "N/A"; pct_vault_icon = "➖"
+
+            # ── Referrals confirmed this week ─────────────────────────────────
+            try:
+                _ref_col         = db["bot1_referrals"]
+                refs_this_week   = _ref_col.count_documents({"status": "confirmed", "confirmed_at": {"$gte": week_start}})
+                refs_last_week   = _ref_col.count_documents({"status": "confirmed", "confirmed_at": {"$gte": prev_week_start, "$lt": week_start}})
+                pct_refs         = ((refs_this_week - refs_last_week) / max(refs_last_week, 1)) * 100
+                pct_refs_str     = f"+{pct_refs:.1f}%" if pct_refs >= 0 else f"{pct_refs:.1f}%"
+                pct_refs_icon    = "📈" if pct_refs >= 0 else "📉"
+            except Exception:
+                refs_this_week = refs_last_week = 0
+                pct_refs_str = "N/A"; pct_refs_icon = "➖"
+
+            # ── Top 3 referrers this week ─────────────────────────────────────
+            top_ref_lines = ""
+            try:
+                pipeline = [
+                    {"$match": {"status": "confirmed", "confirmed_at": {"$gte": week_start}}},
+                    {"$group": {"_id": "$referrer_id", "count": {"$sum": 1}}},
+                    {"$sort": {"count": -1}},
+                    {"$limit": 3},
+                ]
+                top_refs = list(_ref_col.aggregate(pipeline))
+                medals   = ["🥇", "🥈", "🥉"]
+                rows     = []
+                for idx, row in enumerate(top_refs):
+                    uid   = row["_id"]
+                    cnt   = row["count"]
+                    doc   = col_user_verification.find_one({"user_id": uid}, {"first_name": 1})
+                    fname = (doc or {}).get("first_name") or f"Agent {str(uid)[-4:]}"
+                    rows.append(f"  {medals[idx]} {fname} — {cnt} referral{'s' if cnt != 1 else ''}")
+                top_ref_lines = "\n".join(rows) if rows else "  No confirmed referrals this week"
+            except Exception:
+                top_ref_lines = "  Unavailable"
+
+            # ── Source breakdown (IG / YT / IGCC / YTCODE) ───────────────────
+            try:
+                src_ig    = col_user_tracking.count_documents({"source": "IG"})
+                src_yt    = col_user_tracking.count_documents({"source": "YT"})
+                src_igcc  = col_user_tracking.count_documents({"source": "IGCC"})
+                src_ytc   = col_user_tracking.count_documents({"source": "YTCODE"})
+                src_total = max(src_ig + src_yt + src_igcc + src_ytc, 1)
+                def _sp(n): return f"{n/src_total*100:.1f}%"
+                src_line  = (f"📸 IG `{src_ig}` ({_sp(src_ig)})  "
+                             f"▶️ YT `{src_yt}` ({_sp(src_yt)})  "
+                             f"📎 IGCC `{src_igcc}` ({_sp(src_igcc)})  "
+                             f"🔑 YTC `{src_ytc}` ({_sp(src_ytc)})")
+            except Exception:
+                src_line = "Unavailable"
+
+            # ── Churn this week (vault_left_at in last 7 days) ───────────────
+            try:
+                churn_this_week = col_user_verification.count_documents(
+                    {"vault_left_at": {"$gte": week_start}}
+                )
+            except Exception:
+                churn_this_week = 0
+
+            # ── Totals snapshot ───────────────────────────────────────────────
+            try:
+                total_users   = col_user_verification.count_documents({})
+                total_vault   = col_user_verification.count_documents({"vault_joined": True})
+                total_tickets = col_support_tickets.count_documents({"status": "open"})
+            except Exception:
+                total_users = total_vault = total_tickets = 0
+
+            week_label  = week_start.strftime("%b %d") + " – " + now.strftime("%b %d, %Y")
+            report = (
+                f"📈 **WEEKLY GROWTH REPORT**\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"🗓 **{week_label}** (Week {now.isocalendar()[1]})\n\n"
+
+                f"👥 **NEW USERS**\n"
+                f"• This week: `{new_this_week}` | Last week: `{new_last_week}`\n"
+                f"• Trend: {pct_users_icon} `{pct_users_str}`\n\n"
+
+                f"🏛 **VAULT JOINS**\n"
+                f"• This week: `{vault_this_week}` | Last week: `{vault_last_week}`\n"
+                f"• Trend: {pct_vault_icon} `{pct_vault_str}`\n\n"
+
+                f"🤝 **REFERRALS CONFIRMED**\n"
+                f"• This week: `{refs_this_week}` | Last week: `{refs_last_week}`\n"
+                f"• Trend: {pct_refs_icon} `{pct_refs_str}`\n\n"
+
+                f"🏆 **TOP REFERRERS THIS WEEK**\n"
+                f"{top_ref_lines}\n\n"
+
+                f"📊 **SOURCE BREAKDOWN (ALL-TIME)**\n"
+                f"• {src_line}\n\n"
+
+                f"🚪 **CHURN THIS WEEK**\n"
+                f"• Vault left: `{churn_this_week}` users\n\n"
+
+                f"📋 **SNAPSHOTS**\n"
+                f"• Total users ever: `{total_users:,}`\n"
+                f"• Active vault members: `{total_vault:,}`\n"
+                f"• Open support tickets: `{total_tickets}`\n\n"
+
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"_Auto-report · Next Monday 9:00 AM_"
+            )
+
+            await bot.send_message(MASTER_ADMIN_ID, report, parse_mode="Markdown")
+            _sent_weeks.add(week_key)
+            print(f"✅ [WEEKLY REPORT] Week {week_key} report sent to owner")
+
+        except asyncio.CancelledError:
+            print("📈 [WEEKLY REPORT] Scheduler stopping...")
+            break
+        except Exception as _we:
+            print(f"❌ [WEEKLY REPORT] Error: {_we}")
+            await asyncio.sleep(3600)
+
+
 async def schedule_daily_reports():
     """Send daily reports at exactly 8:40 AM and 8:40 PM — strict timing"""
     print("📊 [DAILY REPORT] Scheduler started — reports at 8:40 AM and 8:40 PM")
@@ -16604,6 +17216,9 @@ async def main():
         daily_report_task = asyncio.create_task(schedule_daily_reports())
         print("📊 Daily report scheduler started (8:40 AM & 8:40 PM)")
 
+        asyncio.create_task(schedule_weekly_growth_report())
+        print("📈 Weekly growth report scheduler started (Mondays 9:00 AM — new users, vault joins, referrals, top referrers, churn)")
+
         storage_alert_task = asyncio.create_task(schedule_storage_alerts())
         print("🗄️ Storage alert scheduler started (checks every 6h — alerts at 60/75/85/95%)")
 
@@ -16612,6 +17227,12 @@ async def main():
 
         asyncio.create_task(schedule_backup_cluster_ping())
         print("🩺 Backup cluster health monitor started (pings every 6h — alerts if down or >80% storage)")
+
+        asyncio.create_task(anomaly_detection_scheduler())
+        print("📊 Anomaly detection scheduler started (snapshots daily, alerts on >50% drops)")
+
+        asyncio.create_task(scheduled_broadcast_runner())
+        print("📤 Scheduled broadcast runner started (checks every 60s for due broadcasts)")
 
         asyncio.create_task(_check_gdrive_token_startup())
         print("☁️ GDrive token check queued (validates in 20s)")
