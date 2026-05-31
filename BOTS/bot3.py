@@ -33,7 +33,6 @@ from aiohttp import web
 import html as _html
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
-
 # ==========================================
 # ENTERPRISE CONFIGURATION
 # ==========================================
@@ -81,11 +80,18 @@ _TTL_SECONDS = 90 * 24 * 3600  # 90-day TTL for cluster backup docs
 
 _BOT_COLLECTIONS = {
     "bot3": [
+        # ── Core content (permanent — must survive any reset) ───────────────────
         "bot3_pdfs",
         "bot3_ig_content",
         "bot3_rewards",
+        # ── Economy & Shop (critical — loss breaks reward/store systems) ─────────
+        "bot3_store_items",    # Vault Shop inventory
+        "bot3_milestones",     # Referral milestone tier definitions
+        "bot3_tutorials",      # Tutorial PK links
+        # ── Admin & Config ────────────────────────────────────────────────────────
         "bot3_admins",
         "bot3_settings",
+        # ── Security & Activity (lower priority — have TTLs) ─────────────────────
         "bot3_banned_users",
         "bot3_logs",
         "bot3_user_activity",
@@ -1681,6 +1687,23 @@ try:
         print("✅ TTL index set: bot3_logs → 7-day auto-purge")
     except Exception as _ttl_err:
         print(f"⚠️ TTL index warning (bot3_logs): {_ttl_err}")
+
+    # bot3_banned_users — auto-delete bans after 30 days (prevents unbounded growth from auto-bans)
+    # Note: Admin-created permanent bans should be re-applied via admin panel if needed
+    try:
+        try:
+            col_banned_users.drop_index("banned_at_ttl_30d")
+        except Exception:
+            pass
+        col_banned_users.create_index(
+            [("banned_at", 1)],
+            expireAfterSeconds=2_592_000,  # 30 days
+            sparse=True,
+            name="banned_at_ttl_30d"
+        )
+        print("✅ TTL index set: bot3_banned_users → 30-day auto-purge")
+    except Exception as _ttl_err:
+        print(f"⚠️ TTL index warning (bot3_banned_users): {_ttl_err}")
     
     # Initialize click tracking fields for existing documents (migration)
     try:
@@ -6623,6 +6646,9 @@ async def process_add_reward_content(message: types.Message, state: FSMContext):
     }
     col_rewards.insert_one(doc)
 
+    # Feature #21 — check reward pool stock after every add
+    _check_reward_pool_stock()
+
     await state.clear()
     log_user_action(message.from_user, "Add Reward", f"Added {rw_code}")
     await message.answer(
@@ -6751,6 +6777,8 @@ async def process_delete_reward_confirm(message: types.Message, state: FSMContex
         col_rewards.delete_one({"_id": ObjectId(data["reward_id"])})
         await state.clear()
         log_user_action(message.from_user, "Delete Reward", f"Deleted {data['rw_code']}")
+        # Feature #21 — check reward pool stock after every delete
+        _check_reward_pool_stock()
         await message.answer(f"🗑️ <b>{data['rw_code']} deleted.</b>", reply_markup=get_reward_menu(), parse_mode="HTML")
     else:
         await state.clear()
@@ -8169,17 +8197,20 @@ async def diagnosis_handler(message: types.Message, state: FSMContext):
     # --- 6. STORAGE CHECK ---
     total_checks += 1
     try:
-        db_stats = db.command("dbStats")
-        db_size_mb = db_stats.get("dataSize", 0) / (1024 * 1024)
-        storage_limit = 512  # MB
-        
-        if db_size_mb > storage_limit * 0.9:
-            issues.append(f"❌ Database nearly full: {db_size_mb:.2f}MB / {storage_limit}MB")
-        elif db_size_mb > storage_limit * 0.7:
-            warnings.append(f"⚠️ Database usage high: {db_size_mb:.2f}MB / {storage_limit}MB")
+        db_stats    = db.command("dbStats")
+        data_mb     = db_stats.get("dataSize",  0) / (1024 * 1024)
+        index_mb    = db_stats.get("indexSize", 0) / (1024 * 1024)
+        storage_limit = 512  # MB (Atlas M0 cap)
+        # Atlas M0: totalSize/fsTotalSize are always 0. Use dataSize+indexSize (real values).
+        used_mb = data_mb + index_mb
+
+        if used_mb > storage_limit * 0.9:
+            issues.append(f"❌ Database nearly full: {used_mb:.2f}MB / {storage_limit}MB ({used_mb/storage_limit*100:.1f}%)")
+        elif used_mb > storage_limit * 0.7:
+            warnings.append(f"⚠️ Database usage high: {used_mb:.2f}MB / {storage_limit}MB ({used_mb/storage_limit*100:.1f}%)")
         else:
             checks_passed += 1
-            
+
     except Exception as e:
         warnings.append(f"⚠️ Storage Check: {str(e)}")
     
@@ -10106,12 +10137,20 @@ async def create_backup_file(auto=False, fmt="zip"):
 
         # ── Collect all collections ──────────────────────────────────────────
         collections_data = {
+            # ── Core content (permanent) ────────────────────────────────────────
             "bot3_pdfs":          _serialize(list(col_pdfs.find({}))),
             "bot3_ig_content":    _serialize(list(col_ig_content.find({}))),
+            "bot3_rewards":       _serialize(list(col_rewards.find({}))),
+            # ── Economy & Shop (critical — new collections added) ────────────────
+            "bot3_store_items":   _serialize(list(col_store_items.find({}))),
+            "bot3_milestones":    _serialize(list(col_milestones.find({}))),
+            "bot3_tutorials":     _serialize(list(db["bot3_tutorials"].find({}))),
+            # ── Admin & Config ───────────────────────────────────────────────────
             "bot3_admins":        _serialize(list(col_admins.find({}))),
             "bot3_settings":      _serialize(list(col_settings.find({}))),
+            # ── Security & Activity (capped to prevent oversized backups) ────────
             "bot3_banned_users":  _serialize(list(col_banned_users.find({}))),
-            "bot3_logs":          _serialize(list(col_logs.find({}).sort("created_at", -1).limit(500))),
+            "bot3_logs":          _serialize(list(col_logs.find({}).sort("timestamp", -1).limit(500))),
             "bot3_user_activity": _serialize(list(col_user_activity.find({}).sort("timestamp", -1).limit(1000))),
         }
 
@@ -10185,13 +10224,33 @@ async def create_backup_file(auto=False, fmt="zip"):
         # ── Upsert into backup history (keyed by filename for idempotency) ───
         meta_db = dict(metadata)
         meta_db.pop('created_at', None)   # keep only the str version for clean storage
-        # ADD TTL DATE NATIVELY 
-        # (This is local DB metadata, MSANodeBackups cluster is separate!)
         col_backups.update_one(
             {"filename": filename},
             {"$set": meta_db},
             upsert=True
         )
+
+        # ── Save full restorable snapshot to backup cluster (single always-replaced doc) ──
+        # Mirrors bot1's col_bot1_restore_data design.
+        # Full raw docs → col_bot3_restore_data["bot3_latest"] on MSANodeBackups.
+        # This is the one-click restore point used by the admin panel UPLOAD DATA flow.
+        try:
+            total_records = sum(len(v) for v in collections_data.values())
+            col_bot3_restore_data.replace_one(
+                {"_id": "bot3_latest"},
+                {
+                    "_id":               "bot3_latest",
+                    "backup_date":       now_ts,
+                    "timestamp":         ts_label,
+                    "total_records":     total_records,
+                    "collection_counts": {k: len(v) for k, v in collections_data.items()},
+                    "collections":       collections_data,
+                },
+                upsert=True,
+            )
+            logger.info(f"✅ Bot3 restore snapshot updated — {total_records:,} records restorable")
+        except Exception as _snap_err:
+            logger.warning(f"⚠️ Bot3 restore snapshot warning: {_snap_err}")
 
         logger.info(f"✅ Backup created: {filename} ({file_size_mb:.2f} MB, "
                     f"{len(pdfs_list)} PDFs, {len(ig_list)} IG)")
@@ -10201,9 +10260,322 @@ async def create_backup_file(auto=False, fmt="zip"):
         logger.error(f"❌ Backup creation failed: {e}")
         return False, None, None
 
+# ==================================================================================
+# BOT 3 NEW FEATURES — #17 through #22
+# ==================================================================================
+
+# ── FEATURE #19 — STORE PURCHASE HISTORY ─────────────────────────────────────────
+# Every store purchase (in bot1) logs to bot3_purchase_history for dispute resolution.
+# 365-day TTL so old records auto-clean.
+
+col_purchase_history = db["bot3_purchase_history"]
+try:
+    try: col_purchase_history.drop_index("purchase_history_ttl_365d")
+    except Exception: pass
+    col_purchase_history.create_index(
+        [("purchased_at", 1)], expireAfterSeconds=31_536_000,
+        name="purchase_history_ttl_365d", background=True
+    )
+    col_purchase_history.create_index([("user_id", 1)],  name="purchase_user_idx",  background=True)
+    col_purchase_history.create_index([("item_id", 1)],  name="purchase_item_idx",  background=True)
+    logger.info("✅ bot3_purchase_history TTL index set (365-day auto-purge)")
+except Exception as _ph_err:
+    logger.warning(f"⚠️ purchase_history index warning: {_ph_err}")
+
+
+def record_store_purchase(
+    user_id: int,
+    item_id: str,
+    item_name: str,
+    credits_spent: int,
+    username: str = "",
+    first_name: str = "",
+) -> None:
+    """Write a purchase record to bot3_purchase_history. Called from bot1 store purchase flow."""
+    try:
+        col_purchase_history.insert_one({
+            "user_id":       user_id,
+            "username":      username,
+            "first_name":    first_name,
+            "item_id":       item_id,
+            "item_name":     item_name,
+            "credits_spent": credits_spent,
+            "purchased_at":  now_local(),
+        })
+    except Exception as _pe:
+        logger.warning(f"[PURCHASE_HISTORY] Failed to record for {user_id}: {_pe}")
+
+
+# ── FEATURE #21 — REWARD POOL LOW-STOCK ALERT ────────────────────────────────────
+# After every reward add/delete, check pool size. Alert admin if < 5 items remain.
+_REWARD_LOW_STOCK_THRESHOLD = 5
+
+def _check_reward_pool_stock() -> None:
+    """Check reward pool count and alert MASTER_ADMIN_ID if below threshold. Non-blocking."""
+    try:
+        import asyncio as _asyncio
+        count = col_rewards.count_documents({})
+        if count < _REWARD_LOW_STOCK_THRESHOLD:
+            async def _alert():
+                try:
+                    await bot.send_message(
+                        MASTER_ADMIN_ID,
+                        f"⚠️ <b>Reward Pool Low Stock Alert!</b>\n\n"
+                        f"🎁 Only <b>{count} reward{'s' if count != 1 else ''}</b> remaining in the pool.\n\n"
+                        f"Add more rewards via <b>🎁 REWARDS → ➕ ADD REWARD</b> to prevent delivery failures.",
+                        parse_mode="HTML"
+                    )
+                except Exception:
+                    pass
+            try:
+                loop = _asyncio.get_event_loop()
+                if loop.is_running():
+                    loop.create_task(_alert())
+            except Exception:
+                pass
+    except Exception as _se:
+        logger.warning(f"[REWARD_STOCK] Stock check failed: {_se}")
+
+
+# ── FEATURE #22 — MILESTONE COMPLETION ADMIN NOTIFICATION ────────────────────────
+# When a user hits a referral milestone tier (bronze/silver/gold), notify MASTER_ADMIN_ID.
+# Hooked into bot1's _check_and_fire_referral_tier which writes to bot3_milestones path.
+# Bot 3 version: called when referral rewards are delivered.
+
+async def notify_admin_milestone_hit(
+    user_id: int,
+    user_name: str,
+    tier_name: str,
+    badge: str,
+    referral_count: int,
+) -> None:
+    """Send a milestone notification to MASTER_ADMIN_ID. Called when a referral tier fires."""
+    try:
+        emoji_map = {"starter": "🌟", "silver": "🥈", "gold": "🥇"}
+        emoji = emoji_map.get(tier_name.lower(), "🏆")
+        await bot.send_message(
+            MASTER_ADMIN_ID,
+            f"{emoji} <b>Referral Milestone Hit!</b>\n\n"
+            f"👤 <b>{user_name}</b> (ID: <code>{user_id}</code>)\n"
+            f"🎖 Tier: <b>{badge}</b>\n"
+            f"📊 Referrals confirmed: <b>{referral_count}</b>\n\n"
+            f"<i>This is auto-notified from the milestone system.</i>",
+            parse_mode="HTML"
+        )
+        log_to_terminal("MILESTONE_ALERT", MASTER_ADMIN_ID, f"{user_name} hit {badge} ({referral_count} refs)")
+    except Exception as _me:
+        logger.warning(f"[MILESTONE_NOTIFY] Failed: {_me}")
+
+
+# ── FEATURE #17 — CONTENT PERFORMANCE HEATMAP (Weekly click tracking) ─────────────
+# Each PDF/IG item tracks clicks_this_week / clicks_last_week.
+# Weekly scheduler resets clicks_this_week → clicks_last_week every Monday.
+
+async def weekly_click_reset_scheduler():
+    """
+    Runs weekly (every Monday at 00:05 local time).
+    Rotates clicks_this_week → clicks_last_week for all PDFs and IG content.
+    Enables trending direction display in analytics.
+    Feature #17.
+    """
+    while True:
+        try:
+            now = now_local()
+            # Run on Monday (weekday=0)
+            if now.weekday() == 0 and now.hour == 0 and now.minute < 10:
+                # Rotate clicks_this_week → clicks_last_week for PDFs
+                try:
+                    # Use aggregation pipeline update: set last week = this week, zero this week
+                    col_pdfs.update_many(
+                        {},
+                        [{"$set": {
+                            "clicks_last_week": {"$ifNull": ["$clicks_this_week", 0]},
+                            "clicks_this_week": 0,
+                        }}]
+                    )
+                except Exception as _pdf_e:
+                    logger.warning(f"[HEATMAP] PDF click reset failed: {_pdf_e}")
+
+                try:
+                    col_ig_content.update_many(
+                        {},
+                        [{"$set": {
+                            "clicks_last_week": {"$ifNull": ["$clicks_this_week", 0]},
+                            "clicks_this_week": 0,
+                        }}]
+                    )
+                except Exception as _ig_e:
+                    logger.warning(f"[HEATMAP] IG click reset failed: {_ig_e}")
+
+                logger.info("[HEATMAP] Weekly click rotation complete (clicks_this_week → clicks_last_week)")
+                await asyncio.sleep(3600)  # Sleep 1h after running so we don't re-fire same Monday
+            else:
+                await asyncio.sleep(600)   # Check every 10 minutes
+
+        except asyncio.CancelledError:
+            break
+        except Exception as _we:
+            logger.error(f"[HEATMAP] Scheduler error: {_we}")
+            await asyncio.sleep(3600)
+
+
+# ── FEATURE #18 — ZERO-CLICK CONTENT SCANNER ─────────────────────────────────────
+# Weekly scanner flags PDFs with zero clicks older than 60 days as needs_review=True.
+# Notifies admin. Human confirms deletion — never auto-deletes.
+
+async def zero_click_content_scanner():
+    """
+    Runs every Sunday at 23:00 local time.
+    Finds PDFs with clicks=0 AND created_at older than 60 days.
+    Flags them needs_review=True and sends admin a list.
+    Feature #18.
+    """
+    while True:
+        try:
+            now = now_local()
+            # Run on Sunday (weekday=6) at 23:xx
+            if now.weekday() == 6 and now.hour == 23:
+                cutoff = now - timedelta(days=60)
+                stale_pdfs = list(col_pdfs.find(
+                    {
+                        "clicks":        {"$lte": 0},
+                        "created_at":    {"$lte": cutoff},
+                        "needs_review":  {"$ne": True},
+                        "active":        True,
+                    },
+                    {"_id": 1, "name": 1, "created_at": 1, "msa_code": 1}
+                ))
+
+                if stale_pdfs:
+                    # Flag all of them
+                    ids = [p["_id"] for p in stale_pdfs]
+                    col_pdfs.update_many(
+                        {"_id": {"$in": ids}},
+                        {"$set": {"needs_review": True, "needs_review_flagged_at": now}}
+                    )
+                    # Build admin message
+                    lines = "\n".join(
+                        f"• <code>{p.get('msa_code','?')}</code> — {str(p.get('name',''))[:50]}"
+                        for p in stale_pdfs[:20]
+                    )
+                    try:
+                        await bot.send_message(
+                            MASTER_ADMIN_ID,
+                            f"🔍 <b>Zero-Click Content Review</b>\n\n"
+                            f"📋 <b>{len(stale_pdfs)} PDF(s)</b> have 0 clicks and are 60+ days old:\n\n"
+                            f"{lines}\n\n"
+                            f"⚠️ These have been flagged <code>needs_review=True</code>.\n"
+                            f"Review them in <b>📄 PDF MANAGEMENT</b> and delete if stale.",
+                            parse_mode="HTML"
+                        )
+                    except Exception as _ne:
+                        logger.warning(f"[ZERO_CLICK] Admin notify failed: {_ne}")
+
+                    logger.info(f"[ZERO_CLICK] Flagged {len(stale_pdfs)} stale PDFs for review")
+                else:
+                    logger.info("[ZERO_CLICK] No stale PDFs found this week")
+
+                await asyncio.sleep(3600)  # Sleep 1h after firing
+            else:
+                await asyncio.sleep(1800)  # Check every 30 minutes
+
+        except asyncio.CancelledError:
+            break
+        except Exception as _ze:
+            logger.error(f"[ZERO_CLICK] Scanner error: {_ze}")
+            await asyncio.sleep(3600)
+
+
+# ── FEATURE #20 — CONTENT TAG SEARCH ─────────────────────────────────────────────
+# Admin can search PDFs and IG content by tag keyword via "🔍 SEARCH CONTENT" command.
+
+@dp.message(F.text == "🔍 SEARCH CONTENT")
+async def search_content_start(message: types.Message, state: FSMContext):
+    """Prompt admin to enter a search keyword to find tagged content (Feature #20)."""
+    if not await check_authorization(message, "Search Content", "can_list"):
+        return
+    from aiogram.fsm.state import State, StatesGroup
+
+    await message.answer(
+        "🔍 <b>Content Search</b>\n\n"
+        "Enter a keyword to search across PDF names, descriptions, and tags:\n"
+        "<i>(e.g. 'instagram', 'discord', 'growth', 'setup')</i>",
+        parse_mode="HTML",
+        reply_markup=get_cancel_keyboard()
+    )
+    await state.set_state("content_search_waiting")
+
+
+@dp.message(lambda m: True)
+async def content_search_handler(message: types.Message, state: FSMContext):
+    """Handle content search keyword input (Feature #20)."""
+    current = await state.get_state()
+    if current != "content_search_waiting":
+        return  # Not for us — let other handlers process
+    if message.text in {"❌ CANCEL", "/cancel"}:
+        await state.clear()
+        return await message.answer("❌ Cancelled.", reply_markup=get_cancel_keyboard())
+
+    keyword = message.text.strip().lower()
+    if not keyword or len(keyword) < 2:
+        await message.answer("⚠️ Enter at least 2 characters.", reply_markup=get_cancel_keyboard())
+        return
+
+    await state.clear()
+
+    # Search PDFs: name, description, tags array
+    pdf_results = list(col_pdfs.find(
+        {"$or": [
+            {"name":        {"$regex": keyword, "$options": "i"}},
+            {"description": {"$regex": keyword, "$options": "i"}},
+            {"tags":        {"$regex": keyword, "$options": "i"}},
+            {"msa_code":    {"$regex": keyword, "$options": "i"}},
+        ]},
+        {"name": 1, "msa_code": 1, "clicks": 1, "tags": 1}
+    ).limit(10))
+
+    ig_results = list(col_ig_content.find(
+        {"$or": [
+            {"ig_username": {"$regex": keyword, "$options": "i"}},
+            {"caption":     {"$regex": keyword, "$options": "i"}},
+            {"tags":        {"$regex": keyword, "$options": "i"}},
+        ]},
+        {"ig_username": 1, "cc_code": 1, "ig_start_clicks": 1, "tags": 1}
+    ).limit(5))
+
+    if not pdf_results and not ig_results:
+        await message.answer(
+            f"🔍 No results for <b>'{keyword}'</b>.\n\n"
+            f"<i>Tip: Add tags to content items with ✏️ EDIT to make them searchable.</i>",
+            parse_mode="HTML"
+        )
+        return
+
+    lines = [f"🔍 <b>Search: '{keyword}'</b>\n━━━━━━━━━━━━━━━━━━━━━━━\n"]
+    if pdf_results:
+        lines.append(f"📄 <b>PDFs ({len(pdf_results)} found):</b>")
+        for p in pdf_results:
+            tags_str = ", ".join(p.get("tags", [])) or "—"
+            lines.append(
+                f"  • <code>{p.get('msa_code','?')}</code> — {str(p.get('name',''))[:40]}\n"
+                f"    👁 {p.get('clicks',0)} clicks | 🏷 {tags_str}"
+            )
+    if ig_results:
+        lines.append(f"\n📸 <b>IG Content ({len(ig_results)} found):</b>")
+        for ig in ig_results:
+            tags_str = ", ".join(ig.get("tags", [])) or "—"
+            lines.append(
+                f"  • <code>{ig.get('cc_code','?')}</code> — @{ig.get('ig_username','?')}\n"
+                f"    👁 {ig.get('ig_start_clicks',0)} clicks | 🏷 {tags_str}"
+            )
+
+    await message.answer("\n".join(lines), parse_mode="HTML")
+
+
 # NOTE: All backups are kept permanently — never auto-deleted for data integrity.
 
 async def auto_backup_task():
+
     """Background task — runs monthly auto-backup with catch-up if schedule was missed."""
     last_successful_month_key = None
 
@@ -10400,10 +10772,28 @@ async def bot3_backup_status_start(message: types.Message, state: FSMContext):
     except Exception:
         ttl_docs_str = "Unknown"
 
+    # ── Live Atlas storage stats (production DB) ──────────────────────────────
+    try:
+        _st   = db.command("dbStats")
+        _d_mb = _st.get("dataSize",  0) / 1_048_576
+        _i_mb = _st.get("indexSize", 0) / 1_048_576
+        _used = _d_mb + _i_mb
+        _pct  = round(_used / 512 * 100, 1)
+        _fill = round(_pct / 5)
+        _bar  = "█" * _fill + "░" * (20 - _fill)
+        _risk = ("🔴 CRITICAL" if _pct > 90 else "🟠 HIGH" if _pct > 75 else "🟡 MODERATE" if _pct > 50 else "🟢 HEALTHY")
+        storage_line = (
+            f"  📊 <code>[{_bar}]</code> {_pct:.1f}% of 512MB M0  {_risk}\n"
+            f"  📦 Data: {_d_mb:.2f}MB  🔖 Indexes: {_i_mb:.2f}MB  → <b>{_used:.2f}MB used</b>\n"
+        )
+    except Exception as _se:
+        storage_line = f"  ⚠️ Storage check unavailable: {str(_se)[:60]}\n"
+
     report = (
         f"📊 <b>BACKUP STATUS — Bot 3</b>\n{'─'*28}\n\n"
         f"🗄️ <b>MSANodeDB (Production)</b>\n{prod_lines}"
         f"📊 Total live docs: <b>{total_prod:,}</b>\n\n"
+        f"💾 <b>Atlas Storage (Live)</b>\n{storage_line}\n"
         f"🔐 <b>MSANodeBackups (Cluster)</b>\n"
         f"  📦 Snapshots stored: <b>{snap_count:,}</b>\n"
         f"  🕐 Last backup: <b>{last_bk_str}</b>\n"
@@ -13075,7 +13465,9 @@ async def main():
                         c.admin.command("ping")
                         try:
                             st = c[BACKUP_MONGO_DB_NAME or "MSANodeBackups"].command("dbStats")
-                            return {"ok": True, "used_mb": round(st.get("dataSize", 0)/1_048_576, 2)}
+                            # Use dataSize+indexSize (both real on Atlas M0; totalSize is always 0)
+                            _used = (st.get("dataSize", 0) + st.get("indexSize", 0)) / 1_048_576
+                            return {"ok": True, "used_mb": round(_used, 2)}
                         except Exception:
                             return {"ok": True, "used_mb": None}
                     finally:
@@ -13099,6 +13491,12 @@ async def main():
                 _last_ok = False
     asyncio.create_task(_bot3_backup_cluster_ping())
     print("  ✅ Bot3 backup cluster health ping started (every 6h)")
+
+    asyncio.create_task(weekly_click_reset_scheduler())
+    print("  ✅ Weekly click heatmap reset scheduler started (rotates clicks_this_week every Monday)")
+
+    asyncio.create_task(zero_click_content_scanner())
+    print("  ✅ Zero-click content scanner started (flags stale PDFs every Sunday)")
 
     # ── Auto-heal IG CC codes on every startup (fill gaps from past deletions) ──
 
