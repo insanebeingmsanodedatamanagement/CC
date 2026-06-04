@@ -33,6 +33,8 @@ from aiohttp import web
 import html as _html
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
+
+
 # ==========================================
 # ENTERPRISE CONFIGURATION
 # ==========================================
@@ -10506,12 +10508,8 @@ async def search_content_start(message: types.Message, state: FSMContext):
     await state.set_state("content_search_waiting")
 
 
-@dp.message(lambda m: True)
+@dp.message(StateFilter("content_search_waiting"))
 async def content_search_handler(message: types.Message, state: FSMContext):
-    """Handle content search keyword input (Feature #20)."""
-    current = await state.get_state()
-    if current != "content_search_waiting":
-        return  # Not for us — let other handlers process
     if message.text in {"❌ CANCEL", "/cancel"}:
         await state.clear()
         return await message.answer("❌ Cancelled.", reply_markup=get_cancel_keyboard())
@@ -10990,11 +10988,11 @@ async def bot3_reset_backup_confirm2(message: types.Message, state: FSMContext):
         )
 
 
-@dp.message(F.text == "💾 BACKUP DATA", StateFilter(None))
+@dp.message(F.text == "💾 BACKUP DATA", StateFilter(None, BackupStates.viewing_backup_menu))
 async def backup_menu_handler(message: types.Message, state: FSMContext):
+    """Show backup menu"""
     if not await check_authorization(message, "Backup Menu", "can_manage_admins"):
         return
-    """Show backup menu"""
     await state.set_state(BackupStates.viewing_backup_menu)
     await message.answer(
         "💾 <b>BACKUP &amp; RESTORE — Bot 3</b>\n\n"
@@ -11108,7 +11106,7 @@ async def prev_admin_page(message: types.Message, state: FSMContext):
     await state.update_data(admin_page=page)
     await send_admin_list_view(message, page)
 
-@dp.message(F.text.contains("BACK"))
+@dp.message(F.text.in_({"⬅️ RETURN BACK", "🔙 BACK", "⬅️ BACK TO ADMIN MENU", "⬅️ BACK"}))
 async def admin_list_back(message: types.Message, state: FSMContext):
     """Return to Admin Management menu from list view"""
     if not await check_authorization(message, "Admin Menu", "can_manage_admins"):
@@ -12749,7 +12747,7 @@ def _econ_text(doc):
     )
 
 
-@dp.message(F.text == "💳 CREDIT MANAGEMENT")
+@dp.message(F.text == "💳 CREDIT MANAGEMENT", StateFilter("*"))
 async def economy_menu(message: types.Message, state: FSMContext):
     if not await check_authorization(message, "credit_management", "can_credit"): return
     await state.clear()
