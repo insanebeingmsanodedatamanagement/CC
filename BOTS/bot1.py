@@ -5567,7 +5567,6 @@ async def vault_member_reengagement_scheduler():
                     )
                     vault_count = await get_vault_member_count_async()
                     ig_kb = InlineKeyboardMarkup(inline_keyboard=[
-                        [InlineKeyboardButton(text="📊 Open My Dashboard", callback_data="open_dashboard")],
                         [InlineKeyboardButton(text="📸 Instagram", url=INSTAGRAM_LINK),
                          InlineKeyboardButton(text="▶️ YouTube", url=YOUTUBE_LINK)],
                     ])
