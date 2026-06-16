@@ -5931,7 +5931,9 @@ async def home_yt_handler(message: types.Message):
     code = await get_home_yt_code()
     username = BOT_USERNAME
     
-    link = f"https://t.me/{username}?start={code}_YTCODE"
+    dash_url = os.getenv("DASHBOARD_URL")
+    base_link = f"{dash_url}/tg?start=" if dash_url else f"https://t.me/{username}?start="
+    link = f"{base_link}{code}_YTCODE"
     
     text = (
         "🏠 <b>HOME YT LINK</b>\n"
@@ -5993,7 +5995,9 @@ async def ig_cc_links_handler(message: types.Message, page=0):
         code = content['start_code']
         cc_code = content['cc_code']
         
-        link = f"https://t.me/{username}?start={code}_igcc_{cc_code}"
+        dash_url = os.getenv("DASHBOARD_URL")
+        base_link = f"{dash_url}/tg?start=" if dash_url else f"https://t.me/{username}?start="
+        link = f"{base_link}{code}_igcc_{cc_code}"
         
         text += (
             f"🆔 <b>{cc_code}</b>\n"
@@ -6105,8 +6109,10 @@ async def all_pdf_links_handler(message: types.Message, page=0):
             ig_code = pdf["ig_start_code"]
             yt_code = pdf["yt_start_code"]
 
-            ig_link = f"https://t.me/{username}?start={ig_code}_ig_{sanitized_name}"
-            yt_link = f"https://t.me/{username}?start={yt_code}_yt_{sanitized_name}"
+            dash_url = os.getenv("DASHBOARD_URL")
+            base_link = f"{dash_url}/tg?start=" if dash_url else f"https://t.me/{username}?start="
+            ig_link = f"{base_link}{ig_code}_ig_{sanitized_name}"
+            yt_link = f"{base_link}{yt_code}_yt_{sanitized_name}"
 
             block += (
                 f"📸 <b>IG Link</b>: <code>{ig_link}</code>\n"
