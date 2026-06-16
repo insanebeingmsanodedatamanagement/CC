@@ -9,9 +9,12 @@ from datetime import datetime, timedelta, timezone
 from bson import ObjectId
 import certifi
 import os
+from dotenv import load_dotenv
 
-
-
+if os.path.exists("bot2.env"):
+    load_dotenv("bot2.env", override=True)
+if os.path.exists("bot1.env"):
+    load_dotenv("bot1.env", override=False)
 
 BOT_1_TOKEN = os.getenv("BOT_1_TOKEN")
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{BOT_1_TOKEN}/sendMessage"
