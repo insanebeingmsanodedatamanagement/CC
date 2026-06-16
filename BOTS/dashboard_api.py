@@ -55,6 +55,9 @@ def col(name): return db[name]
 
 @app.get("/", response_class=HTMLResponse)
 def serve_dashboard():
+    import os
+    if not os.path.exists("dashboard/index.html"):
+        return HTMLResponse("<h1>Dashboard HTML not found on server. But the /tg redirector is ONLINE!</h1>")
     with open("dashboard/index.html", "r", encoding="utf-8") as f:
         return f.read()
 
