@@ -88,7 +88,10 @@ def get_bot_link_username() -> str:
 
 
 def make_bot_link(payload: str) -> str:
-    """Construct a t.me deep link using the runtime bot username."""
+    """Construct a web dashboard link if available, otherwise fallback to t.me deep link."""
+    dash_url = os.getenv("DASHBOARD_URL")
+    if dash_url:
+        return f"{dash_url.rstrip('/')}/tg?start={payload}"
     return f"https://t.me/{get_bot_link_username()}?start={payload}"
 
 # ==========================================
