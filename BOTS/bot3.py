@@ -34,7 +34,6 @@ import html as _html
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
 
-
 # ==========================================
 # ENTERPRISE CONFIGURATION
 # ==========================================
@@ -5932,7 +5931,7 @@ async def home_yt_handler(message: types.Message):
     username = BOT_USERNAME
     
     dash_url = os.getenv("DASHBOARD_URL")
-    base_link = f"{dash_url}/tg?start=" if dash_url else f"https://t.me/{username}?start="
+    base_link = f"{dash_url.rstrip('/')}/tg?start=" if dash_url else f"https://t.me/{username}?start="
     link = f"{base_link}{code}_YTCODE"
     
     text = (
@@ -5996,7 +5995,7 @@ async def ig_cc_links_handler(message: types.Message, page=0):
         cc_code = content['cc_code']
         
         dash_url = os.getenv("DASHBOARD_URL")
-        base_link = f"{dash_url}/tg?start=" if dash_url else f"https://t.me/{username}?start="
+        base_link = f"{dash_url.rstrip('/')}/tg?start=" if dash_url else f"https://t.me/{username}?start="
         link = f"{base_link}{code}_igcc_{cc_code}"
         
         text += (
@@ -6110,7 +6109,7 @@ async def all_pdf_links_handler(message: types.Message, page=0):
             yt_code = pdf["yt_start_code"]
 
             dash_url = os.getenv("DASHBOARD_URL")
-            base_link = f"{dash_url}/tg?start=" if dash_url else f"https://t.me/{username}?start="
+            base_link = f"{dash_url.rstrip('/')}/tg?start=" if dash_url else f"https://t.me/{username}?start="
             ig_link = f"{base_link}{ig_code}_ig_{sanitized_name}"
             yt_link = f"{base_link}{yt_code}_yt_{sanitized_name}"
 
