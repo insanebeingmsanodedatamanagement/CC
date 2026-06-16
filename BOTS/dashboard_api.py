@@ -8,10 +8,10 @@ from pymongo import MongoClient
 from datetime import datetime, timedelta, timezone
 from bson import ObjectId
 import certifi
-from dotenv import load_dotenv
+import os
 
-load_dotenv("bot2.env", override=True)
-load_dotenv("bot1.env", override=False)
+
+
 
 BOT_1_TOKEN = os.getenv("BOT_1_TOKEN")
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{BOT_1_TOKEN}/sendMessage"
@@ -25,7 +25,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.mount("/static", StaticFiles(directory="dashboard"), name="static")
+import os
+if os.path.exists("dashboard"):
+    app.mount("/static", StaticFiles(directory="dashboard"), name="static")
 
 MONGO_URI = os.getenv("MONGO_URI")
 MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "MSANodeDB")
