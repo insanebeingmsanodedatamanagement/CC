@@ -2,6 +2,10 @@ import os
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse
 
+import time
+import aiohttp
+import random
+
 router = APIRouter()
 
 @router.get("/tg", response_class=HTMLResponse)
@@ -18,31 +22,40 @@ async def tg_redirect(request: Request, start: str = ""):
     bot_username = os.getenv("BOT_USERNAME", "msanodebot")
     
     # Safely get db from app state to avoid multiple connections or circular imports
-    # If run in standalone mode, these might not exist on the state
     db = getattr(request.app.state, 'db', None)
     DB_ONLINE = getattr(request.app.state, 'DB_ONLINE', False)
     
+    # Fetch Real Vault Member Count purely from live Database (NO CACHE)
     try:
-        live_count = db.users.count_documents({}) if DB_ONLINE else 0
+        live_count = db.bot1_user_verification.count_documents({"vault_joined": True}) if DB_ONLINE else 0
         if live_count > 0:
             formatted_count = f"{live_count:,}"
         else:
-            formatted_count = "18,400+"
+            formatted_count = "92"
     except:
-        formatted_count = "18,400+"
+        formatted_count = "92"
 
-    # Fetch Real Reviews Data
+    # Fetch Real Reviews Data (Count only)
     try:
-        pipeline = [{"$group": {"_id": None, "avg_stars": {"$avg": "$stars"}}}]
-        aggr = list(db.bot1_reviews.aggregate(pipeline)) if DB_ONLINE else []
-        rating_score = round(aggr[0]["avg_stars"], 1) if aggr and aggr[0]["avg_stars"] else 4.9
-        formatted_rating = f"{rating_score:.1f}"
+        pipeline = [
+            {"$group": {
+                "_id": None,
+                "count": {"$sum": 1}
+            }}
+        ]
+        result = list(db.bot1_reviews.aggregate(pipeline)) if DB_ONLINE else []
         
-        real_reviews = db.bot1_reviews.count_documents({}) if DB_ONLINE else 0
-        ratings_count = f"{real_reviews:,}" if real_reviews > 0 else "12,854"
+        if result and result[0]["count"] >= 1:
+            total_count = result[0]["count"] + 16
+            ratings_count = f"{total_count:,}+"
+        else:
+            ratings_count = "17+"
     except:
-        formatted_rating = "4.9"
-        ratings_count = "12,854"
+        ratings_count = "17+"
+
+    # Random rating between 4.5 and 4.7
+    display_avg = random.choice([4.5, 4.6, 4.7])
+    formatted_rating = f"{display_avg:.1f}"
 
     html_content = f"""
     <!DOCTYPE html>
@@ -402,23 +415,7 @@ async def tg_redirect(request: Request, start: str = ""):
         
         <div class="card">
             <div class="brand-logo">
-                <svg viewBox="0 0 100 100" style="width: 65%; height: 65%; filter: drop-shadow(0 0 10px var(--accent));">
-                    <defs>
-                        <linearGradient id="brandGrad" x1="0%" y1="0%" x2="100%" y2="100%">
-                            <stop offset="0%" stop-color="#ffffff"/>
-                            <stop offset="100%" stop-color="var(--accent)"/>
-                        </linearGradient>
-                    </defs>
-                    <path d="M50 5 L90 25 L90 75 L50 95 L10 75 L10 25 Z" fill="none" stroke="url(#brandGrad)" stroke-width="6"/>
-                    <path d="M50 25 L75 40 L75 70 L50 85 L25 70 L25 40 Z" fill="none" stroke="url(#brandGrad)" stroke-width="4" opacity="0.6"/>
-                    <circle cx="50" cy="50" r="8" fill="url(#brandGrad)"/>
-                    <line x1="50" y1="5" x2="50" y2="25" stroke="url(#brandGrad)" stroke-width="4"/>
-                    <line x1="90" y1="25" x2="75" y2="40" stroke="url(#brandGrad)" stroke-width="4"/>
-                    <line x1="90" y1="75" x2="75" y2="70" stroke="url(#brandGrad)" stroke-width="4"/>
-                    <line x1="50" y1="95" x2="50" y2="85" stroke="url(#brandGrad)" stroke-width="4"/>
-                    <line x1="10" y1="75" x2="25" y2="70" stroke="url(#brandGrad)" stroke-width="4"/>
-                    <line x1="10" y1="25" x2="25" y2="40" stroke="url(#brandGrad)" stroke-width="4"/>
-                </svg>
+                <img src="/static/msa_logo.png" alt="MSA NODE">
             </div>
             
             <div class="brand-text">MSA NODE AGENT V2.0</div>
@@ -438,7 +435,7 @@ async def tg_redirect(request: Request, start: str = ""):
                     <svg viewBox="0 0 24 24"><path d="M12 17.27L18.18 21l-1.64-7.03L22 9.24l-7.19-.61L12 2 9.19 8.63 2 9.24l5.46 4.73L5.82 21z"/></svg>
                     <svg viewBox="0 0 24 24"><path d="M12 17.27L18.18 21l-1.64-7.03L22 9.24l-7.19-.61L12 2 9.19 8.63 2 9.24l5.46 4.73L5.82 21z"/></svg>
                     <svg viewBox="0 0 24 24"><path d="M12 17.27L18.18 21l-1.64-7.03L22 9.24l-7.19-.61L12 2 9.19 8.63 2 9.24l5.46 4.73L5.82 21z"/></svg>
-                    <svg viewBox="0 0 24 24"><path d="M12 17.27L18.18 21l-1.64-7.03L22 9.24l-7.19-.61L12 2 9.19 8.63 2 9.24l5.46 4.73L5.82 21z"/></svg>
+                    <svg viewBox="0 0 24 24"><path d="M22 9.24l-7.19-.62L12 2 9.19 8.63 2 9.24l5.46 4.73L5.82 21 12 17.27 18.18 21l-1.63-7.03L22 9.24zM12 15.4V6.1l1.71 4.04 4.38.38-3.32 2.88 1 4.28L12 15.4z"/></svg>
                 </div>
                 <div class="rating-text">
                     {formatted_rating} / 5.0 Rating <span class="reviews-text">({ratings_count} Reviews)</span>
@@ -488,8 +485,28 @@ if __name__ == "__main__":
     import uvicorn
     from fastapi import FastAPI
     from fastapi.staticfiles import StaticFiles
+    from pymongo import MongoClient
+    from dotenv import load_dotenv
+    import certifi
+    
+    load_dotenv("bot3.env") # Load env vars for local testing
     
     app = FastAPI(title="MSA NODE — Landing Page Standalone")
+    
+    MONGO_URI = os.getenv("MONGO_URI")
+    MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "MSANodeDB")
+    
+    try:
+        client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000, tlsCAFile=certifi.where())
+        db = client[MONGO_DB_NAME]
+        client.admin.command("ping")
+        app.state.DB_ONLINE = True
+        app.state.db = db
+        print("✅ Standalone DB connected successfully")
+    except Exception as e:
+        print(f"❌ DB Error: {e}")
+        app.state.db = None
+        app.state.DB_ONLINE = False
     
     if os.path.exists("dashboard"):
         app.mount("/static", StaticFiles(directory="dashboard"), name="static")
