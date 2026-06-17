@@ -508,8 +508,10 @@ if __name__ == "__main__":
         app.state.db = None
         app.state.DB_ONLINE = False
     
-    if os.path.exists("dashboard"):
-        app.mount("/static", StaticFiles(directory="dashboard"), name="static")
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+    dashboard_dir = os.path.join(BASE_DIR, "dashboard")
+    if os.path.exists(dashboard_dir):
+        app.mount("/static", StaticFiles(directory=dashboard_dir), name="static")
         
     app.include_router(router)
     
