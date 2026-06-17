@@ -6,7 +6,6 @@ router = APIRouter()
 
 @router.get("/tg", response_class=HTMLResponse)
 @router.get("/ig", response_class=HTMLResponse)
-@router.get("/igc", response_class=HTMLResponse)
 @router.get("/igcc", response_class=HTMLResponse)
 @router.get("/yt", response_class=HTMLResponse)
 @router.get("/ytcode", response_class=HTMLResponse)
@@ -62,7 +61,7 @@ async def tg_redirect(request: Request, start: str = ""):
                 --accent: #00e5ff;
                 --shadow-dark: #0a0b0d;
                 --shadow-light: #1c1f27;
-                --grid-color: rgba(255, 255, 255, 0.03);
+                --grid-color: rgba(255, 255, 255, 0.08);
             }}
             
             * {{ box-sizing: border-box; margin: 0; padding: 0; }}
@@ -319,7 +318,7 @@ async def tg_redirect(request: Request, start: str = ""):
                 --text-main: #333944;
                 --text-muted: #7a8291;
                 --accent: #0066ff;
-                --grid-color: rgba(0, 0, 0, 0.04);
+                --grid-color: rgba(0, 0, 0, 0.1);
             }}
             /* Apple Siri Style Background Glows for Light Mode */
             body.light-mode .ambient-light-1 {{
@@ -394,28 +393,32 @@ async def tg_redirect(request: Request, start: str = ""):
                 background: linear-gradient(90deg, transparent, rgba(255,255,255,0.8), transparent);
             }}
 
-            body.light-mode #theme-toggle {{
-                color: var(--text-muted);
-                border: 1px solid rgba(163, 177, 198, 0.6);
-                background: var(--bg-main);
-                box-shadow: 4px 4px 8px rgba(163, 177, 198, 0.6), -4px -4px 8px rgba(255, 255, 255, 0.8);
-            }}
-            body.light-mode #theme-toggle:active {{
-                box-shadow: inset 2px 2px 4px rgba(163, 177, 198, 0.6), inset -2px -2px 4px rgba(255, 255, 255, 0.8);
-            }}
         </style>
     </head>
     <body>
-        <button id="theme-toggle" style="position: absolute; top: 20px; right: 20px; background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.2); color: var(--text-muted); padding: 8px 12px; border-radius: 8px; cursor: pointer; z-index: 100; font-family: 'Inter', sans-serif; font-weight: 600; transition: all 0.3s ease;">
-            Toggle Theme
-        </button>
         <div class="ambient-light-1"></div>
         <div class="ambient-light-2"></div>
         <div class="grid-overlay"></div>
         
         <div class="card">
             <div class="brand-logo">
-                <img src="/static/msa_logo.png" alt="MSA NODE">
+                <svg viewBox="0 0 100 100" style="width: 65%; height: 65%; filter: drop-shadow(0 0 10px var(--accent));">
+                    <defs>
+                        <linearGradient id="brandGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+                            <stop offset="0%" stop-color="#ffffff"/>
+                            <stop offset="100%" stop-color="var(--accent)"/>
+                        </linearGradient>
+                    </defs>
+                    <path d="M50 5 L90 25 L90 75 L50 95 L10 75 L10 25 Z" fill="none" stroke="url(#brandGrad)" stroke-width="6"/>
+                    <path d="M50 25 L75 40 L75 70 L50 85 L25 70 L25 40 Z" fill="none" stroke="url(#brandGrad)" stroke-width="4" opacity="0.6"/>
+                    <circle cx="50" cy="50" r="8" fill="url(#brandGrad)"/>
+                    <line x1="50" y1="5" x2="50" y2="25" stroke="url(#brandGrad)" stroke-width="4"/>
+                    <line x1="90" y1="25" x2="75" y2="40" stroke="url(#brandGrad)" stroke-width="4"/>
+                    <line x1="90" y1="75" x2="75" y2="70" stroke="url(#brandGrad)" stroke-width="4"/>
+                    <line x1="50" y1="95" x2="50" y2="85" stroke="url(#brandGrad)" stroke-width="4"/>
+                    <line x1="10" y1="75" x2="25" y2="70" stroke="url(#brandGrad)" stroke-width="4"/>
+                    <line x1="10" y1="25" x2="25" y2="40" stroke="url(#brandGrad)" stroke-width="4"/>
+                </svg>
             </div>
             
             <div class="brand-text">MSA NODE AGENT V2.0</div>
@@ -452,9 +455,15 @@ async def tg_redirect(request: Request, start: str = ""):
         </div>
         
         <script>
-            document.getElementById('theme-toggle').addEventListener('click', function() {{
-                document.body.classList.toggle('light-mode');
-            }});
+            function applyTheme() {{
+                if (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches) {{
+                    document.body.classList.add('light-mode');
+                }} else {{
+                    document.body.classList.remove('light-mode');
+                }}
+            }}
+            applyTheme();
+            window.matchMedia('(prefers-color-scheme: light)').addEventListener('change', applyTheme);
         </script>
     </body>
     </html>
