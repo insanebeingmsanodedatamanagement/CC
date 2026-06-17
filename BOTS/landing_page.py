@@ -104,8 +104,8 @@ async def tg_redirect(request: Request, start: str = ""):
                 background-size: 35px 35px;
                 z-index: 0;
                 pointer-events: none;
-                mask-image: radial-gradient(circle at center, black 40%, transparent 90%);
-                -webkit-mask-image: radial-gradient(circle at center, black 40%, transparent 90%);
+                mask-image: radial-gradient(ellipse at center, black 20%, transparent 100%);
+                -webkit-mask-image: radial-gradient(ellipse at center, black 20%, transparent 100%);
             }}
 
             .ambient-light-1 {{
