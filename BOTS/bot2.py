@@ -1349,6 +1349,7 @@ async def retry_operation(operation, max_retries=3, base_delay=1.0, operation_na
         raise last_exception
     raise RuntimeError(f"Operation {operation_name} aborted (0 retries)")
 
+
 BOT_TOKEN = os.getenv("BOT_2_TOKEN")
 BOT_1_TOKEN = os.getenv("BOT_1_TOKEN")  # Bot 1 for delivery
 MASTER_ADMIN_ID = int(os.getenv("MASTER_ADMIN_ID", "0"))
@@ -1807,6 +1808,7 @@ def format_datetime(dt):
 class BroadcastStates(StatesGroup):
     selecting_category = State()
     waiting_for_message = State()
+    confirming_send = State()
     waiting_for_edit_id = State()
     waiting_for_edit_content = State()
     waiting_for_edit_confirm = State()
@@ -3671,7 +3673,73 @@ async def process_direct_broadcast(message: types.Message, state: FSMContext):
         await state.clear()
         return
     
-    # Send immediately
+    # Show confirmation preview
+    await state.update_data(
+        message_text=message_text,
+        media_type=media_type,
+        file_id=file_id
+    )
+    
+    confirm_kb = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="✅ CONFIRM SEND"), KeyboardButton(text="❌ CANCEL")]
+        ],
+        resize_keyboard=True
+    )
+    
+    preview = f"📋 **BROADCAST PREVIEW**\n\n"
+    preview += f"📂 Category: {category}\n"
+    preview += f"👥 Target Users: {len(target_users)}\n"
+    preview += f"📝 Type: {media_type.capitalize() if media_type else 'Text'}\n\n"
+    preview += "✅ Press **CONFIRM SEND** to proceed or **CANCEL** to abort."
+    
+    await state.set_state(BroadcastStates.confirming_send)
+    await message.answer(preview, reply_markup=confirm_kb, parse_mode="Markdown")
+
+@dp.message(BroadcastStates.confirming_send)
+async def confirm_direct_broadcast(message: types.Message, state: FSMContext):
+    """Execute direct broadcast after confirmation"""
+    if message.text and "CANCEL" in message.text:
+        await state.clear()
+        await message.answer("✅ Cancelled.", reply_markup=get_broadcast_menu(), parse_mode="Markdown")
+        return
+        
+    if not (message.text and "CONFIRM SEND" in message.text):
+        await message.answer("⚠️ Please press CONFIRM SEND or CANCEL.")
+        return
+        
+    data = await state.get_data()
+    category = data.get("category", "ALL")
+    message_text = data.get("message_text", "")
+    media_type = data.get("media_type")
+    file_id = data.get("file_id")
+    
+    # Re-calculate target users to be safe
+    _active_vault_ids = {u["user_id"] for u in col_user_verification.find({"vault_joined": True}, {"user_id": 1})}
+    if category == "ALL" or category == "VAULT (FOMO DROP)":
+        target_users = [{"user_id": uid} for uid in _active_vault_ids]
+    elif category == "GRACE (UNCONSUMED)":
+        grace_docs = list(col_user_verification.find({"grace_allowed": True, "grace_consumed": {"$ne": True}}, {"user_id": 1}))
+        target_users = [u for u in grace_docs if u["user_id"] in _active_vault_ids]
+    elif category == "HIGH_CREDIT":
+        _high_credit_ids = {u["user_id"] for u in db["bot1_msa_credits"].find({"balance": {"$gte": 100}}, {"user_id": 1})}
+        target_users = [{"user_id": uid} for uid in _high_credit_ids if uid in _active_vault_ids]
+    elif category == "AT_RISK":
+        from datetime import timedelta as _td
+        _cutoff = now_local() - _td(days=14)
+        _risk_docs = list(col_user_verification.find({"vault_joined": True, "last_content_access_at": {"$lt": _cutoff}}, {"user_id": 1}))
+        target_users = [u for u in _risk_docs if u["user_id"] in _active_vault_ids]
+    elif category == "NEW_THIS_WEEK":
+        from datetime import timedelta as _td
+        _week_ago = now_local() - _td(days=7)
+        _new_ids = {u["user_id"] for u in col_msa_ids.find({"allocated_at": {"$gte": _week_ago}}, {"user_id": 1})}
+        target_users = [{"user_id": uid} for uid in _new_ids if uid in _active_vault_ids]
+    else:
+        tracking_docs = list(col_user_tracking.find({"source": category}, {"user_id": 1}))
+        target_users = [u for u in tracking_docs if u["user_id"] in _active_vault_ids]
+        
+    broadcast_id, index = get_next_broadcast_id()
+    
     print(f"📤 Starting broadcast delivery...")
     print(f"🆔 Broadcast ID: {broadcast_id}")
     print(f"📂 Category: {category}")
@@ -3689,14 +3757,12 @@ async def process_direct_broadcast(message: types.Message, state: FSMContext):
             print(f"✅ Pre-download complete — {len(_media_bytes):,} bytes")
         except Exception as _dl_err:
             print(f"⚠️ Media pre-download failed: {_dl_err}  (will attempt per-user)")
-    # ────────────────────────────────────────────────────────────────────────
 
     # ── PRE-COMPUTE CAPTION / TEXT (once, shared across all users) ───────────
     _bcast_caption = _format_broadcast_msg(message_text, is_caption=True) if message_text and message_text.strip() else ""
     _bcast_caption_split = len(_bcast_caption) > 1024   # True = too long for caption
     _bcast_full_text = _format_broadcast_msg(message_text or "📢 MSA NODE Broadcast", is_caption=False)
     _bcast_text_chunks = _split_text(_bcast_full_text)  # list of ≤4000-char chunks; usually just 1
-    # ─────────────────────────────────────────────────────────────────────────
 
     status_msg = await message.answer(
         f"📤 **Sending Broadcast via Bot 1...**\n\n"
@@ -3705,7 +3771,8 @@ async def process_direct_broadcast(message: types.Message, state: FSMContext):
         f"👥 Target Users: {len(target_users)}\n"
         f"🤖 Delivery Bot: Bot 1\n\n"
         f"⏳ Preparing to send...",
-        parse_mode="Markdown"
+        parse_mode="Markdown",
+        reply_markup=get_broadcast_menu()
     )
 
     success_count = 0
