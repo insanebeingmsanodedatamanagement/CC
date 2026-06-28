@@ -1345,7 +1345,9 @@ async def retry_operation(operation, max_retries=3, base_delay=1.0, operation_na
             raise e
     
     # If we get here, all retries failed
-    raise last_exception
+    if last_exception is not None:
+        raise last_exception
+    raise RuntimeError(f"Operation {operation_name} aborted (0 retries)")
 
 BOT_TOKEN = os.getenv("BOT_2_TOKEN")
 BOT_1_TOKEN = os.getenv("BOT_1_TOKEN")  # Bot 1 for delivery
