@@ -48,7 +48,6 @@ from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter, TelegramNet
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
 
-
 # ==========================================
 # ⚡ CONFIGURATION  — all values from env vars
 # ==========================================
@@ -88,11 +87,9 @@ def get_bot_link_username() -> str:
 
 
 def make_bot_link(payload: str) -> str:
-    """Construct a web dashboard link if available, otherwise fallback to t.me deep link."""
-    dash_url = os.getenv("DASHBOARD_URL")
-    if dash_url:
-        return f"{dash_url.rstrip('/')}/tg?start={payload}"
-    return f"https://t.me/{get_bot_link_username()}?start={payload}"
+    """Construct a web dashboard redirect link for the custom page middleman."""
+    dash_url = os.getenv("DASHBOARD_URL", "https://cc-svu3.onrender.com")
+    return f"{dash_url.rstrip('/')}/tg?start={payload}"
 
 # ==========================================
 # 🌐 WEBHOOK CONFIGURATION
@@ -3446,15 +3443,23 @@ def allocate_msa_id(user_id: int, username: str, first_name: str) -> str:
     # Get next available ID
     msa_id, msa_number = get_next_msa_id()
     
-    # Insert into database
-    col_msa_ids.insert_one({
-        "user_id": user_id,
-        "msa_id": msa_id,
-        "msa_number": msa_number,
-        "assigned_at": now_local(),
-        "username": username,
-        "first_name": first_name
-    })
+    # Insert into database with race-condition protection
+    try:
+        col_msa_ids.insert_one({
+            "user_id": user_id,
+            "msa_id": msa_id,
+            "msa_number": msa_number,
+            "assigned_at": now_local(),
+            "username": username,
+            "first_name": first_name
+        })
+    except DuplicateKeyError:
+        # Race condition: another request created the ID a fraction of a second ago
+        logger.info(f"Race condition handled: User {user_id} MSA+ ID already created concurrently.")
+        existing = col_msa_ids.find_one({"user_id": user_id})
+        if existing:
+            return existing['msa_id']
+        raise
     
     # Update user verification record
     update_verification_status(user_id, msa_id=msa_id)
@@ -3912,9 +3917,10 @@ async def _check_leaderboard_shifts():
             {"$match": {"ledger.reason": {"$regex": "^Purchase:"}}},
             {"$group": {
                 "_id": "$user_id",
-                "spent": {"$sum": {"$multiply": ["$ledger.pts", -1]}}
+                "spent": {"$sum": {"$multiply": ["$ledger.pts", -1]}},
+                "last_purchase_time": {"$max": "$ledger.at"}
             }},
-            {"$sort": {"spent": -1}},
+            {"$sort": {"spent": -1, "last_purchase_time": 1}},
             {"$limit": 3}
         ]
         top_3 = list(col_msa_credits.aggregate(pipeline))
@@ -3955,14 +3961,14 @@ async def _check_leaderboard_shifts():
                 text = (
                     f"🏆 *LEADERBOARD UPDATE: NEW RANK SECURED*\n\n"
                     f"You have climbed the ranks. Your new status:\n"
-                    f"*{badge} TIER* (Spent: {current_balances[uid]} Credits)\n\n"
+                    f"*{badge} TIER*\n\n"
                     f"Your new badge is live on your Dashboard."
                 )
                 if rank > prev_rank and prev_rank != -1:
                     text = (
                         f"⚠️ *LEADERBOARD ALERT: YOU DROPPED A RANK*\n\n"
-                        f"Another agent just spent more points and pushed you down to:\n"
-                        f"*{badge} TIER* (Spent: {current_balances[uid]} Credits)\n\n"
+                        f"Another agent just pushed you down to:\n"
+                        f"*{badge} TIER*\n\n"
                         f"Don't let them keep it. Reclaim your spot."
                     )
                 try:
@@ -4279,6 +4285,7 @@ async def handle_msa_credits(message: types.Message, state: FSMContext):
 # ─────────────────────────────────────────────────────────────────────────────
 
 @dp.message(RewardStoreStates.browsing_store, F.text != "🔙 BACK TO MENU")
+@anti_spam("store_browse")
 async def handle_store_browsing(message: types.Message, state: FSMContext):
     """Handle entry nav (STORE | MY VAULT) and store item taps."""
     uid   = message.from_user.id
@@ -4385,6 +4392,7 @@ async def handle_store_browsing(message: types.Message, state: FSMContext):
 # ─────────────────────────────────────────────────────────────────────────────
 
 @dp.message(RewardStoreStates.confirm_purchase, F.text != "🔙 BACK TO MENU")
+@anti_spam("store_purchase")
 async def handle_store_confirm(message: types.Message, state: FSMContext):
     """Handle purchase confirmation or cancellation."""
     uid  = message.from_user.id
@@ -4439,6 +4447,26 @@ async def handle_store_confirm(message: types.Message, state: FSMContext):
         )
         return
 
+    # Atomic Purchase Deduction & Duplication Check
+    purchase_result = col_msa_credits.update_one(
+        {
+            "user_id": uid,
+            "balance": {"$gte": cost},
+            "purchased_items": {"$ne": item_id}
+        },
+        {
+            "$inc":    {"balance": -cost},
+            "$addToSet": {"purchased_items": item_id},
+            "$push":   {"ledger": {"pts": -cost, "reason": f"Purchase: {item_name}", "at": now_local()}}
+        }
+    )
+    if purchase_result.modified_count == 0:
+        await message.answer("❌ **Transaction failed.**\nEither you lack the required credits, or you already own this item.", parse_mode=ParseMode.MARKDOWN)
+        items = list(col_store_items.find({"active": True}).sort("cost", 1))
+        await state.set_state(RewardStoreStates.browsing_store)
+        await message.answer("Returning to store...", reply_markup=_build_store_items_keyboard(items, purchased_ids))
+        return
+
     # 🎬 Purchase animation (in-chat)
     anim = await message.answer("🏦")
     await asyncio.sleep(0.2)
@@ -4456,16 +4484,9 @@ async def handle_store_confirm(message: types.Message, state: FSMContext):
 
     reward      = item.get("reward_text", "")
     new_balance = max(0, balance - cost)
-    col_msa_credits.update_one(
-        {"user_id": uid},
-        {
-            "$inc":    {"balance": -cost},
-            "$addToSet": {"purchased_items": item_id},
-            "$push":   {"ledger": {"pts": -cost, "reason": f"Purchase: {item_name}", "at": now_local()}}
-        }
-    )
 
     # Trigger live leaderboard check since this user just spent credits
+
     asyncio.create_task(_check_leaderboard_shifts(), name=f"lb_shift_shop_{uid}")
 
     # Deliver reward
@@ -4737,9 +4758,10 @@ def _build_leaderboard_text() -> str:
         {"$match": {"ledger.reason": {"$regex": "^Purchase:"}}},
         {"$group": {
             "_id": "$user_id",
-            "spent": {"$sum": {"$multiply": ["$ledger.pts", -1]}}
+            "spent": {"$sum": {"$multiply": ["$ledger.pts", -1]}},
+            "last_purchase_time": {"$max": "$ledger.at"}
         }},
-        {"$sort": {"spent": -1}},
+        {"$sort": {"spent": -1, "last_purchase_time": 1}},
         {"$limit": 10}
     ]
     rows = list(col_msa_credits.aggregate(pipeline))
@@ -4771,7 +4793,7 @@ def _build_leaderboard_text() -> str:
             fname = f"Agent {str(uid)[-4:]}"
             
         label = rank_labels[idx] if idx < len(rank_labels) else f"{idx+1}."
-        board_lines.append(f"   {label}  *{_escape_md(fname)}*  —  `{pts} Credits Spent`")
+        board_lines.append(f"   {label}  *{_escape_md(fname)}*")
 
     return (
         f"🏆 *MSA NODE — Top Elite Spenders*\n\n"
@@ -4829,6 +4851,50 @@ async def leaderboard_callback(callback: types.CallbackQuery):
 # The standalone menu button has been removed. Users access the leaderboard
 # from inside their referral hub via the inline 'View Leaderboard' button.
 # The /leaderboard command still works for convenience.
+
+@dp.message(Command("leaderboards"))
+@anti_spam("leaderboards")
+async def leaderboards_cmd(message: types.Message, state: FSMContext):
+    """Show public leaderboard via /leaderboards command with anti-spam & loading."""
+    uid = message.from_user.id
+    if _is_processing(uid):
+        try:
+            await message.answer("⏳")
+        except Exception:
+            pass
+        return
+    _set_processing(uid)
+
+    try:
+        if await check_maintenance_mode(message):
+            _clear_processing(uid)
+            return
+    except Exception:
+        pass
+
+    try:
+        anim = await message.answer("🏆")
+        await asyncio.sleep(0.25)
+        await anim.edit_text("🏆 Accessing Elite Leaderboards...")
+        await asyncio.sleep(0.3)
+        await anim.edit_text("📊 Compiling rankings...")
+        await asyncio.sleep(0.3)
+        try:
+            await anim.delete()
+        except Exception:
+            pass
+
+        text = _build_leaderboard_text()
+        kb_rows = [[
+            InlineKeyboardButton(text="🔄 Refresh", callback_data="show_leaderboard"),
+            InlineKeyboardButton(text="🤝 My Referral Hub", callback_data="ref_page_1"),
+        ]]
+        kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
+        await message.answer(text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+    except Exception:
+        pass
+    finally:
+        _clear_processing(uid)
 
 
 # ==========================================
@@ -6354,7 +6420,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
 
         # ✅ Ownership verified — proceed
         # RECORD FIRST-TOUCH SOURCE — lightweight, no bot2_user_tracking write yet
-        _store_initial_source(user_id, "YTCODE", first_name)
+        _store_initial_source(user_id, "YTCODE", message.from_user.first_name or "")
         # 🔒 VAULT ACCESS CHECK — Block non-members for YTCODE links
         is_in_vault = await check_channel_membership(user_id)
         # ── PRE-VAULT SYNC (idempotent) ──
@@ -7216,6 +7282,10 @@ It's 100% free, instant, and permanent.
 @dp.my_chat_member()
 async def handle_vault_join(event: ChatMemberUpdated):
     """Detect when user joins vault and auto-send welcome message with source-specific rewards"""
+    # Check if this is a test bot instance — avoid sending duplicate messages
+    if os.getenv("IS_TEST_BOT", "False").lower() == "true":
+        return
+
     # Check if this is the vault channel
     if event.chat.id != CHANNEL_ID:
         return
@@ -13769,15 +13839,15 @@ async def weekly_leaderboard_scheduler():
             pipeline = [
                 {"$unwind": "$ledger"},
                 {"$match": {"ledger.reason": {"$regex": "^Purchase:"}}},
-                {"$group": {"_id": "$user_id", "spent": {"$sum": {"$multiply": ["$ledger.pts", -1]}}}},
-                {"$sort": {"spent": -1}},
+                {"$group": {"_id": "$user_id", "spent": {"$sum": {"$multiply": ["$ledger.pts", -1]}}, "last_purchase_time": {"$max": "$ledger.at"}}},
+                {"$sort": {"spent": -1, "last_purchase_time": 1}},
                 {"$limit": 3},
             ]
             top3 = list(col_msa_credits.aggregate(pipeline))
             if not top3: 
                 continue
 
-            settings = db["bot3_settings"].find_one({"_id": "economy"}) or {}
+            settings = db["bot1_state_persistence"].find_one({"key": "economy_settings"}) or {}
             lb_rewards = settings.get("leaderboard_rewards", [50, 40, 30])
 
             medals = ["🥇", "🥈", "🥉"]
@@ -13794,7 +13864,7 @@ async def weekly_leaderboard_scheduler():
                 if reward_amt > 0:
                     _award_msa_credits(uid, reward_amt, f"Weekly Leaderboard Rank {i+1}")
 
-                lines.append(f"   {medals[i]} *{_escape_md(fname)}* — {spent} credits spent (+{reward_amt} reward)")
+                lines.append(f"   {medals[i]} *{_escape_md(fname)}* (+{reward_amt} reward)")
 
             leaderboard_board = "\n".join(lines)
 
