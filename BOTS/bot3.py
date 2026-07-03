@@ -19,6 +19,7 @@ from aiogram.filters import Command, StateFilter
 from aiogram.types import ReplyKeyboardMarkup, ReplyKeyboardRemove, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
+from dotenv import load_dotenv
 import pymongo
 from pymongo import MongoClient
 from pymongo.errors import ServerSelectionTimeoutError, ConnectionFailure, DuplicateKeyError
@@ -33,6 +34,18 @@ from aiohttp import web
 import html as _html
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
+# Load environment variables.
+# Priority:
+# 1) Explicit BOT3_ENV_FILE override
+# 2) Backward-compatible default files used in existing deployments
+_explicit_env_file = os.environ.get("BOT3_ENV_FILE", "").strip()
+if _explicit_env_file:
+    ENV_FILE_CANDIDATES = (_explicit_env_file, "bot3.env", "bot3.env.txt", "BOT3.env", ".env")
+else:
+    ENV_FILE_CANDIDATES = ("bot3.env", "bot3.env.txt", "BOT3.env", ".env")
+
+ACTIVE_ENV_FILE = next((p for p in ENV_FILE_CANDIDATES if os.path.exists(p)), "BOT3.env")
+load_dotenv(ACTIVE_ENV_FILE, override=True)
 
 # ==========================================
 # ENTERPRISE CONFIGURATION
