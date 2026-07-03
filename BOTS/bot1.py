@@ -679,19 +679,29 @@ def record_content_access(user_id: int) -> None:
     Call this whenever content is successfully delivered to a user.
     - Sets last_content_access_at = now
     - Resets streak_nudge_sent = False (so the 7-day nudge can fire again next cycle)
-    - Stores first_name if not already stored (fetched from DB is fine here)
+    - Increments total_content_clicks for Strategy 3 behavior-win milestone tracking
+    - Fires Strategy 3 behavior win checks (1st click, 10th click) as non-blocking tasks
     """
     try:
         col_user_verification.update_one(
             {"user_id": user_id},
-            {"$set": {
-                "last_content_access_at": now_local(),
-                "streak_nudge_sent": False,
-            }},
+            {
+                "$set": {
+                    "last_content_access_at": now_local(),
+                    "streak_nudge_sent": False,
+                },
+                "$inc": {"total_content_clicks": 1},  # S3: lifetime click counter
+            },
             upsert=False  # Only update existing users — never create new docs here
         )
+        # S3: Schedule behavior-win check (non-blocking — never delays content delivery)
+        try:
+            check_and_fire_behavior_wins(user_id, "content_click")
+        except NameError:
+            pass  # check_and_fire_behavior_wins defined later in file — safe at runtime
     except Exception as _e:
         logger.warning(f"[STREAK] record_content_access failed for {user_id}: {_e}")
+
 
 
 # ── Idea 3: Milestone auto-broadcast ──────────────────────────────────────────
@@ -4505,6 +4515,8 @@ async def handle_store_confirm(message: types.Message, state: FSMContext):
     )
     await state.set_state(RewardStoreStates.browsing_vault)
     logger.info(f"[SHOP] User {uid} purchased '{item_name}' for {cost} credits")
+    # S3: Behavior win — fire first-purchase recognition (non-blocking)
+    check_and_fire_behavior_wins(uid, "store_purchase")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -5548,6 +5560,10 @@ async def referral_payout_scheduler() -> None:
                         confirmed_count = col_referrals.count_documents({"referrer_id": referrer_id, "status": "confirmed"})
                         asyncio.create_task(_check_milestone_rewards(referrer_id, confirmed_count))
                         asyncio.create_task(_check_and_fire_referral_tier(referrer_id, referred_name, confirmed_count))
+                        # S3: Behavior win check for 1st and 5th confirmed referrals
+                        check_and_fire_behavior_wins(
+                            referrer_id, "referral", {"count": confirmed_count}
+                        )
                         logger.info(f"[REFERRAL PAYOUT] Matured: {referred_id} -> referrer {referrer_id}")
                     else:
                         col_referrals.update_one(
@@ -13093,6 +13109,264 @@ async def auto_backup_bot1():
         await asyncio.sleep(12 * 3600)
 
 
+
+# ==========================================
+# ⚡ STRATEGY 2 — FLASH DROP ALERT SYSTEM
+# ==========================================
+# Psychology: Scarcity + FOMO + Availability Heuristic
+# When a NEW store item is detected (added within the last 10 minutes and
+# not yet flash-notified), every vault member who can AFFORD it right now
+# gets an instant personal DM within minutes of the drop.
+# Dedup: stamps `flash_notified=True` on the item → fires ONCE per item, ever.
+# Per-user guard: `flash_alerted_{item_id}` on user_verification → one DM per
+# user per item, forever, regardless of 24h auto-msg cooldown (flash = priority).
+# ==========================================
+
+async def flash_drop_alert_scheduler():
+    """
+    Polls every 5 minutes for newly-added active store items.
+    On first detection: blasts a scarcity-framed DM to all vault members
+    whose current balance >= item cost and who haven't been alerted yet.
+    Rate-limited to 1 msg/second to comply with Telegram flood rules.
+    """
+    logger.info("[FLASH_DROP] Scheduler started")
+    await asyncio.sleep(60)  # Let bot fully boot first
+
+    while True:
+        try:
+            cutoff = now_local() - timedelta(minutes=10)
+
+            # ── Find items added in the last 10 min that haven't been flash-notified ──
+            new_items = list(col_store_items.find({
+                "active": True,
+                "flash_notified": {"$ne": True},
+                "created_at": {"$gte": cutoff},
+            }))
+
+            for item in new_items:
+                item_id   = str(item.get("item_id", str(item.get("_id"))))
+                item_name = item.get("name", "Exclusive Item")
+                item_cost = int(item.get("cost", 0))
+                if item_cost <= 0:
+                    col_store_items.update_one(
+                        {"_id": item["_id"]}, {"$set": {"flash_notified": True}}
+                    )
+                    continue
+
+                # Mark immediately — prevents re-fire on next poll even if sends fail
+                col_store_items.update_one(
+                    {"_id": item["_id"]},
+                    {"$set": {"flash_notified": True, "flash_notified_at": now_local()}}
+                )
+
+                # ── Find vault members who can afford this item ────────────────
+                eligible_credits = list(col_msa_credits.find(
+                    {"balance": {"$gte": item_cost}},
+                    {"user_id": 1, "balance": 1}
+                ).limit(200))  # Batch cap — respects Telegram rate limits
+
+                sent_count = 0
+                for cred_doc in eligible_credits:
+                    uid     = cred_doc["user_id"]
+                    balance = cred_doc.get("balance", 0)
+                    flag    = f"flash_alerted_{item_id}"
+
+                    uv = col_user_verification.find_one(
+                        {"user_id": uid},
+                        {"vault_joined": 1, "bot_unreachable": 1,
+                         "first_name": 1, flag: 1}
+                    )
+                    if not uv or not uv.get("vault_joined") or uv.get("bot_unreachable"):
+                        continue
+                    if uv.get(flag):  # Already alerted for this item
+                        continue
+
+                    name = uv.get("first_name") or "Agent"
+                    remaining = balance - item_cost
+
+                    # Stamp BEFORE send — zero duplicates on any restart
+                    col_user_verification.update_one(
+                        {"user_id": uid}, {"$set": {flag: True}}
+                    )
+
+                    try:
+                        await bot.send_message(
+                            uid,
+                            f"<b>⚡ FLASH DROP — Just Added to the Vault Store</b>\n"
+                            f"━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                            f"🎁 <b>{item_name}</b>\n"
+                            f"💳 Cost: <b>{item_cost} MSA Credits</b>\n\n"
+                            f"✅ <b>{name}, you qualify right now.</b>\n"
+                            f"Your balance: <code>{balance} credits</code>\n"
+                            f"After redeeming: <code>{remaining} credits</code> remaining\n\n"
+                            f"<i>Tap</i> <b>🏪 REWARD STORE</b> <i>in your menu to claim it."
+                            f" New drops move fast.</i>",
+                            parse_mode="HTML"
+                        )
+                        sent_count += 1
+                        log_to_terminal(
+                            "FLASH_DROP", uid,
+                            f"Alerted '{item_name}' (cost={item_cost}, bal={balance})"
+                        )
+                        await asyncio.sleep(1)  # 1 msg/sec — Telegram flood guard
+                    except Exception as _e:
+                        _es = str(_e).lower()
+                        if "forbidden" in _es or "chat not found" in _es or "bot can't initiate" in _es:
+                            col_user_verification.update_one(
+                                {"user_id": uid},
+                                {"$set": {
+                                    "bot_unreachable": True,
+                                    "bot_unreachable_reason": str(_e)[:200]
+                                }}
+                            )
+
+                if sent_count:
+                    logger.info(
+                        f"[FLASH_DROP] '{item_name}' — {sent_count} members alerted"
+                    )
+
+        except asyncio.CancelledError:
+            break
+        except Exception as _se:
+            logger.error(f"[FLASH_DROP] Scheduler error: {_se}")
+
+        await asyncio.sleep(5 * 60)  # Poll every 5 minutes
+
+
+# ==========================================
+# 🎯 STRATEGY 3 — BEHAVIOR-TRIGGERED WIN MESSAGES
+# ==========================================
+# Psychology: Variable Reward Schedule + Immediate Positive Reinforcement
+# The bot "notices" real user actions and responds instantly — making the
+# experience feel live, human, and personally observed.
+# Triggers are detected once per milestone, stamped with a DB flag → zero
+# duplicates. Fully additive — does not interfere with any existing flow.
+#
+# Milestone → DB flag                 → Message
+# 1st content click  → win_1st_click  → "That's how it starts."
+# 10 total clicks    → win_10_clicks  → "You're not just browsing."
+# 1st referral       → win_1st_ref    → "Your network starts here."
+# 5 referrals        → win_5_refs     → "You're running an operation."
+# 1st store purchase → win_1st_store  → "Your credits are working for you."
+# ==========================================
+
+async def _fire_behavior_win(uid: int, flag: str, message_html: str) -> None:
+    """
+    Internal helper — stamps flag on user_verification then sends the DM.
+    Called as asyncio.create_task() so it never blocks the trigger path.
+    """
+    try:
+        result = col_user_verification.update_one(
+            {"user_id": uid, flag: {"$ne": True}},   # Only update if NOT already set
+            {"$set": {flag: True, f"{flag}_at": now_local()}}
+        )
+        if result.modified_count == 0:
+            return  # Already fired — strict dedup, no second send
+
+        await asyncio.sleep(1.5)  # Small delay so it arrives after the main action response
+        await bot.send_message(uid, message_html, parse_mode="HTML")
+        log_to_terminal("BEHAVIOR_WIN", uid, f"Fired: {flag}")
+    except Exception as _e:
+        _es = str(_e).lower()
+        if "forbidden" in _es or "chat not found" in _es:
+            col_user_verification.update_one(
+                {"user_id": uid},
+                {"$set": {"bot_unreachable": True, "bot_unreachable_reason": str(_e)[:200]}}
+            )
+
+
+def check_and_fire_behavior_wins(uid: int, event: str, extra: dict | None = None) -> None:
+    """
+    Called synchronously from any handler. Checks which milestone flags to fire
+    based on the `event` type and current DB state, then schedules DMs as
+    non-blocking tasks. Safe to call from any context — never raises.
+
+    Supported events:
+        "content_click"  — user clicked a content link
+        "referral"       — a referral was confirmed for this user (pass extra={"count": N})
+        "store_purchase" — user completed a store purchase (Strategy 5 also fires here)
+    """
+    try:
+        uv = col_user_verification.find_one(
+            {"user_id": uid},
+            {"win_1st_click": 1, "win_10_clicks": 1, "win_1st_ref": 1,
+             "win_5_refs": 1, "win_1st_store": 1, "total_content_clicks": 1}
+        )
+        if not uv:
+            return
+
+        # ── 1st content click ─────────────────────────────────────────────────
+        if event == "content_click" and not uv.get("win_1st_click"):
+            asyncio.create_task(
+                _fire_behavior_win(
+                    uid, "win_1st_click",
+                    "<b>🎯 First access logged.</b>\n\n"
+                    "Most people read about this. You just went and got it.\n\n"
+                    "<i>That's how it starts.</i>"
+                ),
+                name=f"bwin_1st_click_{uid}"
+            )
+
+        # ── 10 total content clicks ───────────────────────────────────────────
+        if event == "content_click" and not uv.get("win_10_clicks"):
+            total_clicks = int(uv.get("total_content_clicks", 0))
+            if total_clicks >= 9:  # 9 already stored + this current click = 10
+                asyncio.create_task(
+                    _fire_behavior_win(
+                        uid, "win_10_clicks",
+                        "<b>📊 10 content accesses.</b>\n\n"
+                        "You're not browsing. You're studying.\n"
+                        "The members who study are the ones who build.\n\n"
+                        "<i>Keep the momentum going.</i>"
+                    ),
+                    name=f"bwin_10_clicks_{uid}"
+                )
+
+        # ── 1st confirmed referral ────────────────────────────────────────────
+        if event == "referral" and not uv.get("win_1st_ref"):
+            asyncio.create_task(
+                _fire_behavior_win(
+                    uid, "win_1st_ref",
+                    "<b>🤝 First referral confirmed.</b>\n\n"
+                    "You just brought someone into the system.\n"
+                    "That's not luck — that's influence.\n\n"
+                    "<i>Your network starts here.</i>"
+                ),
+                name=f"bwin_1st_ref_{uid}"
+            )
+
+        # ── 5 confirmed referrals ─────────────────────────────────────────────
+        if event == "referral" and not uv.get("win_5_refs"):
+            count = (extra or {}).get("count", 0)
+            if count >= 5:
+                asyncio.create_task(
+                    _fire_behavior_win(
+                        uid, "win_5_refs",
+                        "<b>🔥 5 confirmed referrals.</b>\n\n"
+                        "You're not just a member anymore.\n"
+                        "You're running an operation inside the Vault.\n\n"
+                        "<i>Top referrers get recognised. Keep going.</i>"
+                    ),
+                    name=f"bwin_5_refs_{uid}"
+                )
+
+        # ── 1st store purchase ────────────────────────────────────────────────
+        if event == "store_purchase" and not uv.get("win_1st_store"):
+            asyncio.create_task(
+                _fire_behavior_win(
+                    uid, "win_1st_store",
+                    "<b>🏪 First redemption complete.</b>\n\n"
+                    "You earned credits and you spent them on something real.\n"
+                    "That's the whole loop working exactly as designed.\n\n"
+                    "<i>Your credits are working for you now.</i>"
+                ),
+                name=f"bwin_1st_store_{uid}"
+            )
+
+    except Exception as _e:
+        logger.warning(f"[BEHAVIOR_WIN] check failed for {uid}: {_e}")
+
+
 async def inactive_member_monitor():
     """
     30/60/90-DAY ABANDONMENT LIFECYCLE MONITOR
@@ -13288,7 +13562,7 @@ async def inactive_member_monitor():
                         logger.info(f"[30/60/90] Day-30 reminder sent to user {user_id}")
                     except Exception as e:
                         logger.warning(f"[30/60/90] Could not send day-30 reminder to {user_id}: {e}")
-        
+
         except asyncio.CancelledError:
             break
         except Exception as e:
@@ -13297,11 +13571,9 @@ async def inactive_member_monitor():
 
 # ==========================================
 # 📦 MONTHLY JSON BACKUP DELIVERY — Bot 1
-# Runs on the 1st of every month, 09:00–11:00 AM local time
 # ==========================================
 
 _BOT1_MONTHLY_EXPORT = [
-    # (collection_name,          restore_unique_key)
     ("bot1_user_verification",        "user_id"),
     ("bot1_msa_ids",                  "user_id"),
     ("bot1_support_tickets",          "user_id"),
@@ -13330,7 +13602,7 @@ def _mongo_json_encoder(obj):
 
 
 async def _send_col_json(col_name: str, unique_key: str, now, dest_id: int) -> tuple[int, float]:
-    """Dump one collection to gzip JSON and send to dest_id. Returns (record_count, bytes_total)."""
+    """Dump one collection to gzip JSON and send to dest_id."""
     import json, gzip, io
     from aiogram.types import BufferedInputFile
 
@@ -13344,7 +13616,7 @@ async def _send_col_json(col_name: str, unique_key: str, now, dest_id: int) -> t
         doc["_id"] = str(doc.get("_id", ""))
         records.append(doc)
 
-    CHUNK  = 50_000  # split >50k records to stay within Telegram's 50 MB file limit
+    CHUNK  = 50_000
     chunks = [[records[j] for j in range(i, min(i+CHUNK, len(records)))] for i in range(0, len(records), CHUNK)] if records else [[]]
     total_bytes = 0
 
@@ -13850,66 +14122,102 @@ async def weekly_leaderboard_scheduler():
             settings = db["bot1_state_persistence"].find_one({"key": "economy_settings"}) or {}
             lb_rewards = settings.get("leaderboard_rewards", [50, 40, 30])
 
-            medals = ["🥇", "🥈", "🥉"]
-            lines = []
-            top_uids = []
+            # Build winner data + award credits + leaderboard display
+            medals      = ["🥇", "🥈", "🥉"]
+            winner_data = []  # (uid, rank_num, fname, reward_amt)
+            board_lines = []
             for i, row in enumerate(top3):
-                uid = row["_id"]
-                top_uids.append(uid)
-                spent = row["spent"]
-                doc = col_user_verification.find_one({"user_id": uid}, {"first_name": 1})
-                fname = (doc or {}).get("first_name") or f"Agent {str(uid)[-4:]}"
-                
+                uid        = row["_id"]
+                doc        = col_user_verification.find_one({"user_id": uid}, {"first_name": 1})
+                fname      = (doc or {}).get("first_name") or f"Agent {str(uid)[-4:]}"
                 reward_amt = lb_rewards[i] if i < len(lb_rewards) else 0
                 if reward_amt > 0:
                     _award_msa_credits(uid, reward_amt, f"Weekly Leaderboard Rank {i+1}")
+                board_lines.append(
+                    f"   {medals[i]} *{_escape_md(fname)}* — +{reward_amt} credits rewarded"
+                )
+                winner_data.append((uid, i + 1, fname, reward_amt))
 
-                lines.append(f"   {medals[i]} *{_escape_md(fname)}* (+{reward_amt} reward)")
+            leaderboard_board = "\n".join(board_lines)
 
-            leaderboard_board = "\n".join(lines)
+            # ── Rank-specific personal DMs — each winner gets a UNIQUE message ──
+            rank1_msg = rank2_msg = rank3_msg = ""
+            if len(winner_data) >= 1:
+                _r, _n = winner_data[0][2], winner_data[0][3]
+                rank1_msg = (
+                    f"🥇 *{_escape_md(_r)}, you led the entire Vault this week.*\n\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                    f"Out of every member in this system, *you ranked #1.*\n"
+                    f"That’s not random. That’s the result of consistent action.\n\n"
+                    f"*This week’s top 3:*\n{leaderboard_board}\n\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                    f"🎉 *Reward:* +{_n} MSA Credits deposited automatically.\n\n"
+                    f"_New exclusive drops are coming to the store. You’re first in line._"
+                )
+            if len(winner_data) >= 2:
+                _r, _n = winner_data[1][2], winner_data[1][3]
+                rank2_msg = (
+                    f"🥈 *{_escape_md(_r)}, you’re #2 in the Vault this week.*\n\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                    f"Silver. You outperformed every member except one.\n"
+                    f"The gap between 2nd and 1st is smaller than it looks.\n\n"
+                    f"*This week’s top 3:*\n{leaderboard_board}\n\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                    f"🎁 *Reward:* +{_n} MSA Credits deposited.\n\n"
+                    f"_The top spot is one week away. Come back stronger._"
+                )
+            if len(winner_data) >= 3:
+                _r, _n = winner_data[2][2], winner_data[2][3]
+                rank3_msg = (
+                    f"🥉 *{_escape_md(_r)}, you made the top 3 this week.*\n\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                    f"Bronze. You’re on the podium while the rest of the Vault watches.\n"
+                    f"Most members never reach here. You did.\n\n"
+                    f"*This week’s top 3:*\n{leaderboard_board}\n\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                    f"🎁 *Reward:* +{_n} MSA Credits deposited.\n\n"
+                    f"_Gold is one week away. Keep climbing._"
+                )
 
-            announce_loser = (
+            rank_msg_map = {winner_data[0][0]: rank1_msg} if len(winner_data) >= 1 else {}
+            if len(winner_data) >= 2: rank_msg_map[winner_data[1][0]] = rank2_msg
+            if len(winner_data) >= 3: rank_msg_map[winner_data[2][0]] = rank3_msg
+
+            # ── Non-winner broadcast — FOMO-framed ─────────────────────────────
+            announce_non_winner = (
                 f"🏆 *WEEKLY LEADERBOARD — MSA NODE*\n\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                f"This week's elite spenders and reward recipients:\n\n"
+                f"This week’s top performers and their rewards:\n\n"
                 f"{leaderboard_board}\n\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                f"🎯 *These agents just unlocked exclusive weekly credit rewards.*\n"
-                f"While you are watching, they are getting richer and unlocking more power.\n\n"
-                f"*You too can earn this.*\n"
-                f"Earn credits through bounties or referrals, then tap 🛍️ REWARD STORE to climb the ranks.\n"
-                f"_Only those who spend lead the board._"
-            )
-
-            announce_winner = (
-                f"🏆 *WEEKLY LEADERBOARD — YOU ARE A LEADER*\n\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                f"The vault is watching. Here are this week's elite spenders:\n\n"
-                f"{leaderboard_board}\n\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                f"🎉 *Congratulations! Your automated credit reward has been deposited.*\n"
-                f"Keep maintaining your spot. Massive new exclusive items and bigger rewards are entering the 🛍️ REWARD STORE soon.\n\n"
-                f"_Stay at the top to claim them first!_"
+                f"🎯 *These members just received automatic credit rewards.*\n"
+                f"While you’re reading this, they’re already spending them.\n\n"
+                f"*You can earn this too.*\n"
+                f"Earn credits via bounties or referrals, then tap 🛍️ REWARD STORE to climb.\n"
+                f"_Only the active get rewarded._"
             )
 
             vault_members = list(col_user_verification.find({"vault_joined": True}, {"user_id": 1}))
-            sent_winners = 0
-            sent_losers = 0
-            for doc in vault_members:
-                u = doc["user_id"]
+            top_uids      = set(rank_msg_map.keys())
+            sent_winners  = 0
+            sent_non_win  = 0
+            for mdoc in vault_members:
+                u = mdoc["user_id"]
                 try:
                     if u in top_uids:
-                        await bot.send_message(u, announce_winner, parse_mode=ParseMode.MARKDOWN)
-                        sent_winners += 1
+                        msg = rank_msg_map.get(u, "")
+                        if msg:
+                            await bot.send_message(u, msg, parse_mode=ParseMode.MARKDOWN)
+                            sent_winners += 1
                     else:
-                        await bot.send_message(u, announce_loser, parse_mode=ParseMode.MARKDOWN)
-                        sent_losers += 1
+                        await bot.send_message(u, announce_non_winner, parse_mode=ParseMode.MARKDOWN)
+                        sent_non_win += 1
                     await asyncio.sleep(0.05)
                 except Exception:
                     pass
-            
-            logger.info(f"[LEADERBOARD] Weekly announcement sent: {sent_winners} winners, {sent_losers} others")
-            log_to_terminal("LEADERBOARD_REPORT", 0, f"Sunday payouts complete. {sent_winners} winners credited. Broadcast sent to {sent_losers} members.")
+
+            logger.info(f"[LEADERBOARD] Done: {sent_winners} rank DMs, {sent_non_win} non-winner DMs")
+            log_to_terminal("LEADERBOARD_REPORT", 0, f"Sunday: {sent_winners} winners personalised, {sent_non_win} others broadcast.")
 
         except asyncio.CancelledError:
             raise
@@ -14340,6 +14648,9 @@ async def main():
             asyncio.create_task(referral_nudge_scheduler(),            name="referral_nudge"),      # One-time referral reminder
             asyncio.create_task(leaderboard_motivator_scheduler(),     name="leaderboard_motive"),  # Weekly FOMO leaderboard
             asyncio.create_task(weekly_referral_channel_leaderboard_scheduler(), name="ref_channel_leaderboard"),  # Sunday public referral board → vault channel
+            # ── New Strategies (S2, S3) ──────────────────────────────────────────
+            asyncio.create_task(flash_drop_alert_scheduler(),          name="flash_drop_alert"),    # S2: Instant blast when new item added
+            # S3 (behavior wins) fires via check_and_fire_behavior_wins() — event-driven, no background task needed
         ]
         
         # ── NEW: Unified weekly backup (reads PROD → writes to BACKUP cluster) ──
