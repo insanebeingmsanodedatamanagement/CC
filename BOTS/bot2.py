@@ -1350,6 +1350,7 @@ async def retry_operation(operation, max_retries=3, base_delay=1.0, operation_na
     raise RuntimeError(f"Operation {operation_name} aborted (0 retries)")
 
 
+
 BOT_TOKEN = os.getenv("BOT_2_TOKEN")
 BOT_1_TOKEN = os.getenv("BOT_1_TOKEN")  # Bot 1 for delivery
 MASTER_ADMIN_ID = int(os.getenv("MASTER_ADMIN_ID", "0"))
@@ -7131,7 +7132,7 @@ async def backup_page_navigation(callback: types.CallbackQuery):
 async def diagnosis_menu(message: types.Message):
     """Diagnosis menu"""
     if not await has_permission(message.from_user.id, "diagnosis"):
-        await message.answer("⛔ You don't have permission to use DIAGNOSIS.", parse_mode="Markdown")
+        await message.answer("⛔ You don't have permission to use DIAGNOSIS.", parse_mode="HTML")
         return
     log_action("CMD", message.from_user.id, "Opened Diagnosis Menu")
     
@@ -7144,27 +7145,27 @@ async def diagnosis_menu(message: types.Message):
     )
     
     await message.answer(
-        "🩺 **SYSTEM DIAGNOSIS CENTER**\n\n"
+        "🩺 <b>SYSTEM DIAGNOSIS CENTER</b>\n\n"
         "Advanced diagnostic tools for system health monitoring.\n"
         "Select a system to diagnose:",
         reply_markup=keyboard,
-        parse_mode="Markdown"
+        parse_mode="HTML"
     )
 
 @dp.message(F.text == "🩺 BOT 1 DIAGNOSIS")
 async def bot1_diagnosis(message: types.Message):
     """Run comprehensive diagnosis on Bot 1 system"""
     if not await has_permission(message.from_user.id, "diagnosis"):
-        await message.answer("⛔ You don't have permission to use DIAGNOSIS.", parse_mode="Markdown")
+        await message.answer("⛔ You don't have permission to use DIAGNOSIS.", parse_mode="HTML")
         return
     log_action("DIAGNOSIS", message.from_user.id, "Running Bot 1 Diagnosis", "bot1")
     
     status_msg = await message.answer(
-        "🔄 **INITIALIZING BOT 1 DIAGNOSTICS**\n\n"
+        "🔄 <b>INITIALIZING BOT 1 DIAGNOSTICS</b>\n\n"
         "⏳ Scanning system components...\n"
         "📊 Analyzing database health...\n"
         "🔍 Checking data integrity...",
-        parse_mode="Markdown"
+        parse_mode="HTML"
     )
     
     await asyncio.sleep(1.2)
@@ -7196,11 +7197,11 @@ async def bot1_diagnosis(message: types.Message):
             warnings.append(f"Database latency is elevated: {db_latency:.1f}ms (normal <50ms)")
         else:
             db_status = f"❌ Slow ({db_latency:.1f}ms)"
-            issues.append(f"**Database Performance Critical:** Latency {db_latency:.1f}ms exceeds safe threshold.")
+            issues.append(f"<b>Database Performance Critical:</b> Latency {db_latency:.1f}ms exceeds safe threshold.")
             
     except Exception as e:
         db_status = "❌ Connection Failed"
-        issues.append(f"**Database Connection Error:** {str(e)[:100]}")
+        issues.append(f"<b>Database Connection Error:</b> {str(e)[:100]}")
     
     # ═══════════════════════════════════════
     # PHASE 2: COLLECTION VERIFICATION
@@ -7217,14 +7218,14 @@ async def bot1_diagnosis(message: types.Message):
         missing = [c for c in expected_collections if c not in existing]
         
         if missing:
-            warnings.append(f"**Missing Collections:** {', '.join(missing)}")
+            warnings.append(f"<b>Missing Collections:</b> {', '.join(missing)}")
             collections_ok = False
         else:
             checks_passed += 1
             info_items.append(f"All {len(expected_collections)} core collections present")
             
     except Exception as e:
-        issues.append(f"**Collection Check Failed:** {str(e)[:80]}")
+        issues.append(f"<b>Collection Check Failed:</b> {str(e)[:80]}")
         collections_ok = False
     
     # ═══════════════════════════════════════
@@ -7240,29 +7241,29 @@ async def bot1_diagnosis(message: types.Message):
         suspended_users = col_suspended_features.count_documents({})
         
         if total_users == 0:
-            warnings.append("**No Users Found:** Database appears to be empty or not initialized.")
+            warnings.append("<b>No Users Found:</b> Database appears to be empty or not initialized.")
         else:
             checks_passed += 1
             info_items.append(f"{total_users:,} registered users")
             
             # Verification queue check
             if pending_vers > 50:
-                issues.append(f"**Verification Crisis:** {pending_vers} users stuck in queue! Bot may be offline.")
+                issues.append(f"<b>Verification Crisis:</b> {pending_vers} users stuck in queue! Bot may be offline.")
             elif pending_vers > 20:
-                warnings.append(f"**High Verification Queue:** {pending_vers} pending. Monitor closely.")
+                warnings.append(f"<b>High Verification Queue:</b> {pending_vers} pending. Monitor closely.")
             
             # Ban rate analysis
             if total_users > 0:
                 ban_rate = (banned_users / total_users) * 100
                 if ban_rate > 30:
-                    issues.append(f"**Extreme Ban Rate:** {ban_rate:.1f}% ({banned_users}/{total_users}) - Possible attack or misconfiguration")
+                    issues.append(f"<b>Extreme Ban Rate:</b> {ban_rate:.1f}% ({banned_users}/{total_users}) - Possible attack or misconfiguration")
                 elif ban_rate > 15:
-                    warnings.append(f"**High Ban Rate:** {ban_rate:.1f}% ({banned_users}/{total_users})")
+                    warnings.append(f"<b>High Ban Rate:</b> {ban_rate:.1f}% ({banned_users}/{total_users})")
                 else:
                     info_items.append(f"Ban rate: {ban_rate:.1f}%")
                     
     except Exception as e:
-        issues.append(f"**User Data Check Failed:** {str(e)[:80]}")
+        issues.append(f"<b>User Data Check Failed:</b> {str(e)[:80]}")
     
     # ═══════════════════════════════════════
     # PHASE 4: SUPPORT SYSTEM HEALTH
@@ -7274,9 +7275,9 @@ async def bot1_diagnosis(message: types.Message):
         total_tickets = col_support_tickets.count_documents({})
         
         if open_tickets > 20:
-            issues.append(f"**Support Overload:** {open_tickets} open tickets! Urgent admin attention required.")
+            issues.append(f"<b>Support Overload:</b> {open_tickets} open tickets! Urgent admin attention required.")
         elif open_tickets > 10:
-            warnings.append(f"**Support Backlog:** {open_tickets} open tickets pending review.")
+            warnings.append(f"<b>Support Backlog:</b> {open_tickets} open tickets pending review.")
         elif open_tickets > 5:
             info_items.append(f"{open_tickets} open support tickets (manageable)")
         else:
@@ -7300,9 +7301,9 @@ async def bot1_diagnosis(message: types.Message):
         
         if error_logs:
             if len(error_logs) > 5:
-                issues.append(f"**High Error Rate:** {len(error_logs)} errors detected in recent logs.")
+                issues.append(f"<b>High Error Rate:</b> {len(error_logs)} errors detected in recent logs.")
             else:
-                warnings.append(f"**Recent Errors:** {len(error_logs)} error events logged.")
+                warnings.append(f"<b>Recent Errors:</b> {len(error_logs)} error events logged.")
         else:
             checks_passed += 1
             info_items.append("No errors detected in recent logs")
@@ -7336,12 +7337,12 @@ async def bot1_diagnosis(message: types.Message):
                       "🟢 HEALTHY")
             bar    = "█" * filled + "░" * empty
             db_bar_line = (
-                f"**Filesystem:** `[{bar}]` "
+                f"<b>Filesystem:</b> <code>[{bar}]</code> "
                 f"{pct:.1f}% ({fs_used:.0f}MB / {fs_total:.0f}MB) — {risk}"
             )
             if pct > 90:
                 issues.append(
-                    f"**STORAGE CRITICAL:** {pct:.1f}% filesystem used "
+                    f"<b>STORAGE CRITICAL:</b> {pct:.1f}% filesystem used "
                     f"({fs_used:.0f}/{fs_total:.0f}MB) — free space urgently needed"
                 )
             elif pct > 80:
@@ -7361,15 +7362,15 @@ async def bot1_diagnosis(message: types.Message):
                        "🟢 HEALTHY")
             bar     = "█" * filled + "░" * empty
             db_bar_line = (
-                f"**DB Used:** `[{bar}]` "
+                f"<b>DB Used:</b> <code>[{bar}]</code> "
                 f"{pct:.1f}% of 512MB M0 cap ({m0_used:.1f}MB used) — {risk}"
             )
             checks_passed += 1
 
         db_space_line = (
-            f"📦 Data: `{data_mb:.1f}MB`  "
-            f"💾 Storage: `{storage_mb:.1f}MB`  "
-            f"🔖 Indexes: `{index_mb:.1f}MB`"
+            f"📦 Data: <code>{data_mb:.1f}MB</code>  "
+            f"💾 Storage: <code>{storage_mb:.1f}MB</code>  "
+            f"🔖 Indexes: <code>{index_mb:.1f}MB</code>"
         )
         info_items.append(f"DB space — data:{data_mb:.1f}MB storage:{storage_mb:.1f}MB idx:{index_mb:.1f}MB")
     except Exception as space_err:
@@ -7398,37 +7399,37 @@ async def bot1_diagnosis(message: types.Message):
         status_icon = "❌"
         status_text = "CRITICAL"
     
-    report = f"📱 **BOT 1 DIAGNOSTIC REPORT**\n"
+    report = f"📱 <b>BOT 1 DIAGNOSTIC REPORT</b>\n"
     report += "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-    report += f"🕐 **Scan Time:** {scan_time}\n"
-    report += f"💾 **Database:** {db_status}\n"
-    report += f"📊 **Health Score:** {checks_passed}/{total_checks} ({health_percentage}%)\n"
-    report += f"🎯 **Status:** {status_icon} {status_text}\n"
+    report += f"🕐 <b>Scan Time:</b> {scan_time}\n"
+    report += f"💾 <b>Database:</b> {db_status}\n"
+    report += f"📊 <b>Health Score:</b> {checks_passed}/{total_checks} ({health_percentage}%)\n"
+    report += f"🎯 <b>Status:</b> {status_icon} {status_text}\n"
     if db_space_line:
-        report += f"🗄️ **Space:** {db_space_line}\n"
+        report += f"🗄️ <b>Space:</b> {db_space_line}\n"
     if db_bar_line:
         report += f"📊 {db_bar_line}\n"
     report += "\n"
     
     # Critical issues section
     if issues:
-        report += f"❌ **CRITICAL ISSUES ({len(issues)}):**\n"
+        report += f"❌ <b>CRITICAL ISSUES ({len(issues)}):</b>\n"
         for i, issue in enumerate(issues, 1):
-            report += f"{i}. {_esc_md(issue)}\n"
+            report += f"{i}. {_html_escape(issue)}\n"
         report += "\n"
     
     # Warnings section
     if warnings:
-        report += f"⚠️ **WARNINGS ({len(warnings)}):**\n"
+        report += f"⚠️ <b>WARNINGS ({len(warnings)}):</b>\n"
         for i, warning in enumerate(warnings, 1):
-            report += f"{i}. {_esc_md(warning)}\n"
+            report += f"{i}. {_html_escape(warning)}\n"
         report += "\n"
     
     # System info
     if info_items:
-        report += "ℹ️ **SYSTEM INFO:**\n"
+        report += "ℹ️ <b>SYSTEM INFO:</b>\n"
         for info in info_items[:5]:  # Limit to prevent message overflow
-            report += f"• {_esc_md(info)}\n"
+            report += f"• {_html_escape(info)}\n"
         report += "\n"
     
     # Solutions section
@@ -7458,36 +7459,36 @@ async def bot1_diagnosis(message: types.Message):
 
     # Final verdict
     if not issues and not warnings:
-        report += "✅ **ALL SYSTEMS OPERATIONAL**\n"
+        report += "✅ <b>ALL SYSTEMS OPERATIONAL</b>\n"
         report += "No issues detected. Bot 1 is healthy."
     elif issues:
-        report += "🚨 **ACTION REQUIRED**\n"
+        report += "🚨 <b>ACTION REQUIRED</b>\n"
         report += "Critical issues detected. Address immediately."
     else:
-        report += "✅ **SYSTEM FUNCTIONAL**\n"
+        report += "✅ <b>SYSTEM FUNCTIONAL</b>\n"
         report += "Minor warnings — no immediate action needed."
 
     if solutions:
-        report += "\n\n💡 **POSSIBLE SOLUTIONS:**\n"
+        report += "\n\n💡 <b>POSSIBLE SOLUTIONS:</b>\n"
         for s in solutions[:5]:
             report += f"• {s}\n"
 
-    await status_msg.edit_text(report, parse_mode="Markdown")
+    await status_msg.edit_text(report, parse_mode="HTML")
 
 @dp.message(F.text == "🩺 BOT 2 DIAGNOSIS")
 async def bot2_diagnosis(message: types.Message):
     """Run comprehensive diagnosis on Bot 2 admin system"""
     if not await has_permission(message.from_user.id, "diagnosis"):
-        await message.answer("⛔ You don't have permission to use DIAGNOSIS.", parse_mode="Markdown")
+        await message.answer("⛔ You don't have permission to use DIAGNOSIS.", parse_mode="HTML")
         return
     log_action("DIAGNOSIS", message.from_user.id, "Running Bot 2 Diagnosis", "bot2")
 
     status_msg = await message.answer(
-        "🔄 **INITIALIZING BOT 2 DIAGNOSTICS**\n\n"
+        "🔄 <b>INITIALIZING BOT 2 DIAGNOSTICS</b>\n\n"
         "⏳ Scanning system components...\n"
         "📊 Analyzing admin database health...\n"
         "🔍 Checking configurations...",
-        parse_mode="Markdown"
+        parse_mode="HTML"
     )
 
     await asyncio.sleep(1.2)
@@ -7515,7 +7516,7 @@ async def bot2_diagnosis(message: types.Message):
         missing_opt = [f for f in optional_files if not os.path.exists(f)]
 
         if missing_req:
-            issues.append(f"**Missing Core Files:** {', '.join(missing_req)}")
+            issues.append(f"<b>Missing Core Files:</b> {', '.join(missing_req)}")
         else:
             checks_passed += 1
             info_items.append("Core bot file present (bot2.py)")
@@ -7524,7 +7525,7 @@ async def bot2_diagnosis(message: types.Message):
             info_items.append(f"Optional not found: {', '.join(missing_opt)} (Drive backups may be unavailable)")
 
     except Exception as e:
-        issues.append(f"**File System Check Failed:** {_esc_md(str(e)[:80])}")
+        issues.append(f"<b>File System Check Failed:</b> {_html_escape(str(e)[:80])}")
     
     # ═══════════════════════════════════════
     # PHASE 2: BACKUP SYSTEM HEALTH
@@ -7534,12 +7535,13 @@ async def bot2_diagnosis(message: types.Message):
     try:
         backup_dir = "backups"
         if not os.path.exists(backup_dir):
-            issues.append("**Backup System Error:** Backup directory does not exist. Create it immediately!")
+            os.makedirs(backup_dir, exist_ok=True)
+            warnings.append("<b>No Backups Found:</b> Backup directory was missing and has been auto-created. Run first backup now.")
         else:
             backup_files = [f for f in os.listdir(backup_dir) if f.endswith(('.json', '.csv', '.txt'))]
             
             if not backup_files:
-                warnings.append("**No Backups Found:** Backup directory is empty. Run first backup now.")
+                warnings.append("<b>No Backups Found:</b> Backup directory is empty. Run first backup now.")
             else:
                 # Get newest backup
                 backup_files.sort(key=lambda x: os.path.getmtime(os.path.join(backup_dir, x)), reverse=True)
@@ -7550,21 +7552,21 @@ async def bot2_diagnosis(message: types.Message):
                 backup_size = os.path.getsize(newest_path) / 1024  # KB
                 
                 if backup_age > 7:
-                    issues.append(f"**Backup Crisis:** Last backup is {backup_age} days old! Critical data loss risk.")
+                    issues.append(f"<b>Backup Crisis:</b> Last backup is {backup_age} days old! Critical data loss risk.")
                 elif backup_age > 3:
-                    warnings.append(f"**Backup Warning:** Last backup is {backup_age} days old. Backup soon.")
+                    warnings.append(f"<b>Backup Warning:</b> Last backup is {backup_age} days old. Backup soon.")
                 else:
                     checks_passed += 1
                     info_items.append(f"Latest backup: {backup_age}d ago ({backup_size:.1f}KB)")
                 
                 # Check backup count
                 if len(backup_files) < 3:
-                    warnings.append(f"**Low Backup Count:** Only {len(backup_files)} backups exist. Increase retention.")
+                    warnings.append(f"<b>Low Backup Count:</b> Only {len(backup_files)} backups exist. Increase retention.")
                 else:
                     info_items.append(f"{len(backup_files)} backups stored")
                     
     except Exception as e:
-        warnings.append(f"Backup check error: {_esc_md(str(e)[:60])}")
+        warnings.append(f"Backup check error: {_html_escape(str(e)[:60])}")
     
     # ═══════════════════════════════════════
     # PHASE 3: LOG SYSTEM HEALTH
@@ -7578,11 +7580,11 @@ async def bot2_diagnosis(message: types.Message):
         log_health = True
         
         if bot2_log_count >= MAX_LOGS:
-            warnings.append(f"**Log Buffer Full:** Bot 2 buffer at capacity ({MAX_LOGS}). Active rotation.")
+            warnings.append(f"<b>Log Buffer Full:</b> Bot 2 buffer at capacity ({MAX_LOGS}). Active rotation.")
             log_health = False
             
         if bot1_log_count >= MAX_LOGS:
-            warnings.append(f"**Log Buffer Full:** Bot 1 tracking buffer at capacity.")
+            warnings.append(f"<b>Log Buffer Full:</b> Bot 1 tracking buffer at capacity.")
             log_health = False
         
         if log_health:
@@ -7592,10 +7594,10 @@ async def bot2_diagnosis(message: types.Message):
         # Check for error patterns
         error_count_bot2 = sum(1 for l in bot2_logs if 'error' in l.get('details', '').lower())
         if error_count_bot2 > 5:
-            warnings.append(f"**Admin Errors Detected:** {error_count_bot2} error events in Bot 2 logs.")
+            warnings.append(f"<b>Admin Errors Detected:</b> {error_count_bot2} error events in Bot 2 logs.")
             
     except Exception as e:
-        warnings.append(f"Log system check skipped: {_esc_md(str(e)[:50])}")
+        warnings.append(f"Log system check skipped: {_html_escape(str(e)[:50])}")
     
     # ═══════════════════════════════════════
     # PHASE 4: DATABASE CONNECTION
@@ -7612,10 +7614,10 @@ async def bot2_diagnosis(message: types.Message):
             checks_passed += 1
             info_items.append(f"DB responsive ({db_latency:.1f}ms)")
         else:
-            warnings.append(f"**DB Latency High:** {db_latency:.1f}ms (admin operations may be slow)")
+            warnings.append(f"<b>DB Latency High:</b> {db_latency:.1f}ms (admin operations may be slow)")
             
     except Exception as e:
-        issues.append(f"**DB Connection Error:** {_esc_md(str(e)[:80])}")
+        issues.append(f"<b>DB Connection Error:</b> {_html_escape(str(e)[:80])}")
     
     # ═══════════════════════════════════════
     # PHASE 5: ENVIRONMENT & SECURITY
@@ -7632,13 +7634,13 @@ async def bot2_diagnosis(message: types.Message):
                 missing_env.append(var)
         
         if missing_env:
-            issues.append(f"**Missing Env Variables:** {', '.join(missing_env)}")
+            issues.append(f"<b>Missing Env Variables:</b> {', '.join(missing_env)}")
         else:
             checks_passed += 1
             info_items.append("All environment vars configured")
             
     except Exception as e:
-        warnings.append(f"Environment check skipped: {_esc_md(str(e)[:50])}")
+        warnings.append(f"Environment check skipped: {_html_escape(str(e)[:50])}")
     
     # ═══════════════════════════════════════
     # PHASE 6: DRIVE API STATUS (if using)
@@ -7653,9 +7655,9 @@ async def bot2_diagnosis(message: types.Message):
                     checks_passed += 1
                     info_items.append("Drive API token valid")
                 else:
-                    warnings.append("**Drive Token Malformed:** Backup uploads may fail.")
+                    warnings.append("<b>Drive Token Malformed:</b> Backup uploads may fail.")
         else:
-            warnings.append("**No Drive Token:** Cloud backups unavailable.")
+            warnings.append("<b>No Drive Token:</b> Cloud backups unavailable.")
             
     except Exception as e:
         info_items.append("Drive check skipped")
@@ -7691,7 +7693,7 @@ async def bot2_diagnosis(message: types.Message):
             )
             if pct > 90:
                 issues.append(
-                    f"**STORAGE CRITICAL:** {pct:.1f}% filesystem used "
+                    f"<b>STORAGE CRITICAL:</b> {pct:.1f}% filesystem used "
                     f"({fs_used:.0f}/{fs_total:.0f}MB) — free space urgently needed"
                 )
             elif pct > 80:
@@ -12590,8 +12592,8 @@ async def terminal_handler(message: types.Message, state: FSMContext):
         await message.answer(
             "<b>🖥️ LIVE TERMINAL</b>\n\n"
             "Select which bot logs to view:\n\n"
-            "📱 <b>Bot 1 Logs</b> - User interactions & content\n"
-            "🎛️ <b>Bot 2 Logs</b> - Admin actions & management\n\n"
+            "🖥️ <b>Bot 1 Logs</b> - User interactions & content\n"
+            "🖥️ <b>Bot 2 Logs</b> - Admin actions & management\n\n"
             f"<i>💡 Tracking last {MAX_LOGS} actions per bot</i>",
             reply_markup=keyboard,
             parse_mode="HTML"
