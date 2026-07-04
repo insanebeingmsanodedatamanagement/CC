@@ -48,6 +48,7 @@ from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter, TelegramNet
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
 
+
 # ==========================================
 # ⚡ CONFIGURATION  — all values from env vars
 # ==========================================
@@ -2775,34 +2776,53 @@ def rate_limit(cooldown: float = COMMAND_COOLDOWN):
     return decorator
 
 def anti_spam(command_name: str):
-    """Decorator to prevent command spam - blocks if user is already processing"""
+    """Decorator to prevent command spam - blocks if user is already processing.
+    Single-message guarantee: only ONE freeze/cooldown message is ever sent per tap.
+    """
     def decorator(handler):
         @functools.wraps(handler)
         async def wrapper(message: types.Message, *args, **kwargs):
             user_id = message.from_user.id
+            now = time.time()
 
-            # If user is already frozen, block with throttled reminder.
-            if await _guard_flood_from_wrapper(message, "anti_spam", record_tap=False):
+            # ── Priority 1: Already frozen → send ONE throttled reminder and stop.
+            freeze_state = _freeze_tracker.get(user_id, {})
+            if now < freeze_state.get("frozen_until", 0):
+                last_notice = _freeze_notice_tracker.get(user_id, 0)
+                if now - last_notice >= 3:
+                    _freeze_notice_tracker[user_id] = now
+                    remaining = int(max(0, freeze_state["frozen_until"] - now))
+                    mins, secs_r = divmod(remaining, 60)
+                    time_str = f"{mins}m {secs_r}s" if mins else f"{secs_r}s"
+                    unfreeze_dt = datetime.now(TZ) + timedelta(seconds=remaining)
+                    unfreeze_str = unfreeze_dt.strftime("%I:%M:%S %p")
+                    try:
+                        await message.answer(
+                            f"🧊 <b>FLOOD PROTECTION ACTIVE</b>\n\n"
+                            f"Too many rapid taps detected.\n"
+                            f"⏳ <b>Cooldown:</b> {time_str} (until {unfreeze_str})\n\n"
+                            f"<i>Please do not spam buttons.\n"
+                            f"If your internet is lagging, wait a few seconds and try once.</i>",
+                            parse_mode="HTML"
+                        )
+                    except Exception:
+                        pass
                 return
-            
-            # Check if user is already processing
+
+            # ── Priority 2: Already processing this command → record tap only (no duplicate message).
             if is_user_processing(user_id):
-                # Rejected parallel tap: feed anti-flood tracker (non-punitive, no ban)
-                await _guard_flood_from_wrapper(message, "anti_spam", record_tap=True)
+                _record_spam_tap(user_id)  # count toward freeze threshold, but no message
                 return
-            
-            # Mark as processing
+
+            # ── Priority 3: Mark as processing and run the handler.
             set_user_processing(user_id, command_name)
-            
             try:
-                # Execute the actual handler
                 await handler(message, *args, **kwargs)
             except Exception as e:
                 logger.error(f"Error in {command_name} for user {user_id}: {e}")
             finally:
-                # Always clear processing state
                 clear_user_processing(user_id)
-        
+
         return wrapper
     return decorator
 
@@ -2930,26 +2950,25 @@ async def _check_freeze(message: types.Message) -> bool:
     # Check if already frozen (without recording a new tap)
     state = _freeze_tracker.get(user_id, {})
     if now < state.get("frozen_until", 0):
-        remaining = int(state["frozen_until"] - now)
-        mins, secs = divmod(remaining, 60)
-        time_str = f"{mins}m {secs}s" if mins else f"{secs}s"
-        # Calculate unfreeze clock in 12h format
-        unfreeze_dt = datetime.now(TZ) + timedelta(seconds=remaining)
-        unfreeze_str = unfreeze_dt.strftime("%I:%M %p")
-        offense = state.get("offense", 1)
-        level_label = ["1st", "2nd", "3rd", "4th"][min(offense - 1, 3)]
-        try:
-            await message.answer(
-                f"🧊 <b>You are temporarily frozen.</b>\n\n"
-                f"Rapid button presses detected — please slow down.\n\n"
-                f"⏳ <b>Unfreeze in:</b> {time_str}  (at {unfreeze_str})\n"
-                f"⚠️ <b>Offense level:</b> {level_label}\n\n"
-                f"<i>All features are paused during freeze.\n"
-                f"Internet lag? No worries — freeze times reset after 10 min of normal use.</i>",
-                parse_mode="HTML"
-            )
-        except Exception:
-            pass
+        remaining = int(max(0, state["frozen_until"] - now))
+        last_notice = _freeze_notice_tracker.get(user_id, 0)
+        if now - last_notice >= 3:
+            _freeze_notice_tracker[user_id] = now
+            mins, secs = divmod(remaining, 60)
+            time_str = f"{mins}m {secs}s" if mins else f"{secs}s"
+            unfreeze_dt = datetime.now(TZ) + timedelta(seconds=remaining)
+            unfreeze_str = unfreeze_dt.strftime("%I:%M:%S %p")
+            try:
+                await message.answer(
+                    f"🧊 <b>FLOOD PROTECTION ACTIVE</b>\n\n"
+                    f"Too many rapid taps detected.\n"
+                    f"⏳ <b>Cooldown:</b> {time_str} (until {unfreeze_str})\n\n"
+                    f"<i>Please do not spam buttons.\n"
+                    f"If your internet is lagging, wait a few seconds and try once.</i>",
+                    parse_mode="HTML"
+                )
+            except Exception:
+                pass
         return True  # ← caller should return
 
     # Record the tap and check if this triggers a new freeze
@@ -4762,9 +4781,9 @@ async def _check_and_fire_referral_tier(referrer_id: int, referrer_name: str, co
         logger.warning(f"[REFERRAL TIER] {referrer_id}: {_te}")
 
 
-# ── PUBLIC LEADERBOARD (Top 10 by MSA Credits Spent) ────────────────────────────────
+# ── PUBLIC LEADERBOARD (Top 5 by MSA Credits Spent) ────────────────────────────────
 def _build_leaderboard_text() -> str:
-    """Build all-time top-10 leaderboard by MSA Credits SPENT with real names."""
+    """Build all-time top-5 leaderboard by MSA Credits SPENT with real names."""
     pipeline = [
         {"$unwind": "$ledger"},
         {"$match": {"ledger.reason": {"$regex": "^Purchase:"}}},
@@ -4774,26 +4793,25 @@ def _build_leaderboard_text() -> str:
             "last_purchase_time": {"$max": "$ledger.at"}
         }},
         {"$sort": {"spent": -1, "last_purchase_time": 1}},
-        {"$limit": 10}
+        {"$limit": 5}
     ]
     rows = list(col_msa_credits.aggregate(pipeline))
 
     if not rows or all(r.get("spent", 0) == 0 for r in rows):
         return (
-            "🏆 *MSA NODE — Top Spenders Leaderboard*\n\n"
+            "🏆 *MSA NODE — Top 5 Spenders*\n\n"
             "━━━━━━━━━━━━━━━━━━━━━━━\n\n"
             "_The board is currently empty._\n\n"
             "Be the first. Claim IG Bounties and buy rewards to get on the board."
         )
 
-    rank_labels = ["🥇 GOLD", "🥈 SILVER", "🥉 BRONZE", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
+    rank_labels = ["🥇 GOLD", "🥈 SILVER", "🥉 BRONZE", "4️⃣", "5️⃣"]
     divider = "━━━━━━━━━━━━━━━━━━━━━━━"
     board_lines = []
-    
+
     for idx, row in enumerate(rows):
         uid  = row["_id"]
-        pts  = row.get("spent", 0)
-        
+
         fname = None
         v_doc = col_user_verification.find_one({"user_id": uid}, {"first_name": 1})
         if v_doc:
@@ -4803,12 +4821,12 @@ def _build_leaderboard_text() -> str:
             fname = (t_doc or {}).get("name") or (t_doc or {}).get("first_name")
         if not fname:
             fname = f"Agent {str(uid)[-4:]}"
-            
+
         label = rank_labels[idx] if idx < len(rank_labels) else f"{idx+1}."
-        board_lines.append(f"   {label}  *{_escape_md(fname)}*")
+        board_lines.append(f"  {label}  *{_escape_md(fname)}*")
 
     return (
-        f"🏆 *MSA NODE — Top Elite Spenders*\n\n"
+        f"🏆 *MSA NODE — Top 5 Elite Spenders*\n\n"
         f"{divider}\n\n"
         + "\n".join(board_lines)
         + f"\n\n{divider}\n\n"
@@ -4838,7 +4856,15 @@ async def earn_guide_callback(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data == "show_leaderboard")
 async def leaderboard_callback(callback: types.CallbackQuery):
-    """Show public leaderboard via inline button."""
+    """Show public leaderboard via inline button with animation."""
+    try:
+        await callback.message.edit_text("🏆 *Accessing Elite Leaderboards...*", parse_mode=ParseMode.MARKDOWN)
+        await asyncio.sleep(0.3)
+        await callback.message.edit_text("📊 *Compiling rankings...*", parse_mode=ParseMode.MARKDOWN)
+        await asyncio.sleep(0.3)
+    except Exception:
+        pass
+
     text = _build_leaderboard_text()
     kb_rows = [[
         InlineKeyboardButton(text="🔄 Refresh", callback_data="show_leaderboard"),
@@ -4891,18 +4917,13 @@ async def leaderboards_cmd(message: types.Message, state: FSMContext):
         await asyncio.sleep(0.3)
         await anim.edit_text("📊 Compiling rankings...")
         await asyncio.sleep(0.3)
-        try:
-            await anim.delete()
-        except Exception:
-            pass
-
         text = _build_leaderboard_text()
         kb_rows = [[
             InlineKeyboardButton(text="🔄 Refresh", callback_data="show_leaderboard"),
             InlineKeyboardButton(text="🤝 My Referral Hub", callback_data="ref_page_1"),
         ]]
         kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
-        await message.answer(text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+        await anim.edit_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
     except Exception:
         pass
     finally:
@@ -5852,7 +5873,7 @@ def _build_referral_hub_text(user_id: int, name: str, referral_link: str, page: 
     # 2. Refresh + Leaderboard Row
     rows.append([InlineKeyboardButton(text="🔄 Refresh Stats", callback_data=f"ref_page_{page}")])
     rows.append([
-        InlineKeyboardButton(text="🏆 Leaderboard (Top 3)", callback_data="show_leaderboard"),
+        InlineKeyboardButton(text="🏆 Leaderboard (Top 5)", callback_data="show_leaderboard"),
     ])
     rows.append([
         InlineKeyboardButton(text="📸 Earn MSA Credits on IG", url=INSTAGRAM_LINK),
