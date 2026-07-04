@@ -1350,7 +1350,6 @@ async def retry_operation(operation, max_retries=3, base_delay=1.0, operation_na
     raise RuntimeError(f"Operation {operation_name} aborted (0 retries)")
 
 
-
 BOT_TOKEN = os.getenv("BOT_2_TOKEN")
 BOT_1_TOKEN = os.getenv("BOT_1_TOKEN")  # Bot 1 for delivery
 MASTER_ADMIN_ID = int(os.getenv("MASTER_ADMIN_ID", "0"))
@@ -12642,7 +12641,7 @@ async def view_bot1_logs(message: types.Message, state: FSMContext):
             f"</code>"
         )
         await message.answer(
-            header + f"<pre>{_html_escape(logs_text)}</pre>",
+            header + f"<pre>{logs_text}</pre>",
             reply_markup=keyboard,
             parse_mode="HTML"
         )
@@ -12685,7 +12684,7 @@ async def view_bot2_logs(message: types.Message, state: FSMContext):
             f"</code>"
         )
         await message.answer(
-            header + f"<pre>{_html_escape(logs_text)}</pre>",
+            header + f"<pre>{logs_text}</pre>",
             reply_markup=keyboard,
             parse_mode="HTML"
         )
