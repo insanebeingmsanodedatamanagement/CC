@@ -48,7 +48,6 @@ from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter, TelegramNet
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
 
-
 # ==========================================
 # ⚡ CONFIGURATION  — all values from env vars
 # ==========================================
@@ -2597,41 +2596,49 @@ async def send_psychological_vault_lock_message(user_id: int):
         logger.error(f"[GRACE LOCK] Failed: {e}")
 
 
-async def _grace_warm_followup(user_id: int):
+async def _abandonment_nudge_followup(user_id: int, first_name: str = "Agent"):
     """
-    30-second post-grace follow-up — fires while user is still in the app.
-    Marks grace_instant_nudge_sent=True atomically before sending to prevent duplicates.
-    Psychology: Commitment & Consistency — they already took one action, the next is easier.
+    60-second abandonment nudge — fires if user started but left without joining.
+    Psychology: Curiosity & Urgency to unlock vault.
     """
     try:
-        await asyncio.sleep(30)
-        # Atomic dedup guard — only send once ever
+        await asyncio.sleep(60)
+        # Check if they joined vault within the last 60 seconds
+        user_check = col_user_verification.find_one({"user_id": user_id})
+        if user_check and user_check.get("vault_joined"):
+            return  # They joined, no nudge needed
+
+        # Atomic dedup guard
         result = col_user_verification.update_one(
-            {"user_id": user_id, "grace_instant_nudge_sent": {"$ne": True},
-             "vault_joined": {"$ne": True}},
-            {"$set": {"grace_instant_nudge_sent": True}}
+            {"user_id": user_id, "abandonment_nudge_sent": {"$ne": True}},
+            {"$set": {"abandonment_nudge_sent": True}}
         )
         if result.modified_count == 0:
-            return  # Already sent or user joined vault — skip
+            return
 
         kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="💎 JOIN FREE — COMPLETE YOUR ACCESS", url=CHANNEL_LINK)],
+            [InlineKeyboardButton(text="1️⃣ JOIN YOUTUBE & UNLOCK NOW", url=YOUTUBE_LINK)],
+            [InlineKeyboardButton(text="2️⃣ JOIN VAULT & UNLOCK NOW", url=CHANNEL_LINK)],
         ])
+        
+        fname_esc = _escape_md(first_name)
         await bot.send_message(
             user_id,
-            "💡 *One thing before you go.*\n\n"
-            "You just got a free blueprint — most people don't even get that far.\n\n"
-            "The Vault is the next step. It's where that blueprint *connects* to "
-            "everything else we've built:\n"
-            "Every tool. Every strategy. Every drop — all in one place.\n\n"
-            "*You're already 90% there. One tap completes it.*\n\n"
-            "_Free. No signup form. No credit card. Ever._",
+            f"👀 *{fname_esc}, you still there?*\n\n"
+            "Most people stop right here. They click, they look, they leave. "
+            "But the ones who actually win are the ones who take the next step.\n\n"
+            "Inside the vault, you get everything:\n"
+            "\\- Step-by-step blueprints\n"
+            "\\- Private AI automation tools\n"
+            "\\- A community of elite earners\n\n"
+            "*Don't just watch from the sidelines.* The system is ready for you.\n\n"
+            "👇 *Tap below. Complete your access. Zero cost.*",
             reply_markup=kb,
             parse_mode=ParseMode.MARKDOWN
         )
-        logger.info(f"[GRACE WARM] 30s follow-up sent to {user_id}")
+        logger.info(f"[ABANDONMENT NUDGE] 60s follow-up sent to {user_id}")
     except Exception as e:
-        logger.warning(f"[GRACE WARM] Failed for {user_id}: {e}")
+        logger.warning(f"[ABANDONMENT NUDGE] Failed for {user_id}: {e}")
 
 # ==========================================
 # 🛑 MAINTENANCE MODE CHECK
@@ -3508,13 +3515,13 @@ def get_verification_keyboard(user_id: int, user_data: dict, show_all: bool = Tr
     if show_all:
         # For NEW users - show all buttons
         keyboard = [
-            [InlineKeyboardButton(text="📺 JOIN YT AND UNLOCK LINK", url=YOUTUBE_LINK)],
-            [InlineKeyboardButton(text="💎 JOIN VAULT AND UNLOCK LINK", url=CHANNEL_LINK)]
+            [InlineKeyboardButton(text="1️⃣ JOIN YOUTUBE & UNLOCK NOW", url=YOUTUBE_LINK)],
+            [InlineKeyboardButton(text="2️⃣ JOIN VAULT & UNLOCK NOW", url=CHANNEL_LINK)]
         ]
     else:
         # For OLD users who left - show ONLY rejoin button
         keyboard = [
-            [InlineKeyboardButton(text="💎 JOIN VAULT AND UNLOCK LINK", url=CHANNEL_LINK)]
+            [InlineKeyboardButton(text="2️⃣ JOIN VAULT & UNLOCK NOW", url=CHANNEL_LINK)]
         ]
     
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
@@ -4368,9 +4375,9 @@ async def handle_store_browsing(message: types.Message, state: FSMContext):
     already_owned = item_id in credits_doc.get("purchased_items", [])
     if already_owned:
         await message.answer(
-            f"✅ <b>You already own this!</b>\n\n"
-            f"🏆 <b>{name}</b>\n\n"
-            f"Check your Vault to access the reward.",
+        f"✅ <b>You already own this!</b>\n\n"
+        f"🏆 <b>{name}</b>\n\n"
+        f"Check your Vault to access the reward.",
             parse_mode="HTML",
             reply_markup=ReplyKeyboardMarkup(keyboard=[
                 [KeyboardButton(text="🏛️ MY VAULT")],
@@ -4471,8 +4478,8 @@ async def handle_store_confirm(message: types.Message, state: FSMContext):
         items = list(col_store_items.find({"active": True}).sort("cost", 1))
         await state.set_state(RewardStoreStates.browsing_store)
         await message.answer(
-            f"❌ Not enough credits. You need {cost - balance} more.",
-            reply_markup=_build_store_items_keyboard(items, purchased_ids)
+        f"❌ Not enough credits. You need {cost - balance} more.",
+        reply_markup=_build_store_items_keyboard(items, purchased_ids)
         )
         return
 
@@ -5185,9 +5192,9 @@ async def handle_review_text(message: types.Message, state: FSMContext):
 
     if len(review_text) > 500:
         await message.answer(
-            f"\u26a0\ufe0f *Too long.* Keep your review under 500 characters.\n"
-            f"_({len(review_text)} chars used \u2014 trim it down a little.)_",
-            parse_mode=ParseMode.MARKDOWN
+        f"\u26a0\ufe0f *Too long.* Keep your review under 500 characters.\n"
+        f"_({len(review_text)} chars used \u2014 trim it down a little.)_",
+        parse_mode=ParseMode.MARKDOWN
         )
         return
 
@@ -6011,8 +6018,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
         )
         logger.info(f"🚫 Banned user {user_id} ({ban_type}) attempted to access bot")
         return
-    
-    just_consumed_grace = False
+
     args = message.text.split()
     payload = args[1] if len(args) > 1 else None
 
@@ -6229,6 +6235,8 @@ async def cmd_start(message: types.Message, state: FSMContext):
                     {"$set": {"pending_delete_msg_ids": [_vault_ans.message_id]}},
                     upsert=True
                 )
+                # Auto Nudge trigger
+                asyncio.create_task(_abandonment_nudge_followup(user_id, message.from_user.first_name or "Agent"), name=f"abandonment_nudge_{user_id}")
                 return
 
             # ── Growth hooks: record content access for streak monitor ──────────────
@@ -6473,7 +6481,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
             # Grace is NOT consumed here — it is consumed only after a valid code
             # is successfully entered (in process_search_code with is_yt_flow).
             user_data = get_user_verification_status(user_id)
-            grace_consumed = user_data.get('grace_consumed', False)
+            grace_consumed = True
             # Also block users who left the vault (ever_verified but not in vault)
             was_ever_verified = user_data.get('ever_verified', False)
             
@@ -6706,8 +6714,8 @@ async def cmd_start(message: types.Message, state: FSMContext):
             if not is_in_vault:
                 # Check if user has grace-pass available
                 user_data = get_user_verification_status(user_id)
-                grace_allowed = user_data.get('grace_allowed', False)
-                grace_consumed = user_data.get('grace_consumed', False)
+                grace_allowed = False
+                grace_consumed = True
                 has_grace = grace_allowed and not grace_consumed
                 
                 if not has_grace:
@@ -6728,14 +6736,12 @@ async def cmd_start(message: types.Message, state: FSMContext):
                         )
                     else:
                         vault_msg = (
-                            f"🔒 **{_escape_md(user_name)}, AGENT ACCESS PAUSED**\n\n"
-                            f"You tried to access another premium asset, but your complimentary pass has been used.\n\n"
-                            f"**The MSA Node Agent V2 is an exclusive ecosystem.** By verifying your free membership, you will instantly unlock:\n\n"
-                            f"📂 **Unlimited Blueprints:** Seamless delivery of all future PDFs and guides.\n"
-                            f"🤖 **Elite AI Tools:** Access to our private arsenal of automation scripts.\n"
-                            f"🛍️ **The Inner Circle:** Strategies reserved strictly for the Vault.\n\n"
-                            f"To resume your delivery and unlock the entire system at zero cost, simply join the Vault below and return here.\n\n"
-                            f"*The content is waiting. The choice is yours.*"
+                            f"🛑 **Wait. Don't close this, {_escape_md(user_name)}.**\n\n"
+                            f"You are looking for a strategy, but you're missing the bigger picture.\n\n"
+                            f"The people who actually win don't just look for quick tips. They plug into a proven system.\n\n"
+                            f"That is what the Vault is—our private space with the exact tools and steps you need to see real results.\n\n"
+                            f"Your access is waiting inside.\n\n"
+                            f"👇 **Stop guessing. Join for free and unlock everything right now.**"
                         )
                     _vault_ans = await message.answer(
                         vault_msg,
@@ -6790,7 +6796,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
                         },
                         upsert=True
                     )
-                    just_consumed_grace = True
+
                     logger.info(f"✅ Grace-pass consumed for user {user_id} via IGCC")
                 except Exception as grace_err:
                     logger.error(f"⚠️ Failed to consume grace for user {user_id}: {grace_err}")
@@ -6913,8 +6919,6 @@ async def cmd_start(message: types.Message, state: FSMContext):
                 )
 
             logger.info(f"User {user_id} triggered IGCC deep link for {cc_code}")
-            if just_consumed_grace:
-                await send_psychological_vault_lock_message(user_id)
             # ── PRE-VAULT FIRST-INTERACTION MENU UNLOCK ──────────────────────
             if _igcc_newly_synced:
                 _igcc_msa = get_user_msa_id(user_id) or "Assigned"
@@ -6995,7 +6999,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
     
     # If not verified (not in vault) AND this is a NEW user (never verified before)
     if not all_verified and not was_ever_verified:
-        grace_consumed = user_data.get('grace_consumed', False)
+        grace_consumed = True
         
         if not grace_consumed:
             # ── FIRST-TIME USER: Grace available ─────────────────────────────
@@ -7177,6 +7181,8 @@ It's 100% free, instant, and permanent.
             reply_markup=ReplyKeyboardRemove()
         )
         logger.info(f"[STRICT] First-time non-vault user {user_id} — shown My-Link + Vault hard gate")
+        # Auto Nudge trigger
+        asyncio.create_task(_abandonment_nudge_followup(user_id, message.from_user.first_name or "Agent"), name=f"abandonment_nudge_{user_id}")
         return
 
     # User is verified - show welcome interface
@@ -7885,9 +7891,9 @@ async def handle_join_vault_button(message: types.Message):
     is_in_vault = await check_channel_membership(user_id)
     if is_in_vault:
         await message.answer(
-            f"✅ **{user_name}, you're already in the Vault!**\n\n"
-            f"Your full access is active. Use the menu below:",
-            reply_markup=get_user_menu(user_id),
+        f"✅ **{user_name}, you're already in the Vault!**\n\n"
+        f"Your full access is active. Use the menu below:",
+        reply_markup=get_user_menu(user_id),
             parse_mode=ParseMode.MARKDOWN
         )
         return
@@ -8216,9 +8222,9 @@ async def cancel_search_handler(message: types.Message, state: FSMContext):
         was_ever_verified = user_data.get('ever_verified', False)
         user_name = message.from_user.first_name or "User"
         await message.answer(
-            f"🔐 **VAULT ACCESS REQUIRED**\n\n"
-            f"Hey {user_name}, this feature is exclusive to Vault Members.\n\n"
-            f"📌 **Click the join button below** to unlock full access.\n\n"
+        f"🔐 **VAULT ACCESS REQUIRED**\n\n"
+        f"Hey {user_name}, this feature is exclusive to Vault Members.\n\n"
+        f"📌 **Click the join button below** to unlock full access.\n\n"
             f"_Once joined, all features will be available immediately._",
             reply_markup=get_verification_keyboard(user_id, user_data, show_all=not was_ever_verified),
             parse_mode=ParseMode.MARKDOWN
@@ -8282,14 +8288,12 @@ async def search(message: types.Message, state: FSMContext):
         
         if was_ever_verified:
             await message.answer(
-                f"🔒 **{_escape_md(user_name)}, AGENT ACCESS PAUSED**\n\n"
-                f"You tried to access another premium asset, but your complimentary pass has been used.\n\n"
-                f"**The MSA Node Agent V2 is an exclusive ecosystem.** By verifying your free membership, you will instantly unlock:\n\n"
-                f"📂 **Unlimited Blueprints:** Seamless delivery of all future PDFs.\n"
-                f"🤖 **Elite AI Tools:** Access to our private arsenal.\n"
-                f"🛍️ **The Inner Circle:** Strategies reserved strictly for the Vault.\n\n"
-                f"To resume search and unlock the entire system at zero cost, simply join the Vault below and return here.\n\n"
-                f"*The content is waiting. The choice is yours.*",
+                f"🛑 **Wait. Don't close this, {_escape_md(user_name)}.**\n\n"
+                f"You are looking for a strategy, but you're missing the bigger picture.\n\n"
+                f"The people who actually win don't just look for quick tips. They plug into a proven system.\n\n"
+                f"That is what the Vault is—our private space with the exact tools and steps you need to see real results.\n\n"
+                f"Your access is waiting inside.\n\n"
+                f"👇 **Stop guessing. Join for free and unlock everything right now.**",
                 reply_markup=get_verification_keyboard(message.from_user.id, user_data, show_all=not was_ever_verified),
                 parse_mode=ParseMode.MARKDOWN
             )
@@ -8340,7 +8344,7 @@ async def search(message: types.Message, state: FSMContext):
 @anti_spam("process_search")
 async def process_search_code(message: types.Message, state: FSMContext):
     """Process the MSA code input"""
-    just_consumed_grace = False
+
     
     # Check Maintenance Mode
     if await check_maintenance_mode(message):
@@ -8464,8 +8468,8 @@ async def process_search_code(message: types.Message, state: FSMContext):
     # 🎁 CONSUME GRACE-PASS if available (user is not in vault but has one free pass)
     user_id = message.from_user.id
     user_data = get_user_verification_status(user_id)
-    grace_allowed = user_data.get('grace_allowed', False)
-    grace_consumed = user_data.get('grace_consumed', False)
+    grace_allowed = False
+    grace_consumed = True
     is_in_vault = await check_channel_membership(user_id)
     
     if not is_in_vault and grace_allowed and not grace_consumed:
@@ -8485,7 +8489,7 @@ async def process_search_code(message: types.Message, state: FSMContext):
                     }
                 }
             )
-            just_consumed_grace = True
+
             logger.info(f"✅ Grace-pass consumed for user {user_id} via SEARCH CODE")
         except Exception as grace_err:
             logger.error(f"⚠️ Failed to consume grace for user {user_id}: {grace_err}")
@@ -8667,14 +8671,11 @@ async def process_search_code(message: types.Message, state: FSMContext):
     # DO NOT clear state - keep loop active
     # Re-prompt for another MSA CODE
     await asyncio.sleep(ANIM_DELAY)  # Brief pause after content delivery
-    
-    if just_consumed_grace:
-        await send_psychological_vault_lock_message(user_id)
-    else:
-        await message.answer(
-            f"🔒 **AUTHENTICATION REQUIRED**\n\n{first_name}, the agent is waiting.\nEnter your **MSA CODE** to decrypt the asset.\n\n*Precision is key.*\n\n`ENTER MSA CODE BELOW:`\n\n⚪️ _Reply 'CANCEL' to cancel this operation._",
-            parse_mode=ParseMode.MARKDOWN
-        )
+
+    await message.answer(
+        f"🔒 **AUTHENTICATION REQUIRED**\n\n{first_name}, the agent is waiting.\nEnter your **MSA CODE** to decrypt the asset.\n\n*Precision is key.*\n\n`ENTER MSA CODE BELOW:`\n\n⚪️ _Reply 'CANCEL' to cancel this operation._",
+        parse_mode=ParseMode.MARKDOWN
+    )
     # State remains active - user can enter another code or cancel
 
 
@@ -10281,9 +10282,9 @@ async def _require_vault_check(
         was_ever_verified = user_data.get('ever_verified', False)
         
         await message.answer(
-            f"🔐 **VAULT ACCESS REQUIRED**\n\n"
-            f"Hey {first_name}, this feature is exclusive to Vault Members.\n\n"
-            f"📌 **Click the join button below** to unlock full support access.\n\n"
+        f"🔐 **VAULT ACCESS REQUIRED**\n\n"
+        f"Hey {first_name}, this feature is exclusive to Vault Members.\n\n"
+        f"📌 **Click the join button below** to unlock full support access.\n\n"
             f"_Once joined, all features will be available immediately._",
             reply_markup=get_verification_keyboard(user_id, user_data, show_all=not was_ever_verified),
             parse_mode=ParseMode.MARKDOWN
@@ -10412,9 +10413,9 @@ async def raise_ticket_handler(message: types.Message, state: FSMContext):
         await safe_delete_message(msg)
         
         await message.answer(
-            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"🔒  **ACTIVE TICKET IN PROGRESS**\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🔒  **ACTIVE TICKET IN PROGRESS**\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
             f"**{_escape_md(first_name)}**, you already have an open support request currently being reviewed by our team.\n\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"📋  **CURRENT TICKET STATUS**\n\n"
@@ -10509,9 +10510,9 @@ async def process_ticket_submission(message: types.Message, state: FSMContext):
         created_text = created_at.strftime("%B %d, %Y at %I:%M %p") if hasattr(created_at, "strftime") else str(created_at)
         await state.clear()
         await message.answer(
-            f"🔒 **ACTIVE TICKET ALREADY OPEN**\n\n"
-            f"{user_name}, you already have an active support ticket.\n"
-            f"📅 Submitted: {created_text}\n\n"
+        f"🔒 **ACTIVE TICKET ALREADY OPEN**\n\n"
+        f"{user_name}, you already have an active support ticket.\n"
+        f"📅 Submitted: {created_text}\n\n"
             f"Please wait for admin response before opening another ticket.",
             reply_markup=get_support_menu(),
             parse_mode=ParseMode.MARKDOWN
@@ -10550,9 +10551,9 @@ async def process_ticket_submission(message: types.Message, state: FSMContext):
     if issue_text.upper() == "CANCEL" or issue_text == "❌ CANCEL":
         await state.clear()
         await message.answer(
-            f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"❌  **TICKET CANCELLED**\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"❌  **TICKET CANCELLED**\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
             f"{user_name}, your ticket request has been cancelled.\n\n"
             f"_You can raise a new ticket any time you need help._",
             reply_markup=get_support_menu(),
@@ -10564,9 +10565,9 @@ async def process_ticket_submission(message: types.Message, state: FSMContext):
     if has_unsupported:
         warn_count, lock_remaining, _ = _register_support_violation(user_id)
         await message.answer(
-            f"⚠️  **UNSUPPORTED FILE TYPE**\n\n"
-            f"**{_escape_md(user_name)}**, only the following are accepted in a ticket:\n\n"
-            f"   📷  Photo (1 image with caption)\n"
+        f"⚠️  **UNSUPPORTED FILE TYPE**\n\n"
+        f"**{_escape_md(user_name)}**, only the following are accepted in a ticket:\n\n"
+        f"   📷  Photo (1 image with caption)\n"
             f"   🎥  Video (max 3 min · 50 MB, with caption)\n"
             f"   📄  Text description\n\n"
             f"❌  Documents, voice notes, GIFs, stickers, and audio are not accepted.\n\n"
@@ -10588,9 +10589,9 @@ async def process_ticket_submission(message: types.Message, state: FSMContext):
     if message.media_group_id:
         warn_count, lock_remaining, _ = _register_support_violation(user_id)
         await message.answer(
-            f"⚠️  **ALBUM NOT ALLOWED**\n\n"
-            f"**{_escape_md(user_name)}**, you sent multiple files (an album).\n\n"
-            f"📋  **Only 1 media file is accepted per ticket:**\n"
+        f"⚠️  **ALBUM NOT ALLOWED**\n\n"
+        f"**{_escape_md(user_name)}**, you sent multiple files (an album).\n\n"
+        f"📋  **Only 1 media file is accepted per ticket:**\n"
             f"   📷  1 photo — with a caption describing your issue\n"
             f"   🎥  1 video — max 3 min · 50 MB, with a caption\n\n"
             f"❌  Albums and multiple attachments are strictly denied.\n\n"
@@ -10612,9 +10613,9 @@ async def process_ticket_submission(message: types.Message, state: FSMContext):
     if has_photo and has_video:
         warn_count, lock_remaining, _ = _register_support_violation(user_id)
         await message.answer(
-            f"⚠️  **ONE MEDIA FILE ONLY**\n\n"
-            f"**{_escape_md(user_name)}**, please send either a **photo** or a **video** — not both at once.\n\n"
-            f"_Resend with a single attachment. Tap_ **❌ CANCEL** _to exit._",
+        f"⚠️  **ONE MEDIA FILE ONLY**\n\n"
+        f"**{_escape_md(user_name)}**, please send either a **photo** or a **video** — not both at once.\n\n"
+        f"_Resend with a single attachment. Tap_ **❌ CANCEL** _to exit._",
             parse_mode=ParseMode.MARKDOWN
         )
         await message.answer(
@@ -10683,9 +10684,9 @@ async def process_ticket_submission(message: types.Message, state: FSMContext):
     # ── Validate that there is actual content ─────────────────────────────────
     if not issue_text and not has_photo and not has_video:
         await message.answer(
-            f"⚠️  **NO CONTENT DETECTED**\n\n"
-            f"**{_escape_md(user_name)}**, please send one of the following:\n\n"
-            f"   📷  A screenshot with a caption\n"
+        f"⚠️  **NO CONTENT DETECTED**\n\n"
+        f"**{_escape_md(user_name)}**, please send one of the following:\n\n"
+        f"   📷  A screenshot with a caption\n"
             f"   🎥  A short video with a caption\n"
             f"   📄  A text description of your issue\n\n"
             f"_Try again or tap_ **❌ CANCEL** _to exit._",
@@ -10697,9 +10698,9 @@ async def process_ticket_submission(message: types.Message, state: FSMContext):
     if (has_photo or has_video) and len(issue_text) == 0:
         media_label = "photo" if has_photo else "video"
         await message.answer(
-            f"⚠️  **CAPTION REQUIRED**\n\n"
-            f"**{_escape_md(user_name)}**, please add a description to your {media_label}.\n\n"
-            f"📝  **How to add a caption:**\n"
+        f"⚠️  **CAPTION REQUIRED**\n\n"
+        f"**{_escape_md(user_name)}**, please add a description to your {media_label}.\n\n"
+        f"📝  **How to add a caption:**\n"
             f"   1.  Long-press the {media_label}\n"
             f"   2.  Tap ✏️ Add a caption\n"
             f"   3.  Describe your issue, then send\n\n"
@@ -11016,9 +11017,9 @@ async def my_ticket_handler(message: types.Message):
             [KeyboardButton(text="🔙 BACK TO SUPPORT")]
         ], resize_keyboard=True)
         await message.answer(
-            f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"🎫  **YOUR ACTIVE TICKET**\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🎫  **YOUR ACTIVE TICKET**\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
             f"📋  **TICKET DETAILS**\n\n"
             f"   🔄  Status:     ⏳ Awaiting Admin Review\n"
             f"   📅  Submitted:  {date_str}\n"
@@ -11055,9 +11056,9 @@ async def my_ticket_handler(message: types.Message):
     if total == 0:
         await safe_delete_message(msg)
         await message.answer(
-            f"📋 **NO TICKET HISTORY**\n\n"
-            f"{first_name}, you haven't submitted any support tickets yet.\n\n"
-            f"Tap **🎫 RAISE A TICKET** whenever you need help!",
+        f"📋 **NO TICKET HISTORY**\n\n"
+        f"{first_name}, you haven't submitted any support tickets yet.\n\n"
+        f"Tap **🎫 RAISE A TICKET** whenever you need help!",
             reply_markup=get_support_menu(),
             parse_mode=ParseMode.MARKDOWN
         )
@@ -11450,9 +11451,9 @@ async def cmd_ticket_stats(message: types.Message):
         })
         
         await message.answer(
-            f"📊 **SUPPORT TICKET STATISTICS**\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"**📋 Overall Status:**\n"
+        f"📊 **SUPPORT TICKET STATISTICS**\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"**📋 Overall Status:**\n"
             f"• Total Tickets: `{total_count}`\n"
             f"• 🔴 Open: `{open_count}`\n"
             f"• 🟢 Resolved: `{resolved_count}`\n"
@@ -11517,9 +11518,9 @@ async def cmd_bot_health(message: types.Message):
         success_rate = (healed / total_errors * 100) if total_errors > 0 else 100
         
         await message.answer(
-            f"🏥 **BOT HEALTH STATUS**\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"**⚡ System Status:**\n"
+        f"🏥 **BOT HEALTH STATUS**\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"**⚡ System Status:**\n"
             f"• Bot: {bot_status}\n"
             f"• Database: {db_status}\n"
             f"• Health Monitor: ✅ Active\n"
@@ -11602,9 +11603,9 @@ async def cmd_dead_users(message: types.Message):
         bot_blocked_never  = col_user_verification.count_documents({"bot_unreachable": True, "vault_joined": False})
 
         await message.answer(
-            f"💬 **DEAD USER PIPELINE — /dead\\_users**\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"📄 **user\\_verification docs:** `{total_docs}`\n"
+        f"💬 **DEAD USER PIPELINE — /dead\\_users**\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"📄 **user\\_verification docs:** `{total_docs}`\n"
             f"🆔 **Active MSA IDs:**  `{total_msa}`\n\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"✅ **Active vault members:** `{active}`\n\n"
@@ -11852,9 +11853,9 @@ async def reset_confirm2(message: types.Message, state: FSMContext):
 
         await state.clear()
         await message.answer(
-            f"✅ **{label.upper()} DATA RESET COMPLETE**\n\n"
-            f"🗑️ Total records deleted: **{total:,}**\n\n"
-            f"**Breakdown:**\n{breakdown}\n\n"
+        f"✅ **{label.upper()} DATA RESET COMPLETE**\n\n"
+        f"🗑️ Total records deleted: **{total:,}**\n\n"
+        f"**Breakdown:**\n{breakdown}\n\n"
             f"✅ Backups remain intact.\n"
             f"✅ Only {label} data was affected.",
             reply_markup=get_user_menu(message.from_user.id),
@@ -11865,9 +11866,9 @@ async def reset_confirm2(message: types.Message, state: FSMContext):
     except Exception as e:
         await state.clear()
         await message.answer(
-            f"❌ **RESET FAILED**\n\n{str(e)}\n\nPartial deletion may have occurred.",
-            reply_markup=get_user_menu(message.from_user.id),
-            parse_mode=ParseMode.MARKDOWN
+        f"❌ **RESET FAILED**\n\n{str(e)}\n\nPartial deletion may have occurred.",
+        reply_markup=get_user_menu(message.from_user.id),
+        parse_mode=ParseMode.MARKDOWN
         )
 
 
@@ -13741,6 +13742,7 @@ async def monthly_json_delivery_bot1():
 # ==========================================
 
 async def vault_nudge_scheduler():
+    return # Grace completely removed as per user request
     """
     Background scheduler — runs every 30 minutes.
     Scans grace-consumed, non-vault users and sends psychologically-tuned
@@ -14858,4 +14860,3 @@ if __name__ == "__main__":
             _restart_delay = min(_restart_delay * 2, 60)
             # Replace the entire process to get a clean event loop
             os.execv(sys.executable, [sys.executable, _script_path])
-
