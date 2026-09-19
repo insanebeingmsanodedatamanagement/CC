@@ -19,6 +19,7 @@ from aiogram.filters import Command, StateFilter
 from aiogram.types import ReplyKeyboardMarkup, ReplyKeyboardRemove, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
+from dotenv import load_dotenv
 import pymongo
 from pymongo import MongoClient
 from pymongo.errors import ServerSelectionTimeoutError, ConnectionFailure, DuplicateKeyError
@@ -31,8 +32,64 @@ from zoneinfo import ZoneInfo
 from logging.handlers import RotatingFileHandler
 from aiohttp import web
 import html as _html
+import html
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
+# Load environment variables.
+# Priority:
+# 1) Explicit BOT3_ENV_FILE override
+# 2) Backward-compatible default files used in existing deployments
+_explicit_env_file = os.environ.get("BOT3_ENV_FILE", "").strip()
+if _explicit_env_file:
+    ENV_FILE_CANDIDATES = (_explicit_env_file, "bot3.env", "bot3.env.txt", "BOT3.env", ".env")
+else:
+    ENV_FILE_CANDIDATES = ("bot3.env", "bot3.env.txt", "BOT3.env", ".env")
+
+ACTIVE_ENV_FILE = next((p for p in ENV_FILE_CANDIDATES if os.path.exists(p)), "BOT3.env")
+load_dotenv(ACTIVE_ENV_FILE, override=True)
+
+# Safe datetime parsing & formatting helpers — resilient to strings, None, and mixed datetime types
+def safe_parse_dt(val):
+    if not val:
+        return None
+    if isinstance(val, datetime):
+        return val
+    if isinstance(val, str):
+        val = val.strip()
+        for fmt in (
+            "%Y-%m-%d %H:%M:%S",
+            "%Y-%m-%dT%H:%M:%S",
+            "%Y-%m-%d %I:%M:%S %p",
+            "%Y-%m-%d %I:%M %p",
+            "%Y-%m-%d %H:%M",
+            "%Y-%m-%d",
+            "%d/%m/%Y %H:%M:%S",
+            "%d/%m/%Y",
+            "%b %d, %Y %I:%M %p",
+            "%B %d, %Y %I:%M %p",
+            "%A, %B %d, %Y",
+            "%Y-%m-%d_%H-%M-%S",
+        ):
+            try:
+                return datetime.strptime(val, fmt)
+            except (ValueError, TypeError):
+                continue
+        try:
+            return datetime.fromisoformat(val)
+        except Exception:
+            pass
+    return None
+
+def safe_format_date(val, fmt="%b %d, %Y  %I:%M %p", default="Unknown"):
+    dt = safe_parse_dt(val)
+    if dt:
+        try:
+            return dt.strftime(fmt)
+        except Exception:
+            return default
+    if val:
+        return str(val)
+    return default
 
 # ==========================================
 # ENTERPRISE CONFIGURATION
@@ -172,6 +229,47 @@ def _gdrive_upload_bytes(service, zip_bytes: bytes, filename: str, folder_id: st
     media = MediaIoBaseUpload(io.BytesIO(zip_bytes), mimetype="application/zip", resumable=True)
     f = service.files().create(body=meta, media_body=media, fields="id").execute()
     return f.get("id", "")
+
+
+def _get_or_create_gdrive_folder(service, folder_name: str, parent_id: str) -> str:
+    """Get an existing GDrive folder by name, or create it if it doesn't exist."""
+    query = (
+        f"name='{folder_name}' and "
+        f"'{parent_id}' in parents and "
+        "mimeType='application/vnd.google-apps.folder' and "
+        "trashed=false"
+    )
+    results = service.files().list(q=query, fields="files(id, name)").execute()
+    files = results.get("files", [])
+    if files:
+        return files[0]["id"]
+    
+    meta = {
+        "name": folder_name,
+        "mimeType": "application/vnd.google-apps.folder",
+        "parents": [parent_id]
+    }
+    f = service.files().create(body=meta, fields="id").execute()
+    return f.get("id")
+
+def _resolve_gdrive_path(service, base_folder_id: str, ts_dt) -> str:
+    """
+    Resolve the nested GDrive folder structure:
+    Base -> Year -> Month -> Week -> Date
+    Creates any missing folders along the way.
+    """
+    year_str = ts_dt.strftime("%Y")
+    month_str = ts_dt.strftime("%B")  # e.g., 'July'
+    date_str = ts_dt.strftime("%Y-%m-%d")
+    day_of_month = ts_dt.day
+    week_num = ((day_of_month - 1) // 7) + 1
+    week_str = f"Week {week_num}"
+
+    year_id = _get_or_create_gdrive_folder(service, year_str, base_folder_id)
+    month_id = _get_or_create_gdrive_folder(service, month_str, year_id)
+    week_id = _get_or_create_gdrive_folder(service, week_str, month_id)
+    date_id = _get_or_create_gdrive_folder(service, date_str, week_id)
+    return date_id
 
 
 def _export_bot_collections(prod_db, bot_name: str) -> dict:
@@ -441,11 +539,21 @@ def gdrive_upload_cluster_backup(
         size_mb   = len(zip_bytes) / (1024 * 1024)
 
         service = _get_gdrive_service()
-        if _gdrive_file_exists(service, zip_name, _folder):
+        
+        # Parse timestamp string from record (e.g. 20260724_093000) or use current time
+        from datetime import datetime as _dt
+        try:
+            ts_dt = _dt.strptime(ts_str.split("_")[0], "%Y%m%d")
+        except:
+            ts_dt = _dt.utcnow()
+            
+        final_folder_id = _resolve_gdrive_path(service, _folder, ts_dt)
+
+        if _gdrive_file_exists(service, zip_name, final_folder_id):
             bkp_client.close()
             return {"status": "error", "message": f"File '{zip_name}' already exists in GDrive — skipped duplicate."}
 
-        file_id = _gdrive_upload_bytes(service, zip_bytes, zip_name, _folder)
+        file_id = _gdrive_upload_bytes(service, zip_bytes, zip_name, final_folder_id)
 
         bkp_col.update_one(
             {"_id": ObjectId(backup_id)},
@@ -791,8 +899,76 @@ for _noisy in ("aiogram", "aiogram.event", "aiogram.dispatcher", "aiohttp", "asy
     logging.getLogger(_noisy).setLevel(logging.WARNING)
 for _ultra_noisy in ("pymongo", "pymongo.client", "pymongo.pool", "pymongo.topology"):
     logging.getLogger(_ultra_noisy).setLevel(logging.CRITICAL)
-del _noisy
-del _ultra_noisy
+# Database Global Handles & Resilient Connector
+client = None
+db = None
+col_logs = None
+col_pdfs = None
+col_ig_content = None
+col_rewards = None
+col_settings = None
+col_admins = None
+col_banned_users = None
+col_user_activity = None
+col_backups = None
+col_live_logs = None
+col_store_items = None
+col_milestones = None
+col_tutorials = None
+col_purchase_history = None
+
+def connect_db(is_reconnect: bool = False) -> bool:
+    """Enterprise-grade MongoDB connection helper with SSL resilience & auto-reconnect."""
+    global client, db, col_logs, col_pdfs, col_ig_content, col_rewards, col_settings
+    global col_admins, col_banned_users, col_user_activity, col_backups, col_live_logs
+    global col_store_items, col_milestones, col_tutorials, col_purchase_history
+    import certifi
+    
+    if is_reconnect and client:
+        try:
+            client.close()
+            logger.info("✅ Old connection closed")
+        except Exception as e:
+            logger.warning(f"⚠️ Could not close old connection: {e}")
+
+    try:
+        new_client = pymongo.MongoClient(
+            MONGO_URI,
+            serverSelectionTimeoutMS=MONGO_CONNECT_TIMEOUT_MS,
+            connectTimeoutMS=MONGO_CONNECT_TIMEOUT_MS,
+            maxPoolSize=MONGO_MAX_POOL_SIZE,
+            minPoolSize=MONGO_MIN_POOL_SIZE,
+            maxIdleTimeMS=45000,
+            heartbeatFrequencyMS=10000,
+            retryWrites=True,
+            retryReads=True,
+            tlsCAFile=certifi.where(),
+            tlsAllowInvalidCertificates=True
+        )
+        new_db = new_client[MONGO_DB_NAME]
+        new_client.admin.command('ping')
+        
+        client = new_client
+        db = new_db
+        col_logs = db["bot3_logs"]
+        col_pdfs = db["bot3_pdfs"]
+        col_ig_content = db["bot3_ig_content"]
+        col_rewards = db["bot3_rewards"]
+        col_settings = db["bot3_settings"]
+        col_admins = db["bot3_admins"]
+        col_banned_users = db["bot3_banned_users"]
+        col_user_activity = db["bot3_user_activity"]
+        col_backups = db["bot3_backups"]
+        col_live_logs = db["bot2_live_terminal_logs"]
+        col_store_items = db["bot3_store_items"]
+        col_milestones = db["bot3_milestones"]
+        col_tutorials = db["bot3_tutorials"]
+        col_purchase_history = db["bot3_purchase_history"]
+        return True
+    except Exception as e:
+        logger.error(f"❌ connect_db failed: {e}")
+        return False
+
 # ==========================================
 # ENTERPRISE HEALTH MONITORING SYSTEM
 # ==========================================
@@ -888,56 +1064,20 @@ class HealthMonitor:
         """Attempt to auto-heal database connection (CRITICAL: Only on confirmed failures)"""
         try:
             logger.info("🔧 Attempting database auto-heal...")
-            global client, db, col_pdfs, col_ig_content, col_logs, col_admins, col_banned_users, col_user_activity, col_settings, col_backups
             
             # SAFETY: Verify old collections still work before healing
             try:
                 test_count = col_pdfs.count_documents({})
                 logger.warning(f"⚠️ Auto-heal triggered but col_pdfs is still responsive ({test_count} docs). Skipping heal.")
                 return
-            except:
+            except Exception:
                 logger.error("✅ Confirmed: Database connection is truly broken. Proceeding with auto-heal.")
             
-            # Close existing connection
-            try:
-                client.close()
-                logger.info("✅ Old connection closed")
-            except Exception as e:
-                logger.warning(f"⚠️ Could not close old connection: {e}")
-            
-            # Reconnect
-            new_client = pymongo.MongoClient(
-                MONGO_URI,
-                serverSelectionTimeoutMS=MONGO_CONNECT_TIMEOUT_MS,
-                connectTimeoutMS=MONGO_CONNECT_TIMEOUT_MS,
-                maxPoolSize=MONGO_MAX_POOL_SIZE,
-                minPoolSize=MONGO_MIN_POOL_SIZE
-            )
-            new_db = new_client[MONGO_DB_NAME]
-            
-            # Verify credentials and database name BEFORE reinitializing
-            try:
-                new_client.admin.command('ping')
-                logger.info(f"✅ New connection verified")
-                if new_db.name != MONGO_DB_NAME:
-                    logger.error(f"❌ CRITICAL: New connection points to wrong database '{new_db.name}' (expected {MONGO_DB_NAME}). Abort heal.")
-                    return
-            except Exception as e:
-                logger.error(f"❌ New connection failed: {e}. Reverting.")
+            # Use unified resilient reconnect
+            success = connect_db(is_reconnect=True)
+            if not success:
+                logger.error("❌ Auto-heal reconnection failed.")
                 return
-            
-            # ONLY NOW: Reinitialize collections
-            client = new_client
-            db = new_db
-            col_logs = db["bot3_logs"]
-            col_pdfs = db["bot3_pdfs"]
-            col_ig_content = db["bot3_ig_content"]
-            col_rewards = db["bot3_rewards"]
-            col_settings = db["bot3_settings"]
-            col_admins = db["bot3_admins"]
-            col_banned_users = db["bot3_banned_users"]
-            col_user_activity = db["bot3_user_activity"]
-            col_backups = db["bot3_backups"]
             
             # Verify collections are responsive
             try:
@@ -946,6 +1086,15 @@ class HealthMonitor:
             except Exception as e:
                 logger.error(f"❌ New collections not responding: {e}")
                 return
+            
+            self.health_checks_failed = 0
+            self.consecutive_errors = 0
+            logger.info("✅ Database auto-heal completed successfully!")
+            await self.send_success_notification(
+                "Database Auto-Healed",
+                f"Successfully restored MongoDB connection to {MONGO_DB_NAME}\nPDFs accessible: {pdf_count}"
+            )
+            return True
             
             self.health_checks_failed = 0
             self.is_healthy = True
@@ -1491,35 +1640,8 @@ dp = Dispatcher()
 # Database Connection with Enterprise Configuration
 try:
     print("🔌 Connecting to MongoDB...")
-    import certifi
-    client = pymongo.MongoClient(
-        MONGO_URI,
-        serverSelectionTimeoutMS=MONGO_CONNECT_TIMEOUT_MS,
-        connectTimeoutMS=MONGO_CONNECT_TIMEOUT_MS,
-        maxPoolSize=MONGO_MAX_POOL_SIZE,
-        minPoolSize=MONGO_MIN_POOL_SIZE,
-        retryWrites=True,
-        retryReads=True,
-        tlsCAFile=certifi.where()
-    )
-    db = client[MONGO_DB_NAME]
-    
-    # Bot3 Management Collections
-    col_logs = db["bot3_logs"]
-    col_pdfs = db["bot3_pdfs"]
-    col_ig_content = db["bot3_ig_content"]
-    col_rewards = db["bot3_rewards"]          # Referral reward content pool (RW1, RW2...)
-    col_settings = db["bot3_settings"]
-    col_admins = db["bot3_admins"]
-    col_banned_users = db["bot3_banned_users"]
-    col_user_activity = db["bot3_user_activity"]
-    col_backups = db["bot3_backups"]  # Backup history collection
-    col_live_logs = db["bot2_live_terminal_logs"]  # Shared live terminal with Bot 2
-    col_store_items = db["bot3_store_items"]  # Vault Shop items
-    col_milestones  = db["bot3_milestones"]   # Referral milestone tiers
-    
-    # Test connection
-    client.admin.command('ping')
+    if not connect_db():
+        raise ConnectionError("Initial connect_db() call returned False")
     print("✅ Connected to MongoDB")
     print(f"   Database: {MONGO_DB_NAME}")
     print(f"   Connection Pool: {MONGO_MIN_POOL_SIZE}-{MONGO_MAX_POOL_SIZE}")
@@ -1848,6 +1970,9 @@ class IGDeleteStates(StatesGroup):
     waiting_for_confirm = State()
 
 class IGListStates(StatesGroup):
+    viewing = State()
+
+class IGLinkStates(StatesGroup):
     viewing = State()
 
 class IGAffiliateStates(StatesGroup):
@@ -3179,9 +3304,13 @@ async def attempt_db_recovery():
     print("[RECOVERY] Attempting database recovery...")
     
     try:
-        # Force reconnect by pinging database
-        client.admin.command('ping')
-        logger.info("[RECOVERY] ✅ Database ping successful")
+        # Verify and reconnect if needed
+        try:
+            client.admin.command('ping')
+            logger.info("[RECOVERY] ✅ Database ping successful")
+        except Exception:
+            logger.info("[RECOVERY] Ping failed, cycling connection pool...")
+            connect_db(is_reconnect=True)
         
         # Verify collections exist
         collections = db.list_collection_names()
@@ -3270,7 +3399,7 @@ def is_ig_name_duplicate(name, exclude_id=None):
     Check if IG content name already exists
     exclude_id: ObjectId to exclude from check (for edit operations)
     """
-    query = {"name": {"$regex": f"^{name}$", "$options": "i"}}  # Case-insensitive exact match
+    query = {"name": {"$regex": f"^{re.escape(name)}$", "$options": "i"}}  # Case-insensitive exact match
     if exclude_id:
         from bson.objectid import ObjectId
         query["_id"] = {"$ne": ObjectId(exclude_id)}
@@ -3780,9 +3909,10 @@ def get_roles_menu():
 
 
 def get_analytics_menu():
-    """Analytics Menu Structure"""
+    """Analytics Menu Structure — upgraded with Top Content & Affiliate Revenue reports."""
     keyboard = [
-        [KeyboardButton(text="📊 OVERVIEW")],
+        [KeyboardButton(text="📊 OVERVIEW"), KeyboardButton(text="🔥 TOP CONTENT")],
+        [KeyboardButton(text="💰 AFFILIATE REPORT"), KeyboardButton(text="🏷️ TAG SEARCH")],
         [KeyboardButton(text="📄 PDF Clicks"), KeyboardButton(text="💸 Affiliate Clicks")],
         [KeyboardButton(text="📸 IG Start Clicks"), KeyboardButton(text="▶️ YT Start Clicks")],
         [KeyboardButton(text="📸 IG CC Start Clicks"), KeyboardButton(text="🔑 YT Code Start Clicks")],
@@ -4649,7 +4779,7 @@ async def process_edit_search(message: types.Message, state: FSMContext):
         pdf = col_pdfs.find_one({"index": int(query)})
     else:
         # Search by Name (Text)
-        pdf = col_pdfs.find_one({"name": {"$regex": query, "$options": "i"}})
+        pdf = col_pdfs.find_one({"name": {"$regex": re.escape(query), "$options": "i"}})
     
     if not pdf:
         await message.answer("❌ PDF Not Found. Try again or Cancel.", reply_markup=get_cancel_keyboard())
@@ -5326,7 +5456,7 @@ async def process_msa_edit_select(message: types.Message, state: FSMContext):
     if query.isdigit():
         pdf = col_pdfs.find_one({"index": int(query)})
     else:
-        pdf = col_pdfs.find_one({"name": {"$regex": query, "$options": "i"}})
+        pdf = col_pdfs.find_one({"name": {"$regex": re.escape(query), "$options": "i"}})
     
     if not pdf:
         await message.answer("❌ PDF Not Found.", reply_markup=get_cancel_keyboard())
@@ -5438,7 +5568,7 @@ async def process_msa_delete_select(message: types.Message, state: FSMContext):
         if q.isdigit():
             pdf_item = col_pdfs.find_one({"index": int(q)})
         else:
-            pdf_item = col_pdfs.find_one({"name": {"$regex": q, "$options": "i"}})
+            pdf_item = col_pdfs.find_one({"name": {"$regex": re.escape(q), "$options": "i"}})
             
         if not pdf_item:
             not_found.append(q)
@@ -5579,7 +5709,7 @@ async def process_yt_pdf_selection(message: types.Message, state: FSMContext):
     if query.isdigit():
         pdf = col_pdfs.find_one({"index": int(query)})
     else:
-        pdf = col_pdfs.find_one({"name": {"$regex": query, "$options": "i"}})
+        pdf = col_pdfs.find_one({"name": {"$regex": re.escape(query), "$options": "i"}})
     
     if not pdf:
         await message.answer("❌ PDF Not Found. Try again or Cancel.", reply_markup=get_cancel_keyboard())
@@ -5679,7 +5809,7 @@ async def process_yt_edit_select(message: types.Message, state: FSMContext):
     if query.isdigit():
         pdf = col_pdfs.find_one({"index": int(query)})
     else:
-        pdf = col_pdfs.find_one({"name": {"$regex": query, "$options": "i"}})
+        pdf = col_pdfs.find_one({"name": {"$regex": re.escape(query), "$options": "i"}})
     
     if not pdf:
         await message.answer("❌ PDF Not Found.", reply_markup=get_cancel_keyboard())
@@ -5945,12 +6075,16 @@ async def home_yt_handler(message: types.Message):
     await message.answer(text, parse_mode="HTML")
 
 @dp.message(F.text == "📸 IG CC")
-async def ig_cc_links_handler(message: types.Message, page=0):
+async def ig_cc_links_handler(message: types.Message, state: FSMContext = None, page=0):
     if not await check_authorization(message, "IG CC Links", "can_list"):
         return
     limit = 5
     skip = page * limit
     
+    if state:
+        await state.set_state(IGLinkStates.viewing)
+        await state.update_data(ig_page=page)
+
     try:
         total = col_ig_content.count_documents({})
     except Exception as db_err:
@@ -5984,22 +6118,29 @@ async def ig_cc_links_handler(message: types.Message, page=0):
             return
     
     contents = list(col_ig_content.find().sort("cc_number", 1).skip(skip).limit(limit))
+    total_pages = max(1, ((total - 1) // limit) + 1)
 
-    text = f"📸 <b>IG CC LINKS</b> (Page {page+1})\n━━━━━━━━━━━━━━━━━━━━\n\n"
+    text = f"📸 <b>IG CC LINKS</b> (Page {page+1} / {total_pages})\n"
+    text += f"━━━━━━━━━━━━━━━━━━━━\n"
+    text += f"💡 <i>Type any Index (1-{total}), CC Code (e.g. CC1), or Keyword to get that specific link instantly!</i>\n"
+    text += f"━━━━━━━━━━━━━━━━━━━━\n\n"
     username = BOT_USERNAME
     
-    for content in contents:
+    for idx, content in enumerate(contents, start=1):
+        display_num = skip + idx
         # Ensure Code
         content = await ensure_ig_cc_code(content)
         code = content['start_code']
         cc_code = content['cc_code']
+        raw_name = content.get('name', 'Unnamed')
+        title_snippet = raw_name.split('\n')[0][:35]
         
         dash_url = os.getenv("DASHBOARD_URL", "https://cc-svu3.onrender.com")
         base_link = f"{dash_url.rstrip('/')}/tg?start=" if dash_url else f"https://t.me/{username}?start="
         link = f"{base_link}{code}_igcc_{cc_code}"
         
         text += (
-            f"🆔 <b>{cc_code}</b>\n"
+            f"🆔 <b>#{display_num} • {cc_code}</b> — {_html.escape(title_snippet)}\n"
             f"🔗 <code>{link}</code>\n"
             f"🔑 Start Code: <code>{code}</code>\n"
             "────────────────────\n"
@@ -6017,16 +6158,122 @@ async def ig_cc_links_handler(message: types.Message, page=0):
     await message.answer(text, reply_markup=ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True), parse_mode="HTML", disable_web_page_preview=True)
 
 @dp.message(F.text == "⬅️ BACK TO LINKS MENU")
-async def back_to_links_menu(message: types.Message):
+async def back_to_links_menu(message: types.Message, state: FSMContext = None):
+    if state:
+        await state.clear()
     await message.answer("🔗 <b>DEEP LINKS MANAGER</b>", reply_markup=get_links_menu(), parse_mode="HTML")
 
 @dp.message(lambda m: m.text and (m.text.startswith("⬅️ PREV_IGLINK") or m.text.startswith("➡️ NEXT_IGLINK")))
-async def ig_link_pagination(message: types.Message):
+async def ig_link_pagination(message: types.Message, state: FSMContext = None):
     try:
         page = int(message.text.split()[-1]) - 1
-        await ig_cc_links_handler(message, page=page)
+        await ig_cc_links_handler(message, state=state, page=page)
     except:
         await message.answer("❌ Error navigating.")
+
+@dp.message(IGLinkStates.viewing)
+async def process_ig_link_search(message: types.Message, state: FSMContext):
+    """Handler for typing a specific link, CC code, index, or keyword while browsing IG deep links."""
+    raw_text = (message.text or "").strip()
+    if raw_text in ("⬅️ BACK TO LINKS MENU", "❌ CANCEL", "⬅️ BACK"):
+        await state.clear()
+        return await message.answer("🔗 <b>DEEP LINKS MANAGER</b>", reply_markup=get_links_menu(), parse_mode="HTML")
+
+    if raw_text.startswith("⬅️ PREV_IGLINK") or raw_text.startswith("➡️ NEXT_IGLINK"):
+        try:
+            page = int(raw_text.split()[-1]) - 1
+            return await ig_cc_links_handler(message, state=state, page=page)
+        except Exception:
+            return await ig_cc_links_handler(message, state=state, page=0)
+
+    query = raw_text
+    all_contents = list(col_ig_content.find().sort("cc_number", 1))
+    total = len(all_contents)
+    content = None
+
+    # 1. Try by numeric index (1-based index or cc_number)
+    if query.isdigit():
+        val = int(query)
+        # Check by cc_number
+        content = next((c for c in all_contents if c.get("cc_number") == val), None)
+        if not content and 0 < val <= total:
+            content = all_contents[val - 1]
+
+    # 2. Try by CC code (e.g. CC1, cc001, CC7)
+    if not content:
+        m = re.match(r"^CC0*(\d+)$", query, re.IGNORECASE)
+        if m:
+            num = int(m.group(1))
+            content = next((c for c in all_contents if c.get("cc_number") == num or c.get("cc_code", "").upper() == f"CC{num}"), None)
+        if not content:
+            content = col_ig_content.find_one({"cc_code": {"$regex": f"^{re.escape(query)}$", "$options": "i"}})
+
+    # 3. Try by start_code or if user pasted a deep link
+    if not content:
+        clean_code = query
+        if "_igcc_" in query:
+            clean_code = query.split("_igcc_")[0].split("start=")[-1]
+        content = col_ig_content.find_one({"start_code": clean_code})
+
+    # 4. Try by content title / keyword (safely escaped)
+    if not content:
+        content = col_ig_content.find_one({"name": {"$regex": re.escape(query), "$options": "i"}})
+
+    # Current page for keyboard retention
+    data = await state.get_data()
+    page = data.get("ig_page", 0)
+    skip = page * 5
+    buttons = []
+    if page > 0: buttons.append(KeyboardButton(text=f"⬅️ PREV_IGLINK {page}"))
+    if (skip + 5) < total: buttons.append(KeyboardButton(text=f"➡️ NEXT_IGLINK {page+2}"))
+    keyboard = []
+    if buttons: keyboard.append(buttons)
+    keyboard.append([KeyboardButton(text="⬅️ BACK TO LINKS MENU")])
+    reply_kb = ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
+
+    if not content:
+        await message.answer(
+            f"❌ <b>No IG content found for:</b> <code>{_html.escape(query)}</code>\n\n"
+            f"💡 <i>Tip: Type an Index (1-{total}), CC Code (e.g. <code>CC1</code>, <code>CC12</code>), or keyword from the title.</i>",
+            reply_markup=reply_kb,
+            parse_mode="HTML"
+        )
+        return
+
+    # Find 1-based display index
+    display_index = next((i + 1 for i, c in enumerate(all_contents) if c.get("_id") == content.get("_id")), content.get("cc_number", "?"))
+
+    # Ensure start code exists
+    content = await ensure_ig_cc_code(content)
+    code = content.get("start_code", "")
+    cc_code = content.get("cc_code", "")
+    raw_name = content.get("name", "Unnamed")
+    first_line = raw_name.split("\n")[0][:80]
+
+    dash_url = os.getenv("DASHBOARD_URL", "https://cc-svu3.onrender.com")
+    username = BOT_USERNAME
+    base_link = f"{dash_url.rstrip('/')}/tg?start=" if dash_url else f"https://t.me/{username}?start="
+    link = f"{base_link}{code}_igcc_{cc_code}"
+
+    aff_line = f"\n💸 <b>Affiliate Link:</b> {content.get('affiliate_link')}" if content.get("affiliate_link") else ""
+    created_str = safe_format_date(content.get("created_at"), "%b %d, %Y  %I:%M %p", "Unknown")
+
+    resp = (
+        f"📸 <b>SPECIFIC IG LINK FOUND</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"🆔 <b>#{display_index} • {cc_code}</b>\n"
+        f"📝 <b>Title:</b> {_html.escape(first_line)}\n\n"
+        f"🔗 <b>Deep Link (Click to Copy):</b>\n"
+        f"<code>{link}</code>\n\n"
+        f"🔑 Start Code: <code>{code}</code>\n"
+        f"📊 Clicks: <code>{content.get('ig_cc_clicks', 0)}</code>"
+        f"{aff_line}\n"
+        f"📅 Added: <code>{created_str}</code>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"💡 <i>Type another Index or CC Code to get that link, or use navigation buttons below:</i>"
+    )
+
+    await message.answer(resp, reply_markup=reply_kb, parse_mode="HTML", disable_web_page_preview=True)
 
 @dp.message(F.text == "📑 ALL PDF")
 async def all_pdf_links_handler(message: types.Message, page=0):
@@ -6288,7 +6535,7 @@ async def process_ig_edit_select(message: types.Message, state: FSMContext):
             display_index = int(query)
     # Try by CC code
     elif query.upper().startswith("CC"):
-        content = col_ig_content.find_one({"cc_code": {"$regex": f"^{query}$", "$options": "i"}})
+        content = col_ig_content.find_one({"cc_code": {"$regex": f"^{re.escape(query)}$", "$options": "i"}})
         if content:
             # Find display index
             all_contents = list(col_ig_content.find().sort("cc_number", 1))
@@ -6532,7 +6779,7 @@ async def process_ig_list_view(message: types.Message, state: FSMContext):
             display_index = int(query)
     # Try by CC code
     elif query.upper().startswith("CC"):
-        content = col_ig_content.find_one({"cc_code": {"$regex": f"^{query}$", "$options": "i"}})
+        content = col_ig_content.find_one({"cc_code": {"$regex": f"^{re.escape(query)}$", "$options": "i"}})
         if content:
             # Find display index
             all_contents = list(col_ig_content.find().sort("cc_number", 1))
@@ -6985,7 +7232,7 @@ async def handle_ig_cc_pagination(message: types.Message, state: FSMContext):
             content = all_contents[idx]
             display_index = int(query)
     elif query.upper().startswith("CC"):
-        content = col_ig_content.find_one({"cc_code": {"$regex": f"^{query}$", "$options": "i"}})
+        content = col_ig_content.find_one({"cc_code": {"$regex": f"^{re.escape(query)}$", "$options": "i"}})
         if content:
             for i, c in enumerate(all_contents, start=1):
                 if c["_id"] == content["_id"]:
@@ -7810,17 +8057,16 @@ async def process_pdf_search(message: types.Message, state: FSMContext):
         pdf = col_pdfs.find_one({"msa_code": query.upper()})
     # Try by name
     else:
-        pdf = col_pdfs.find_one({"name": {"$regex": f"^{query}$", "$options": "i"}})
+        pdf = col_pdfs.find_one({"name": {"$regex": f"^{re.escape(query)}$", "$options": "i"}})
     
     if not pdf:
         await message.answer("❌ PDF Not Found. Try again or Cancel.", reply_markup=get_cancel_keyboard())
         return
     
     # Format creation time
-    from datetime import datetime
     creation_time = pdf.get('created_at', now_local())
-    time_12h = creation_time.strftime("%I:%M %p")
-    date_str = creation_time.strftime("%A, %B %d, %Y")
+    time_12h = safe_format_date(creation_time, "%I:%M %p", "Unknown")
+    date_str = safe_format_date(creation_time, "%A, %B %d, %Y", "Unknown")
     
     # Build detailed info
     text = f"📄 <b>PDF DETAILS</b>\n━━━━━━━━━━━━━━━━━━━━\n"
@@ -7935,17 +8181,16 @@ async def process_ig_search(message: types.Message, state: FSMContext):
             content = all_contents[idx]
     # Try by CC code
     elif query.upper().startswith("CC"):
-        content = col_ig_content.find_one({"cc_code": {"$regex": f"^{query}$", "$options": "i"}})
+        content = col_ig_content.find_one({"cc_code": {"$regex": f"^{re.escape(query)}$", "$options": "i"}})
     
     if not content:
         await message.answer("❌ IG Content Not Found. Try again or Cancel.", reply_markup=get_cancel_keyboard())
         return
     
     # Format creation time
-    from datetime import datetime
     creation_time = content.get('created_at', now_local())
-    time_12h = creation_time.strftime("%I:%M %p")
-    date_str = creation_time.strftime("%A, %B %d, %Y")
+    time_12h = safe_format_date(creation_time, "%I:%M %p", "Unknown")
+    date_str = safe_format_date(creation_time, "%A, %B %d, %Y", "Unknown")
     
     # Build detailed info
     text = f"📸 <b>IG CONTENT DETAILS</b>\n━━━━━━━━━━━━━━━━━━━━\n"
@@ -8015,7 +8260,7 @@ async def process_reward_search(message: types.Message, state: FSMContext):
             reward = all_rewards[idx]
             display_idx = int(query)
     elif query.upper().startswith("RW"):
-        reward = col_rewards.find_one({"rw_code": {"$regex": f"^{query}$", "$options": "i"}})
+        reward = col_rewards.find_one({"rw_code": {"$regex": f"^{re.escape(query)}$", "$options": "i"}})
         if reward:
             for i, r in enumerate(all_rewards, start=1):
                 if r["_id"] == reward["_id"]:
@@ -8028,7 +8273,7 @@ async def process_reward_search(message: types.Message, state: FSMContext):
 
     content = str(reward.get("content", ""))
     created_at = reward.get("created_at")
-    created_str = created_at.strftime("%b %d, %Y  %I:%M %p") if hasattr(created_at, 'strftime') else str(created_at) if created_at else "N/A"
+    created_str = safe_format_date(created_at, "%b %d, %Y  %I:%M %p", "N/A")
 
     header = (
         f"🎁 <b>REWARD DETAIL</b>\n━━━━━━━━━━━━━━━━━━━━\n"
@@ -9350,7 +9595,8 @@ async def send_analytics_view(message: types.Message, category: str, page: int =
         else:
             indicator = "🔥"
         
-        text += f"{idx}. {indicator} <b>{item_name}</b>\n"
+        item_name_clean = _html.escape(str(item_name)[:30])
+        text += f"{idx}. {indicator} <b>{item_name_clean}</b>\n"
         text += f"   🔢 Clicks: <b>{clicks:,}</b>"
         
         if last_clicked:
@@ -9699,14 +9945,19 @@ async def process_ig_affiliate_selection(message: types.Message, state: FSMConte
         if not q: continue
         
         content = None
-        if q.isdigit():
-            # Sequential selection — matches displayed index
-            idx = int(q) - 1
-            if 0 <= idx < len(all_contents):
-                content = all_contents[idx]
+        m = re.match(r"^CC0*(\d+)$", q, re.IGNORECASE)
+        if m:
+            num = int(m.group(1))
+            content = next((c for c in all_contents if c.get('cc_number') == num or c.get('cc_code', '').upper() == f"CC{num}"), None)
+        elif q.isdigit():
+            val = int(q)
+            content = next((c for c in all_contents if c.get('cc_number') == val), None)
+            if not content and 0 <= val - 1 < len(all_contents):
+                content = all_contents[val - 1]
         elif q.upper().startswith("CC"):
-            # CC Code match (search all, not just filtered, for CC code entry)
-            content = next((c for c in all_contents if c['cc_code'].upper() == q.upper()), None)
+            content = next((c for c in all_contents if c.get('cc_code', '').upper() == q.upper()), None)
+        else:
+            content = next((c for c in all_contents if q.lower() in c.get('name', '').lower()), None)
             
         if content:
             cid = str(content["_id"])
@@ -9823,7 +10074,7 @@ async def process_ig_affiliate_edit_selection(message: types.Message, state: FSM
     # Try by CC code
     elif query.upper().startswith("CC"):
         content = col_ig_content.find_one({
-            "cc_code": {"$regex": f"^{query}$", "$options": "i"},
+            "cc_code": {"$regex": f"^{re.escape(query)}$", "$options": "i"},
             "affiliate_link": {"$exists": True, "$ne": ""}
         })
     
@@ -9934,7 +10185,7 @@ async def process_ig_affiliate_delete_selection(message: types.Message, state: F
     # Try by CC code
     elif query.upper().startswith("CC"):
         content = col_ig_content.find_one({
-            "cc_code": {"$regex": f"^{query}$", "$options": "i"},
+            "cc_code": {"$regex": f"^{re.escape(query)}$", "$options": "i"},
             "affiliate_link": {"$exists": True, "$ne": ""}
         })
     
@@ -10527,21 +10778,22 @@ async def content_search_handler(message: types.Message, state: FSMContext):
     await state.clear()
 
     # Search PDFs: name, description, tags array
+    kw_esc = re.escape(keyword)
     pdf_results = list(col_pdfs.find(
         {"$or": [
-            {"name":        {"$regex": keyword, "$options": "i"}},
-            {"description": {"$regex": keyword, "$options": "i"}},
-            {"tags":        {"$regex": keyword, "$options": "i"}},
-            {"msa_code":    {"$regex": keyword, "$options": "i"}},
+            {"name":        {"$regex": kw_esc, "$options": "i"}},
+            {"description": {"$regex": kw_esc, "$options": "i"}},
+            {"tags":        {"$regex": kw_esc, "$options": "i"}},
+            {"msa_code":    {"$regex": kw_esc, "$options": "i"}},
         ]},
         {"name": 1, "msa_code": 1, "clicks": 1, "tags": 1}
     ).limit(10))
 
     ig_results = list(col_ig_content.find(
         {"$or": [
-            {"ig_username": {"$regex": keyword, "$options": "i"}},
-            {"caption":     {"$regex": keyword, "$options": "i"}},
-            {"tags":        {"$regex": keyword, "$options": "i"}},
+            {"ig_username": {"$regex": kw_esc, "$options": "i"}},
+            {"caption":     {"$regex": kw_esc, "$options": "i"}},
+            {"tags":        {"$regex": kw_esc, "$options": "i"}},
         ]},
         {"ig_username": 1, "cc_code": 1, "ig_start_clicks": 1, "tags": 1}
     ).limit(5))
@@ -12594,8 +12846,11 @@ _PDF_EXCLUDED_BUTTONS = {
     "🗑️ DELETE STORE ITEM", "📋 LIST STORE ITEMS",
     "➕ ADD REWARD", "✏️ EDIT REWARD", "🗑️ DELETE REWARD", "📋 LIST REWARD",
     "🎯 MILESTONES", "⬅️ BACK TO REWARD MENU", "⬅️ BACK TO ADD MENU",
+    # ── Power Features Analytics buttons ─────────────────────────────────────
+    "🔥 TOP CONTENT", "📊 CONTENT PERFORMANCE", "💰 AFFILIATE REPORT",
+    "💸 AFFILIATE ANALYTICS", "🏷️ TAG SEARCH",
     # ── Navigation / Cancel ────────────────────────────────────────────────────
-    "⬅️ BACK", "❌ CANCEL", "❌ CANCEL",
+    "⬅️ BACK", "❌ CANCEL",
 }
 
 @dp.message(
@@ -12615,7 +12870,7 @@ async def smart_pdf_selection_handler(message: types.Message, state: FSMContext)
     if query.isdigit():
         pdf = col_pdfs.find_one({"index": int(query)})
     else:
-        pdf = col_pdfs.find_one({"name": {"$regex": query, "$options": "i"}})
+        pdf = col_pdfs.find_one({"name": {"$regex": re.escape(query), "$options": "i"}})
     
     if not pdf:
         # Pass through to debug logger if not found
@@ -13273,6 +13528,453 @@ async def econ_target_action_amt(message: types.Message, state: FSMContext):
         parse_mode="Markdown"
     )
 
+# ====================================================================================
+# ⚡ BOT 3 POWER FEATURES BLOCK — 8 Features (F1–F8)
+# Content Performance Dashboard, Reward Pool Alerts, Store Stock Limits,
+# Affiliate Analytics, Scheduled Drops, Auto-Expire Store Items, Tagging
+# ====================================================================================
+
+# ── FEATURE 1 — CONTENT PERFORMANCE DASHBOARD (Interactive Paginated Viewer) ─────────
+
+async def _build_top_content_report(page: int = 0) -> tuple:
+    """Build paginated Top Content report page with clean HTML and inline navigation buttons."""
+    all_pdfs = list(col_pdfs.find(
+        {},
+        {"name": 1, "index": 1, "msa_code": 1, "clicks": 1, "ig_start_clicks": 1,
+         "yt_start_clicks": 1, "affiliate_clicks": 1, "yt_code_clicks": 1, "last_clicked_at": 1}
+    ))
+    for p in all_pdfs:
+        p["total_clicks"] = (
+            p.get("clicks", 0) +
+            p.get("ig_start_clicks", 0) +
+            p.get("yt_start_clicks", 0) +
+            p.get("affiliate_clicks", 0) +
+            p.get("yt_code_clicks", 0)
+        )
+    top_pdfs  = sorted(all_pdfs, key=lambda x: x["total_clicks"], reverse=True)
+    zero_pdfs = [p for p in all_pdfs if p["total_clicks"] == 0]
+
+    all_ig = list(col_ig_content.find({}, {"name": 1, "cc_number": 1, "ig_cc_clicks": 1}))
+    top_ig = sorted(all_ig, key=lambda x: x.get("ig_cc_clicks", 0), reverse=True)
+
+    grand_total_pdf_clicks = sum(p["total_clicks"] for p in all_pdfs)
+    grand_total_ig_clicks  = sum(i.get("ig_cc_clicks", 0) for i in all_ig)
+
+    TOTAL_PAGES = 3
+    page = max(0, min(page, TOTAL_PAGES - 1))
+
+    if page == 0:
+        # Page 1: Aggregates + Top PDFs
+        pdf_lines = []
+        for i, p in enumerate(top_pdfs[:5], 1):
+            code = p.get("msa_code") or f"PDF#{p.get('index')}"
+            last_ts = p.get("last_clicked_at")
+            last_str = last_ts.strftime("%b %d") if hasattr(last_ts, "strftime") else "Never"
+            name_clean = _html.escape(str(p.get('name', 'PDF'))[:30])
+            pdf_lines.append(
+                f"{i}. <b>{name_clean}</b> (<code>{code}</code>)\n"
+                f"   👆 Clicks: <b>{p['total_clicks']:,}</b> | Active: {last_str}"
+            )
+        report = (
+            f"🔥 <b>CONTENT PERFORMANCE — Page 1/3</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"📊 <b>Grand Aggregates:</b>\n"
+            f"  • Total PDF Clicks: <b>{grand_total_pdf_clicks:,}</b> ({len(all_pdfs)} PDFs)\n"
+            f"  • Total IG Clicks: <b>{grand_total_ig_clicks:,}</b> ({len(all_ig)} items)\n"
+            f"  • Dead Content: <b>{len(zero_pdfs)}</b> PDFs with 0 clicks\n\n"
+            f"🏆 <b>Top 5 PDFs:</b>\n" +
+            ("\n\n".join(pdf_lines) if pdf_lines else "  <i>No PDF activity recorded</i>") +
+            f"\n\n<i>Live data · MSANodeDB</i>"
+        )
+    elif page == 1:
+        # Page 2: Top IG Content (5 items max, truncated names)
+        ig_lines = []
+        for i, ig in enumerate(top_ig[:5], 1):
+            name_clean = _html.escape(str(ig.get('name', 'IG'))[:30])
+            ig_lines.append(
+                f"{i}. <b>{name_clean}</b> (CC{ig.get('cc_number')})\n"
+                f"   📸 Clicks: <b>{ig.get('ig_cc_clicks', 0):,}</b>"
+            )
+        report = (
+            f"📸 <b>INSTAGRAM CONTENT — Page 2/3</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"📊 Total IG Items: <b>{len(all_ig)}</b>\n"
+            f"👆 Total IG Clicks: <b>{grand_total_ig_clicks:,}</b>\n\n"
+            f"🏆 <b>Top IG Items:</b>\n" +
+            ("\n\n".join(ig_lines) if ig_lines else "  <i>No IG activity recorded</i>") +
+            f"\n\n<i>Live data · MSANodeDB</i>"
+        )
+    else:
+        # Page 3: Dead Content Scanner (5 items max)
+        dead_lines = []
+        for i, p in enumerate(zero_pdfs[:5], 1):
+            code = p.get("msa_code") or f"PDF#{p.get('index')}"
+            name_clean = _html.escape(str(p.get('name', 'PDF'))[:30])
+            dead_lines.append(f"{i}. <b>{name_clean}</b> (<code>{code}</code>)")
+        report = (
+            f"⚠️ <b>ZERO-CLICK DEAD CONTENT — Page 3/3</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"📉 <b>{len(zero_pdfs)} PDFs</b> have 0 clicks in last 30 days.\n\n" +
+            ("\n".join(dead_lines) if dead_lines else "  🎉 <i>No dead content! All PDFs are active.</i>") +
+            f"\n\n<i>Consider revising or replacing these items.</i>"
+        )
+
+    if len(report) > 3500:
+        report = report[:3500] + "\n\n<i>... [content truncated]</i>"
+
+    # Build Inline Keyboard
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton(text="◀️ PREV", callback_data=f"b3_top_pg:{page-1}"))
+    nav_row.append(InlineKeyboardButton(text=f"📄 {page+1}/{TOTAL_PAGES}", callback_data="b3_top_noop"))
+    if page < TOTAL_PAGES - 1:
+        nav_row.append(InlineKeyboardButton(text="NEXT ▶️", callback_data=f"b3_top_pg:{page+1}"))
+
+    markup = InlineKeyboardMarkup(inline_keyboard=[nav_row])
+    return report, markup
+
+
+@dp.message(F.text.in_({"🔥 TOP CONTENT", "📊 CONTENT PERFORMANCE"}))
+async def content_performance_dashboard_handler(message: types.Message):
+    """F1: Show interactive paginated Top Content Dashboard."""
+    if not await check_authorization(message, "Content Performance", "can_analytics"): return
+    loading = await message.answer("📊 Compiling content metrics...")
+    try:
+        report, markup = await _build_top_content_report(0)
+        try: await loading.delete()
+        except Exception: pass
+        await message.answer(report, parse_mode="HTML", reply_markup=markup)
+    except Exception as _e:
+        await message.answer(f"❌ Error: {_html.escape(str(_e))}", reply_markup=get_analytics_menu(), parse_mode="HTML")
+
+
+@dp.callback_query(F.data.startswith("b3_top_pg:"))
+async def b3_top_content_page_cb(callback: types.CallbackQuery):
+    """F1 Callback: Navigate pages in Top Content report."""
+    try:
+        page = int(callback.data.split(":")[1])
+        report, markup = await _build_top_content_report(page)
+        await callback.message.edit_text(report, parse_mode="HTML", reply_markup=markup)
+    except Exception as _e:
+        logger.error(f"[TOP_CONTENT_CB] Error on page navigation: {_e}")
+        await callback.answer("Unable to update page", show_alert=True)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "b3_top_noop")
+async def b3_top_noop_cb(callback: types.CallbackQuery):
+    await callback.answer()
+
+
+# ── FEATURE 2 — AFFILIATE ANALYTICS DASHBOARD (Interactive Paginated Viewer) ───────
+
+_AFF_PAGE_SIZE = 5
+
+async def _build_affiliate_report(page: int = 0) -> tuple:
+    """Build paginated Affiliate Analytics report page with inline navigation buttons."""
+    pdfs_with_aff = list(col_pdfs.find(
+        {"affiliate_link": {"$nin": [None, ""]}},
+        {"name": 1, "index": 1, "msa_code": 1, "affiliate_link": 1, "affiliate_clicks": 1, "last_affiliate_click": 1}
+    ))
+    ig_with_aff = list(col_ig_content.find(
+        {"affiliate_link": {"$nin": [None, ""]}},
+        {"name": 1, "cc_number": 1, "affiliate_link": 1, "ig_cc_clicks": 1}
+    ))
+
+    all_items = []
+    for p in pdfs_with_aff:
+        all_items.append({
+            "type": "PDF",
+            "name": p.get("name", "PDF"),
+            "code": p.get("msa_code") or f"PDF#{p.get('index')}",
+            "url": p.get("affiliate_link", ""),
+            "clicks": p.get("affiliate_clicks", 0),
+            "last_click": p.get("last_affiliate_click"),
+        })
+    for i in ig_with_aff:
+        all_items.append({
+            "type": "IG",
+            "name": i.get("name", "IG"),
+            "code": f"CC{i.get('cc_number')}",
+            "url": i.get("affiliate_link", ""),
+            "clicks": i.get("ig_cc_clicks", 0),
+            "last_click": None,
+        })
+
+    ranked = sorted(all_items, key=lambda x: x["clicks"], reverse=True)
+    total_aff_clicks = sum(x["clicks"] for x in ranked)
+    total_pages = max(1, (len(ranked) + _AFF_PAGE_SIZE - 1) // _AFF_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+
+    start = page * _AFF_PAGE_SIZE
+    chunk = ranked[start: start + _AFF_PAGE_SIZE]
+
+    lines = []
+    for idx, item in enumerate(chunk, start + 1):
+        ts = item["last_click"]
+        ts_str = ts.strftime("%b %d %I:%M %p") if hasattr(ts, "strftime") else "N/A"
+        url_raw = str(item.get("url", ""))
+        url_short = url_raw[:25] + "..." if len(url_raw) > 25 else url_raw
+        name_clean = _html.escape(str(item.get('name', 'Item'))[:25])
+        lines.append(
+            f"{idx}. [{item['type']}] <b>{name_clean}</b> (<code>{item['code']}</code>)\n"
+            f"   💰 Clicks: <b>{item['clicks']:,}</b> | Last: {ts_str}\n"
+            f"   🔗 <code>{_html.escape(url_short)}</code>"
+        )
+
+    report = (
+        f"💰 <b>AFFILIATE ANALYTICS — Page {page + 1}/{total_pages}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"📈 Total Clicks: <b>{total_aff_clicks:,}</b> across <b>{len(ranked)}</b> links\n\n" +
+        ("\n\n".join(lines) if lines else "<i>No affiliate links configured yet.</i>") +
+        f"\n\n━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"<i>Ranked by click volume · MSANodeDB</i>"
+    )
+
+    if len(report) > 3500:
+        report = report[:3500] + "\n\n<i>... [content truncated]</i>"
+
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton(text="◀️ PREV", callback_data=f"b3_aff_pg:{page-1}"))
+    nav_row.append(InlineKeyboardButton(text=f"📄 {page+1}/{total_pages}", callback_data="b3_aff_noop"))
+    if page < total_pages - 1:
+        nav_row.append(InlineKeyboardButton(text="NEXT ▶️", callback_data=f"b3_aff_pg:{page+1}"))
+
+    markup = InlineKeyboardMarkup(inline_keyboard=[nav_row])
+    return report, markup
+
+
+@dp.message(F.text.in_({"💰 AFFILIATE REPORT", "💸 AFFILIATE ANALYTICS"}))
+async def affiliate_analytics_dashboard_handler(message: types.Message):
+    """F2: Show interactive paginated Affiliate Analytics report."""
+    if not await check_authorization(message, "Affiliate Report", "can_analytics"): return
+    loading = await message.answer("💰 Compiling affiliate link analytics...")
+    try:
+        report, markup = await _build_affiliate_report(0)
+        try: await loading.delete()
+        except Exception: pass
+        await message.answer(report, parse_mode="HTML", reply_markup=markup)
+    except Exception as _e:
+        await message.answer(f"❌ Error: {_html.escape(str(_e))}", reply_markup=get_analytics_menu(), parse_mode="HTML")
+
+
+@dp.callback_query(F.data.startswith("b3_aff_pg:"))
+async def b3_aff_report_page_cb(callback: types.CallbackQuery):
+    """F2 Callback: Navigate pages in Affiliate Analytics report."""
+    try:
+        page = int(callback.data.split(":")[1])
+        report, markup = await _build_affiliate_report(page)
+        await callback.message.edit_text(report, parse_mode="HTML", reply_markup=markup)
+    except Exception as _e:
+        await callback.answer(f"Error: {_e}", show_alert=True)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "b3_aff_noop")
+async def b3_aff_noop_cb(callback: types.CallbackQuery):
+    await callback.answer()
+
+
+# ── FEATURE 3 — REWARD POOL HEALTH ALERT (Scheduler) ──────────────────────────────────
+async def reward_pool_health_scheduler():
+    """
+    F3: Checks bot3_rewards pool every 6 hours.
+    Sends urgent warning DM to Master Admin & Owner if pool count < 5.
+    """
+    await asyncio.sleep(60)  # 1 min warm-up after boot
+    while True:
+        try:
+            pool_count = col_rewards.count_documents({})
+            if pool_count < 5:
+                warn_msg = (
+                    f"🚨 <b>REWARD POOL RUNNING LOW</b>\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                    f"⚠️ Only <b>{pool_count}</b> referral reward item(s) remain in <code>bot3_rewards</code>!\n\n"
+                    f"If the pool empties, referral reward deliveries will fail for users.\n\n"
+                    f"<b>Action Required:</b> Go to Bot 3 → 🎁 REWARD → Add new rewards now."
+                )
+                for admin_target in set([MASTER_ADMIN_ID, OWNER_ID]):
+                    if admin_target and admin_target != 0:
+                        try:
+                            await bot.send_message(admin_target, warn_msg, parse_mode="HTML")
+                            await asyncio.sleep(0.5)
+                        except Exception:
+                            pass
+        except asyncio.CancelledError:
+            break
+        except Exception as _re:
+            logger.error(f"[REWARD_HEALTH] Error: {_re}")
+        await asyncio.sleep(21600)  # Check every 6 hours
+
+
+# ── FEATURE 4 — STORE ITEM STOCK LIMIT HELPER ─────────────────────────────────────────
+def check_store_stock_available(item: dict) -> tuple:
+    """
+    F4: Check if a store item is in stock.
+    Returns (is_available: bool, remaining_stock_str: str).
+    """
+    max_stock = item.get("max_stock")
+    purchases = item.get("purchase_count", 0)
+    if max_stock is None or max_stock == 0:
+        return True, "∞ Unlimited"
+    remaining = max(0, max_stock - purchases)
+    if remaining <= 0:
+        return False, "0 (SOLD OUT)"
+    return True, f"{remaining}/{max_stock} remaining"
+
+
+def increment_store_item_purchase(item_id: str) -> None:
+    """F4: Increment purchase_count for a store item upon confirmed purchase."""
+    try:
+        col_store_items.update_one({"item_id": item_id}, {"$inc": {"purchase_count": 1}})
+    except Exception as _e:
+        logger.error(f"[STORE_STOCK] Failed to increment purchase_count for {item_id}: {_e}")
+
+
+# ── FEATURE 5 — SCHEDULED CONTENT DROPS (Scheduler) ──────────────────────────────────
+async def content_drop_scheduler():
+    """
+    F5: Polls bot3_pdfs & bot3_ig_content every 60 seconds.
+    Flips active=True when go_live_at <= now() for scheduled items.
+    Sends confirmation DM to Master Admin.
+    """
+    await asyncio.sleep(30)
+    while True:
+        try:
+            now = now_local()
+
+            # Scheduled PDFs
+            due_pdfs = list(col_pdfs.find(
+                {"is_scheduled": True, "go_live_at": {"$lte": now}},
+                {"_id": 1, "name": 1, "msa_code": 1, "index": 1}
+            ))
+            for pdf in due_pdfs:
+                col_pdfs.update_one(
+                    {"_id": pdf["_id"]},
+                    {"$set": {"active": True, "is_scheduled": False, "released_at": now}}
+                )
+                code = pdf.get("msa_code") or f"PDF#{pdf.get('index')}"
+                alert_text = (
+                    f"🚀 <b>SCHEDULED CONTENT DROP LIVE!</b>\n\n"
+                    f"📄 PDF <b>{_html.escape(pdf.get('name', 'PDF'))}</b> (<code>{code}</code>) is now live!\n"
+                    f"Users can now access it via Search Code."
+                )
+                if MASTER_ADMIN_ID:
+                    try: await bot.send_message(MASTER_ADMIN_ID, alert_text, parse_mode="HTML")
+                    except Exception: pass
+
+            # Scheduled IG Items
+            due_ig = list(col_ig_content.find(
+                {"is_scheduled": True, "go_live_at": {"$lte": now}},
+                {"_id": 1, "name": 1, "cc_number": 1}
+            ))
+            for ig in due_ig:
+                col_ig_content.update_one(
+                    {"_id": ig["_id"]},
+                    {"$set": {"active": True, "is_scheduled": False, "released_at": now}}
+                )
+                alert_text = (
+                    f"🚀 <b>SCHEDULED IG DROP LIVE!</b>\n\n"
+                    f"📸 IG Item <b>{_html.escape(ig.get('name', 'IG'))}</b> (CC{ig.get('cc_number')}) is now live!"
+                )
+                if MASTER_ADMIN_ID:
+                    try: await bot.send_message(MASTER_ADMIN_ID, alert_text, parse_mode="HTML")
+                    except Exception: pass
+
+        except asyncio.CancelledError:
+            break
+        except Exception as _ce:
+            logger.error(f"[CONTENT_DROP] Error: {_ce}")
+        await asyncio.sleep(60)
+
+
+# ── FEATURE 6 — AUTO-EXPIRE STORE ITEMS (Scheduler) ──────────────────────────────────
+async def store_item_cleanup_scheduler():
+    """
+    F6: Polls bot3_store_items every 1 hour.
+    Deactivates store items where expires_at <= now() and active != False.
+    Alerts Master Admin on expiration.
+    """
+    await asyncio.sleep(120)
+    while True:
+        try:
+            now = now_local()
+            expired_items = list(col_store_items.find(
+                {"expires_at": {"$lte": now}, "active": {"$ne": False}},
+                {"_id": 1, "item_id": 1, "name": 1, "expires_at": 1}
+            ))
+            for item in expired_items:
+                col_store_items.update_one(
+                    {"_id": item["_id"]},
+                    {"$set": {"active": False, "deactivated_reason": "EXPIRED"}}
+                )
+                alert_msg = (
+                    f"⏳ <b>STORE ITEM EXPIRED</b>\n\n"
+                    f"🛒 Item <b>{_html.escape(item.get('name', 'Item'))}</b> (ID: <code>{item.get('item_id')}</code>) "
+                    f"has reached its expiration date and was auto-deactivated from the Vault Shop."
+                )
+                if MASTER_ADMIN_ID:
+                    try: await bot.send_message(MASTER_ADMIN_ID, alert_msg, parse_mode="HTML")
+                    except Exception: pass
+        except asyncio.CancelledError:
+            break
+        except Exception as _se:
+            logger.error(f"[STORE_CLEANUP] Error: {_se}")
+        await asyncio.sleep(3600)
+
+
+# ── FEATURE 7 — CONTENT TAGGING & SEARCH BY TAG ──────────────────────────────────────
+@dp.message(F.text.startswith("🏷️ TAG SEARCH") | Command("tag"))
+async def tag_search_handler(message: types.Message):
+    """
+    F7: Search PDFs and IG content by tag (e.g. /tag discord or 🏷️ TAG SEARCH).
+    """
+    if not await check_authorization(message, "Tag Search", "can_search"): return
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2:
+        # Show tag overview
+        all_pdfs = list(col_pdfs.find({"tags": {"$exists": True, "$ne": []}}, {"tags": 1}))
+        tag_counts = {}
+        for p in all_pdfs:
+            for t in p.get("tags", []):
+                t_clean = t.strip().lower()
+                tag_counts[t_clean] = tag_counts.get(t_clean, 0) + 1
+
+        lines = [f"  • <code>{t}</code> ({cnt} PDFs)" for t, cnt in sorted(tag_counts.items(), key=lambda x: x[1], reverse=True)]
+        await message.answer(
+            f"🏷️ <b>CONTENT TAG SEARCH</b>\n\n"
+            f"Type <code>/tag &lt;tag_name&gt;</code> to filter content by tag.\n\n"
+            f"<b>Available Tags:</b>\n" +
+            ("\n".join(lines) if lines else "  <i>No tagged content yet. Add tags when creating/editing PDFs.</i>"),
+            parse_mode="HTML"
+        )
+        return
+
+    tag_query = args[1].strip().lower()
+    matching_pdfs = list(col_pdfs.find(
+        {"tags": {"$regex": f"^{re.escape(tag_query)}$", "$options": "i"}},
+        {"name": 1, "msa_code": 1, "index": 1, "clicks": 1}
+    ).limit(20))
+
+    if not matching_pdfs:
+        await message.answer(f"❌ No content found matching tag: <code>{_html.escape(tag_query)}</code>", parse_mode="HTML")
+        return
+
+    res_lines = []
+    for p in matching_pdfs:
+        code = p.get("msa_code") or f"PDF#{p.get('index')}"
+        res_lines.append(f"• <b>{_html.escape(p.get('name', 'PDF'))}</b> (<code>{code}</code>)")
+    await message.answer(
+        f"🏷️ <b>Content Tagged '<code>{_html.escape(tag_query)}</code>'</b> ({len(matching_pdfs)} items):\n\n" +
+        "\n".join(res_lines),
+        parse_mode="HTML"
+    )
+
+# ─────────────────────────────────────────────────────────────────────────────────────
+# End of Bot 3 Power Features Block
+# ─────────────────────────────────────────────────────────────────────────────────────
+
 @dp.message()
 async def debug_catch_all(message: types.Message):
     # Apply authorization check
@@ -13501,6 +14203,15 @@ async def main():
     asyncio.create_task(zero_click_content_scanner())
     print("  ✅ Zero-click content scanner started (flags stale PDFs every Sunday)")
 
+    asyncio.create_task(reward_pool_health_scheduler())
+    print("  🎁 Reward pool health monitor started (alerts if rewards < 5, checks every 6h)")
+
+    asyncio.create_task(content_drop_scheduler())
+    print("  🚀 Scheduled content drop runner started (checks every 60s for due drops)")
+
+    asyncio.create_task(store_item_cleanup_scheduler())
+    print("  ⏳ Store item expiration cleanup started (auto-deactivates expired items every 1h)")
+
     # ── Auto-heal IG CC codes on every startup (fill gaps from past deletions) ──
 
     print("\n🔄 Reindexing IG CC codes...")
@@ -13653,9 +14364,6 @@ async def main():
         await cleanup_on_shutdown()
 
 
-# ==========================================
-# 🚀 APPLICATION ENTRY POINT
-# ==========================================
 if __name__ == "__main__":
     try:
         # Validate required environment variables before starting
