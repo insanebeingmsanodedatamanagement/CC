@@ -8539,7 +8539,7 @@ def _build_review_analytics_pages() -> list[str]:
                 uname     = rv.get("username", "")
                 stars     = rv.get("stars", 5)
                 rev_text  = _esc_md(str(rv.get("review_text", ""))[:200])
-                sub_at    = rv.get("submitted_at")
+                sub_at    = safe_parse_dt(rv.get("submitted_at"))
                 date_str  = sub_at.strftime("%b %d, %Y") if sub_at else "—"
                 star_str  = "⭐" * stars
                 user_disp = f"@{uname}" if uname else f"User {fname}"

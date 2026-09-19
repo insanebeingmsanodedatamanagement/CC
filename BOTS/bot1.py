@@ -5203,9 +5203,11 @@ async def rate_agent_handler(message: types.Message, state: FSMContext):
     )
     if existing:
         from datetime import timedelta
-        _last = existing.get("submitted_at")
-        if _last and (now_local() - _last) < timedelta(days=365):
-            _days_left = int(365 - (now_local() - _last).total_seconds() / 86400)
+        _last = safe_parse_dt(existing.get("submitted_at"))
+        _now_nv = now_local().replace(tzinfo=None) if hasattr(now_local(), 'replace') and now_local().tzinfo else now_local()
+        _last_nv = _last.replace(tzinfo=None) if _last and hasattr(_last, 'replace') and _last.tzinfo else _last
+        if _last_nv and (_now_nv - _last_nv) < timedelta(days=365):
+            _days_left = int(365 - (_now_nv - _last_nv).total_seconds() / 86400)
             
             # Fetch past review data
             _past_stars = existing.get("stars", 5)
