@@ -404,8 +404,8 @@ def connect_db(is_reconnect: bool = False) -> bool:
 
         new_client = pymongo.MongoClient(
             MONGO_URI,
-            maxPoolSize=25,
-            minPoolSize=1,
+            maxPoolSize=50,
+            minPoolSize=2,
             maxIdleTimeMS=45000,         # 45s - refresh sockets before Atlas 60s idle timeout
             heartbeatFrequencyMS=10000,  # Ping every 10s to detect broken connections fast
             serverSelectionTimeoutMS=10000,
@@ -12447,8 +12447,42 @@ async def _build_daily_report(period: str) -> str:
             "vault_left_at": {"$exists": False},  # currently active
         })
         # Grace conversion
-        grace_consumed_total = col_user_verification.count_documents({"grace_consumed": True})
-        grace_converted_total = col_user_verification.count_documents({"grace_converted_to_vault": True})
+        # Credit economy stats
+        try:
+            credit_agg = list(col_msa_credits.aggregate([
+                {"$group": {"_id": None, "total_circulating": {"$sum": "$balance"}, "users_with_credits": {"$sum": 1}}}
+            ]))
+            total_circulating = credit_agg[0].get("total_circulating", 0) if credit_agg else 0
+            users_with_credits = credit_agg[0].get("users_with_credits", 0) if credit_agg else 0
+        except Exception:
+            total_circulating = 0
+            users_with_credits = 0
+
+        # Review stats
+        try:
+            review_agg = list(col_reviews.aggregate([
+                {"$group": {"_id": None, "total_reviews": {"$sum": 1}, "avg_stars": {"$avg": "$stars"}}}
+            ]))
+            total_reviews = review_agg[0].get("total_reviews", 0) if review_agg else 0
+            avg_stars = round(review_agg[0].get("avg_stars", 0.0), 1) if review_agg else 0.0
+        except Exception:
+            total_reviews = 0
+            avg_stars = 0.0
+
+        # Referral stats
+        try:
+            confirmed_refs = col_referrals.count_documents({"status": "confirmed"})
+            holding_refs   = col_referrals.count_documents({"status": "holding"})
+        except Exception:
+            confirmed_refs = 0
+            holding_refs = 0
+
+        # Backup health
+        try:
+            last_bk = col_bot1_backups.find_one(sort=[("backup_date", -1)])
+            last_backup_str = safe_format_date(last_bk.get("backup_date")) if last_bk else "None recorded"
+        except Exception:
+            last_backup_str = "Status OK"
 
         return {
             "total_users": total_users,
@@ -12467,6 +12501,13 @@ async def _build_daily_report(period: str) -> str:
             "left_7d": left_7d,
             "grace_consumed_total": grace_consumed_total,
             "grace_converted_total": grace_converted_total,
+            "total_circulating": total_circulating,
+            "users_with_credits": users_with_credits,
+            "total_reviews": total_reviews,
+            "avg_stars": avg_stars,
+            "confirmed_refs": confirmed_refs,
+            "holding_refs": holding_refs,
+            "last_backup_str": last_backup_str,
         }
 
     stats = await loop.run_in_executor(None, _get_stats)
@@ -12491,6 +12532,13 @@ async def _build_daily_report(period: str) -> str:
         f"• New today: `{stats['new_today']}`\n"
         f"• Banned: `{stats['banned_users']}`\n"
         f"• Left vault (last 7d): `{stats['left_7d']}`\n\n"
+        f"━━ 💳 REWARD & REFERRAL ECONOMY ━━\n"
+        f"• Circulating Credits: `{stats['total_circulating']} pts` ({stats['users_with_credits']} holders)\n"
+        f"• Confirmed Referrals: `{stats['confirmed_refs']}`\n"
+        f"• Holding Referrals (48h): `{stats['holding_refs']}`\n\n"
+        f"━━ ⭐ RATINGS & REVIEWS ━━\n"
+        f"• Total Reviews: `{stats['total_reviews']}`\n"
+        f"• Average Score: `⭐ {stats['avg_stars']}/5.0`\n\n"
         f"━━ 🎁 GRACE PASS FUNNEL ━━\n"
         f"• Grace consumed (all time): `{stats['grace_consumed_total']}`\n"
         f"• Converted to vault: `{stats['grace_converted_total']}` "
@@ -12503,9 +12551,10 @@ async def _build_daily_report(period: str) -> str:
         f"• Open: `{stats['open_tickets']}`\n"
         f"• Resolved: `{stats['resolved_tickets']}`\n"
         f"• Archived: `{stats['archived_tickets']}`\n\n"
-        f"━━ 🏥 HEALTH ━━\n"
+        f"━━ 🏥 HEALTH & BACKUPS ━━\n"
         f"• Database: {stats['db_status']}\n"
         f"• Atlas Storage: `{stats['db_size_str']}`\n"
+        f"• Last Bot 1 Backup: `{stats['last_backup_str']}`\n"
         f"• Errors caught: `{total_errors}`\n"
         f"• Auto-healed: `{healed}`\n"
         f"• Heal success rate: `{success_rate:.1f}%`\n"
@@ -12712,12 +12761,27 @@ async def credit_expiry_warning_scheduler():
 # All schedulers respect a 24h per-user cooldown to prevent message fatigue.
 # ==========================================
 
-# ── Global 24h anti-spam guard ────────────────────────────────────────────────
+# ── Global 24h anti-spam guard + Quiet Hours ─────────────────────────────────
 # Tracks the last automated engagement message sent to each user.
-# ALL 3 schedulers check this BEFORE sending. Maximum 1 auto-msg per user per day.
+# ALL schedulers check this BEFORE sending. Maximum 1 auto-msg per user per day.
+# Also enforces Quiet Hours: no promotional nudges between 10:00 PM and 8:30 AM.
+
+def is_quiet_hours() -> bool:
+    """Return True if current local time is in quiet hours window (22:00 - 08:30 IST).
+    Prevents non-urgent promotional and nudge notifications from disturbing users at night.
+    """
+    now = datetime.now(TZ)
+    hour = now.hour
+    minute = now.minute
+    if hour >= 22 or hour < 8 or (hour == 8 and minute < 30):
+        return True
+    return False
 
 async def _can_send_auto_msg(uid: int) -> bool:
-    """Return True if user hasn't received an automated engagement message in 24h."""
+    """Return True if user hasn't received an automated engagement message in 24h,
+    and the current time is outside Quiet Hours."""
+    if is_quiet_hours():
+        return False
     import time as _t
     doc = col_user_verification.find_one({"user_id": uid}, {"last_auto_promo_at": 1})
     if not doc:
@@ -12854,6 +12918,9 @@ async def store_promo_scheduler():
                     sent += 1
                     log_to_terminal("STORE_PROMO", uid, f"Promoted '{item_name}' (cost={item_cost}, bal={balance})")
                     await asyncio.sleep(1)
+                except TelegramRetryAfter as tra:
+                    logger.warning(f"[STORE_PROMO] Telegram FloodWait: sleeping {tra.retry_after}s")
+                    await asyncio.sleep(tra.retry_after)
                 except Exception as _e:
                     _e_str = str(_e).lower()
                     if "forbidden" in _e_str or "chat not found" in _e_str or "bot can't initiate" in _e_str:
@@ -12953,6 +13020,9 @@ async def referral_nudge_scheduler():
                     sent += 1
                     log_to_terminal("REFERRAL_NUDGE", uid, f"First-time referral reminder sent")
                     await asyncio.sleep(1)
+                except TelegramRetryAfter as tra:
+                    logger.warning(f"[REFERRAL_NUDGE] Telegram FloodWait: sleeping {tra.retry_after}s")
+                    await asyncio.sleep(tra.retry_after)
                 except Exception as _e:
                     _e_str = str(_e).lower()
                     if "forbidden" in _e_str or "chat not found" in _e_str or "bot can't initiate" in _e_str:
@@ -13396,7 +13466,9 @@ async def review_nudge_scheduler():
                         total_sent += 1
                         log_to_terminal("REVIEW_NUDGE", uid, f"{wave['label']} sent — {first_name}")
                         await asyncio.sleep(1.2)
-
+                    except TelegramRetryAfter as tra:
+                        logger.warning(f"[REVIEW_NUDGE] Telegram FloodWait: sleeping {tra.retry_after}s")
+                        await asyncio.sleep(tra.retry_after)
                     except Exception as _dm_err:
                         _e_str = str(_dm_err).lower()
                         if "forbidden" in _e_str or "chat not found" in _e_str or "bot can't initiate" in _e_str:

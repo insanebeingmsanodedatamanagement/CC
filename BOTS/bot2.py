@@ -22042,6 +22042,9 @@ async def generate_daily_report(page: int = 1) -> str:
         bkp_status = f"Online ({bkp_ms:.0f}ms)"
     except Exception:
         bkp_status = "Offline"
+
+    # === BOT 1 USER DATA ===
+    try:
         b1_msa_total     = col_msa_ids.count_documents({})
         b1_verified      = col_user_verification.count_documents({"verified": True})
         b1_unverified    = col_user_verification.count_documents({"verified": {"$ne": True}})
@@ -22057,105 +22060,6 @@ async def generate_daily_report(page: int = 1) -> str:
         _referrals_col       = db["bot1_referrals"]
         b1_referrals_confirmed = _referrals_col.count_documents({"status": "confirmed"})
         b1_referrals_pending   = _referrals_col.count_documents({"status": "pending"})
-        
-        # ── Backup Guide Pages (Redefined) ──
-        pages = {
-            1: (
-                "📖 <b>MASTER BACKUP GUIDE — PAGE 1/5: ARCHITECTURE</b>\n"
-                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                "<b>🗄️ 1. DUAL DATABASE SYSTEM</b>\n"
-                "The backup system operates across two completely separate MongoDB clusters:\n\n"
-                "• <b>Production DB — MSANodeDB (LIVE):</b>\n"
-                "  Holds every user record, permission set, support ticket, referral entry, and all Bot 1 & Bot 2 system state. This DB is <b>NEVER touched</b> by any backup job, TTL, or reset. Backup jobs only READ from it.\n\n"
-                "• <b>Backup DB — MSANodeBackups (SNAPSHOTS):</b>\n"
-                "  A dedicated isolated Atlas cluster storing daily JSON snapshots for Bot 1 and Bot 2. Each document is one full daily export. Records carry a 90-day TTL — but are NEVER deleted unless GDrive copy is confirmed first.\n\n"
-                "• <b>Local Disk Tier (Dev/Server only):</b>\n"
-                "  On non-Render environments, daily exports are also written locally to:\n"
-                "  <code>MSANode_Local_Backups/{bot}/{year}/{Month}/Week {N}/{date}/{col}.json</code>\n"
-                "  On Render (ephemeral disk) this step is skipped — only the cluster upsert runs.\n\n"
-                "<b>☁️ 2. GOOGLE DRIVE 4-TIER FOLDER HIERARCHY</b>\n"
-                "Root folders (<code>BOT 1 BACKUPS</code> / <code>BOT 2 BACKUPS</code>) are auto-discovered at startup. All backups go into a strict nested path that is created on-demand:\n\n"
-                "  <code>Root → Year → Month → Week → Date</code>\n"
-                "  <i>Example: BOT 1 BACKUPS / 2026 / July / Week 4 / 2026-07-25</i>\n"
-                "  Missing folder levels are created automatically. You never need to touch GDrive manually.\n\n"
-                "<b>🕐 3. DATE & TIMESTAMP FORMAT</b>\n"
-                "All logs, ZIP names, history entries, and Telegram alerts use:\n"
-                "<code>DD-MM-YYYY HH:MM:SS</code> (IST local time)\n"
-                "ZIP archives: <code>{bot_name}_backup_{YYYYMMDD_HHMMSS}.zip</code>\n"
-                "GDrive uploads: <code>gdrive_{bot_name}_{YYYYMMDD_HHMMSS}.zip</code>"
-            ),
-            2: (
-                "📖 <b>MASTER BACKUP GUIDE — PAGE 2/5: AUTOMATION ENGINE</b>\n"
-                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                "<b>⚙️ 1. THREE-TIER AUTOMATED BACKUP SCHEDULE</b>\n\n"
-                "<b>Tier 1 — Daily Cluster Snapshot (23:59 UTC, every day):</b>\n"
-                "Runs automatically every day at 23:59 UTC for BOTH Bot 1 and Bot 2. Exports all collections from MSANodeDB that belong to the bot (auto-discovers new collections with matching prefix). Upserts the full snapshot into MSANodeBackups using the date as a unique key — running twice in one day UPDATES, never duplicates. On non-Render servers, also writes individual <code>.json</code> files to the local folder hierarchy. After each run, sends you a Telegram confirmation. If the run fails, you receive a failure alert with error details. If the scheduler itself crashes, it auto-restarts after a 5-minute cooldown.\n\n"
-                "<b>Tier 2 — Month-End GDrive Upload (Last day of month, 23:59 UTC):</b>\n"
-                "On the last calendar day of each month, AFTER the daily snapshot, the system automatically fetches the latest snapshot and uploads it as a ZIP to GDrive inside the correct <code>Year/Month/Week/Date</code> subfolder. Duplicate protection: if a file with the same name already exists, the upload is skipped. On success, the record is flagged <code>gdrive_uploaded: true</code> — required before TTL can expire it. On failure, you receive a Telegram alert.\n\n"
-                "<b>Tier 3 — Manual GDrive Upload (On-demand via ☁️ GDRIVE SYSTEM):</b>\n"
-                "You can manually upload any specific snapshot to GDrive at any time via the GDRIVE SYSTEM button.\n\n"
-                "<b>🛡️ 2. 90-DAY TTL SAFETY AUDITOR (Every 12 hours)</b>\n"
-                "Wakes every 12 hours. Step 1 — identifies records older than 90 days. Step 2 — before deleting ANYTHING, verifies a corresponding file exists in Google Drive for that month. Step 3a — if GDrive has the file: purge from MSANodeBackups, log it. Step 3b — if GDrive does NOT have the file: immediately cancels TTL on those records, strips <code>gdrive_uploaded</code> flag, sends you an URGENT alert. Data is preserved until you upload to GDrive and re-enable TTL. MSANodeDB is completely ignored — only MSANodeBackups records are affected.\n\n"
-                "<b>📊 3. BACKUP CLUSTER HEALTH MONITOR (Every 6 hours)</b>\n"
-                "Checks MSANodeBackups cluster connectivity every 6 hours. Sends alerts if cluster is unreachable or if storage crosses: <b>60% / 75% / 85% / 95%</b>.\n\n"
-                "<b>☁️ 4. GDRIVE TOKEN AUTO-REFRESH</b>\n"
-                "20 seconds after startup, validates the Google Drive OAuth token. If expired but refresh token is valid, auto-refreshes and saves <code>token.json</code>. If token is missing or broken, sends an urgent alert and safely skips all GDrive operations until fixed."
-            ),
-            3: (
-                "📖 <b>MASTER BACKUP GUIDE — PAGE 3/5: RESTORATION & DOWNTIME</b>\n"
-                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                "<b>♻️ 1. ONE-CLICK DATABASE RESTORATION</b>\n\n"
-                "To restore from a snapshot:\n"
-                "1. Go to ☁️ GDRIVE SYSTEM → 📦 BROWSE BACKUPS.\n"
-                "2. Find the desired date/bot ZIP file.\n"
-                "3. Tap 📥 DOWNLOAD & RESTORE.\n\n"
-                "<b>What happens behind the scenes:</b>\n"
-                "The system pulls the ZIP from GDrive, extracts it to the local cache, and iterates through each <code>.json</code> file. It performs a <code>bulk_write</code> (upsert) to MSANodeDB. If your collection uses a custom restore key (defined in <code>_MONTHLY_RESTORE_KEYS</code>), it merges by that key; otherwise, it defaults to <code>_id</code>. All existing documents in target collections are NOT wiped — the restore will update existing records and insert new ones. This ensures a safe, additive recovery.\n\n"
-                "<b>⚠️ 2. DOWNTIME & SAFETY WARNINGS</b>\n"
-                "Before performing a full DB restoration, ensure you have put the bot in <b>MAINTENANCE MODE</b> to prevent data collisions while the bulk operation is processing.\n\n"
-                "<b>🛡️ 3. ZIP VALIDATION</b>\n"
-                "Every ZIP file downloaded from GDrive is pre-validated for structure integrity. If a ZIP is corrupt or missing required collection files, the restore process is halted immediately. A summary log is generated in the <code>bot2_backup_history</code> collection regardless of outcome."
-            ),
-            4: (
-                "📖 <b>MASTER BACKUP GUIDE — PAGE 4/5: STORAGE & QUOTA</b>\n"
-                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                "<b>🗃️ 1. CLUSTER STORAGE MANAGEMENT</b>\n"
-                "The <code>MSANodeBackups</code> cluster has a strict storage quota (currently set to your MongoDB Atlas tier limit). Because the backup system stores DAILY snapshots, the storage volume grows linearly. \n\n"
-                "<b>Automatic Prevention:</b>\n"
-                "The 90-day TTL system is the primary mechanism to keep storage levels healthy. By purging snapshots >90 days old (that have been mirrored to GDrive), it maintains a constant 'rolling window' of 3 months of history on the Atlas cluster.\n\n"
-                "<b>📊 2. STORAGE STATUS MONITORING</b>\n"
-                "You are protected by automated alerts that run every 6 hours:\n"
-                "• <b>60% Used:</b> Informational dashboard notice.\n"
-                "• <b>75% Used:</b> Recommendation to review TTL policies.\n"
-                "• <b>85% Used:</b> Urgent warning: start cleaning up or prepare to upgrade.\n"
-                "• <b>95% Used:</b> Critical error: Atlas may read-only if reached; automatic intervention required.\n\n"
-                "<b>💡 Expert Note:</b>\n"
-                "If you anticipate a high spike in database activity (e.g., a massive influx of users), navigate to the Backup Settings page to perform a 'Manual Cleanup' of stale history logs or verify that the 90-day TTL window is set correctly."
-            ),
-            5: (
-                "📖 <b>MASTER BACKUP GUIDE — PAGE 5/5: TTL & HISTORY</b>\n"
-                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                "<b>⏳ 1. ACTIVATE TTL (90-Day Auto-Purge Manager)</b>\n\n"
-                "Press ⏳ ACTIVATE TTL to open the paginated month list. Each entry shows: month label, number of snapshots, GDrive verification badge (<code>☁️ GDrive ✅</code> = safe to purge, <code>⚠️ Not on GDrive</code> = blocked), and current TTL status (<code>🟢 Active</code> or <code>🔴 Off</code>).\n\n"
-                "<b>How TTL works:</b>\n"
-                "When activated for a month, a <code>backup_ttl_90d</code> MongoDB index marks those records to auto-expire 90 days after their <code>backup_date</code>. MongoDB's TTL monitor handles the actual deletion automatically. When deactivated, the expiry index is removed — records are kept indefinitely until re-activated or manually deleted.\n\n"
-                "<b>Safety Lock:</b>\n"
-                "You CANNOT activate TTL for any month showing <code>⚠️ Not on GDrive</code>. The system blocks the action and prompts you to upload to GDrive first via ☁️ GDRIVE SYSTEM. This prevents accidental data loss — if no cloud copy exists, the cluster copy is your only backup.\n\n"
-                "<b>Emergency Auto-Lock:</b>\n"
-                "The 12-hour TTL Auditor double-checks before every purge. If a GDrive file is missing for a record about to be purged, it immediately strips the TTL flag, preserves the data, and sends you an URGENT alert. Nothing is ever deleted without GDrive confirmation.\n\n"
-                "<b>📜 2. HISTORY (Full Backup Action Log)</b>\n\n"
-                "Navigate with ◀️ Prev | 📄 Page X/Y | Next ▶️. Every backup event is logged with <code>DD-MM-YYYY HH:MM:SS</code> timestamp:\n"
-                "  ✅ Daily Snapshot — automated daily cluster upsert\n"
-                "  ☁️ GDrive Upload — manual or auto month-end upload\n"
-                "  💾 Download — admin downloaded a ZIP via Telegram\n"
-                "  📤 Restore — admin uploaded a ZIP and restored the database\n"
-                "  🗑️ Reset — admin cleared snapshot records from cluster\n"
-                "  ⏳ TTL Activated / Deactivated — TTL toggled per month\n"
-                "  🛡️ TTL Auto-Cancelled — emergency lock triggered by auditor\n"
-                "  ❌ Backup Failed — any automated run that errored\n\n"
-                "History is stored in <code>bot2_backup_history</code> and is never auto-deleted."
-            )
-        }
     except Exception:
         b1_msa_total = b1_verified = b1_unverified = b1_perm_banned = 0
         b1_open_tickets = b1_total_tickets = b1_new_tickets = b1_banned = b1_suspended = 0

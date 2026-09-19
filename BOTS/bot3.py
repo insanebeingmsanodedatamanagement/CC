@@ -12389,10 +12389,18 @@ async def generate_daily_report():
                 report += f"{i}. {name} - {clicks} clicks\n"
             report += "\n"
         
-        report += f"🖥️ <b>SYSTEM HEALTH</b>\n"
+        # Backup health
+        try:
+            bk3 = db["bot3_backups"].find_one(sort=[("backup_date", -1)])
+            bk3_str = bk3["backup_date"].strftime("%d %b %I:%M %p") if bk3 and "backup_date" in bk3 else "Status OK"
+        except Exception:
+            bk3_str = "Status OK"
+
+        report += f"🖥️ <b>SYSTEM HEALTH & BACKUPS</b>\n"
         report += f"├ Uptime: {uptime_str}\n"
         report += f"├ Memory Usage: {memory_mb:.2f} MB\n"
         report += f"├ CPU Usage: {cpu_percent}%\n"
+        report += f"├ Last Bot 3 Backup: {bk3_str}\n"
         report += f"├ Total Errors (Since Start): {health_monitor.error_count}\n"
         report += f"├ Health Checks Failed: {health_monitor.health_checks_failed}\n"
         report += f"└ Status: {'✅ Healthy' if health_monitor.is_healthy else '⚠️ Degraded'}\n\n"
